@@ -105,6 +105,7 @@ GUI機能:
 - 宛先指定Wi-Fi送信のE2E配達確認（`delivery_ack`）と自動再送
 - 長文テキスト送信（一定サイズ超過時に自動チャンク化）
 - ping単発/連続試験
+- 試験タブ下部に通信品質グラフ（PDR/遅延/Loss）のリアルタイム表示
 - 画像送信（`image_start/chunk/end`）
 - トポロジ表示モード切替（`tree` / `flow` / `both`）
 - 通信フロー表（observer / via_node / hops / msg）表示

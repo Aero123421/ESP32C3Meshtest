@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import hashlib
 import json
 import math
@@ -61,6 +62,8 @@ MAX_CHAT_LINES = 1200
 TOPOLOGY_REDRAW_INTERVAL_MS = 400
 TOPOLOGY_DEFAULT_WINDOW_SEC = 30
 TOPOLOGY_FLOW_EVENT_LIMIT = 240
+QUALITY_GRAPH_MAX_POINTS = 240
+QUALITY_GRAPH_MIN_REDRAW_INTERVAL_MS = 200
 MAX_WORKER_EVENTS_PER_TICK = 120
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
 PING_PENDING_MAX_AGE_MS = 20000
@@ -177,6 +180,10 @@ class LPWAApp(tk.Tk):
         self.min_var = tk.StringVar(value="0.0 ms")
         self.max_var = tk.StringVar(value="0.0 ms")
         self.p95_var = tk.StringVar(value="0.0 ms")
+        self.quality_graph_status_var = tk.StringVar(value="品質グラフ: 待機中")
+        self.quality_points: deque[dict[str, float | int]] = deque(maxlen=QUALITY_GRAPH_MAX_POINTS)
+        self._quality_last_draw_ms = 0
+        self.quality_graph_canvas: tk.Canvas | None = None
 
         self._build_ui_tabbed()
         self.refresh_destination_choices()
@@ -615,6 +622,7 @@ class LPWAApp(tk.Tk):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
         parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=2)
 
         help_line = ttk.Label(
             parent,
@@ -646,7 +654,7 @@ class LPWAApp(tk.Tk):
         )
 
         stats_frame = ttk.LabelFrame(parent, text="PDR / 遅延統計")
-        stats_frame.grid(row=2, column=0, sticky="nsew")
+        stats_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
         for idx in range(4):
             stats_frame.columnconfigure(idx, weight=1)
         ttk.Label(stats_frame, text="Sent").grid(row=0, column=0, padx=6, pady=6, sticky="w")
@@ -668,6 +676,33 @@ class LPWAApp(tk.Tk):
         ttk.Button(stats_frame, text="統計リセット", command=self.reset_stats).grid(
             row=4, column=0, columnspan=4, padx=6, pady=(2, 8), sticky="e"
         )
+
+        quality_frame = ttk.LabelFrame(parent, text="通信品質（リアルタイム）")
+        quality_frame.grid(row=3, column=0, sticky="nsew")
+        quality_frame.columnconfigure(0, weight=1)
+        quality_frame.rowconfigure(1, weight=1)
+
+        quality_head = ttk.Frame(quality_frame)
+        quality_head.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+        quality_head.columnconfigure(6, weight=1)
+        ttk.Label(quality_head, text="PDR", foreground="#22c55e").grid(row=0, column=0, padx=(0, 8), sticky="w")
+        ttk.Label(quality_head, text="Avg(ms)", foreground="#38bdf8").grid(row=0, column=1, padx=(0, 8), sticky="w")
+        ttk.Label(quality_head, text="P95(ms)", foreground="#f59e0b").grid(row=0, column=2, padx=(0, 8), sticky="w")
+        ttk.Label(quality_head, text="Loss", foreground="#ef4444").grid(row=0, column=3, padx=(0, 8), sticky="w")
+        ttk.Label(quality_head, text="上段: PDR(0-100%) / 下段: 遅延ms・Loss", foreground="#4b5563").grid(
+            row=0, column=4, padx=(0, 8), sticky="w"
+        )
+        ttk.Label(quality_head, textvariable=self.quality_graph_status_var).grid(row=0, column=6, sticky="e")
+
+        self.quality_graph_canvas = tk.Canvas(
+            quality_frame,
+            bg="#0b1220",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
+            height=220,
+        )
+        self.quality_graph_canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.quality_graph_canvas.bind("<Configure>", lambda _: self._draw_quality_graph(force=True))
 
     def _build_topology_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2805,12 +2840,153 @@ class LPWAApp(tk.Tk):
         self.stop_test_btn.configure(state=tk.DISABLED)
         self.continuous_remaining = None
 
+    def _record_quality_point(self, snapshot: dict[str, float | int]) -> None:
+        point = {
+            "ts_ms": self._now_ms(),
+            "pdr": float(snapshot["pdr"]),
+            "avg_ms": float(snapshot["avg_ms"]),
+            "p95_ms": float(snapshot["p95_ms"]),
+            "lost": int(snapshot["lost"]),
+            "sent": int(snapshot["sent"]),
+            "received": int(snapshot["received"]),
+        }
+        self.quality_points.append(point)
+        self.quality_graph_status_var.set(
+            (
+                f"最新 sent={point['sent']} recv={point['received']} "
+                f"pdr={point['pdr']:.1f}% avg={point['avg_ms']:.1f}ms p95={point['p95_ms']:.1f}ms loss={point['lost']}"
+            )
+        )
+
+    def _draw_quality_graph(self, *, force: bool = False) -> None:
+        canvas = self.quality_graph_canvas
+        if canvas is None:
+            return
+        now_ms = self._now_ms()
+        if not force and (now_ms - self._quality_last_draw_ms) < QUALITY_GRAPH_MIN_REDRAW_INTERVAL_MS:
+            return
+        self._quality_last_draw_ms = now_ms
+
+        canvas.delete("all")
+        width = max(280, int(canvas.winfo_width()))
+        height = max(180, int(canvas.winfo_height()))
+        if width < 40 or height < 40:
+            return
+
+        margin_left = 48.0
+        margin_right = 34.0
+        margin_top = 16.0
+        margin_bottom = 16.0
+        panel_gap = 16.0
+        panel_height = max(50.0, (height - margin_top - margin_bottom - panel_gap) / 2.0)
+
+        x0 = margin_left
+        x1 = width - margin_right
+        top_y0 = margin_top
+        top_y1 = top_y0 + panel_height
+        bottom_y0 = top_y1 + panel_gap
+        bottom_y1 = height - margin_bottom
+
+        canvas.create_rectangle(x0, top_y0, x1, top_y1, outline="#334155", width=1)
+        canvas.create_rectangle(x0, bottom_y0, x1, bottom_y1, outline="#334155", width=1)
+        canvas.create_text(x0 + 4, top_y0 - 8, anchor="w", text="PDR (%)", fill="#cbd5e1", font=("Consolas", 9))
+        canvas.create_text(x0 + 4, bottom_y0 - 8, anchor="w", text="Latency / Loss", fill="#cbd5e1", font=("Consolas", 9))
+
+        if not self.quality_points:
+            canvas.create_text(
+                (x0 + x1) / 2.0,
+                (top_y0 + bottom_y1) / 2.0,
+                text="Ping実行後に品質グラフを表示します",
+                fill="#94a3b8",
+                font=("Consolas", 11),
+            )
+            return
+
+        points = list(self.quality_points)
+        count = len(points)
+        plot_w = max(1.0, x1 - x0)
+        top_h = max(1.0, top_y1 - top_y0)
+        bottom_h = max(1.0, bottom_y1 - bottom_y0)
+        lat_max = max(20.0, max(float(p["p95_ms"]) for p in points) * 1.15)
+        loss_max = max(1, max(int(p["lost"]) for p in points))
+
+        def x_at(idx: int) -> float:
+            if count <= 1:
+                return x0 + (plot_w / 2.0)
+            return x0 + (plot_w * float(idx) / float(count - 1))
+
+        def pdr_y(value: float) -> float:
+            clipped = min(100.0, max(0.0, value))
+            return top_y1 - ((clipped / 100.0) * top_h)
+
+        def lat_y(value: float) -> float:
+            clipped = min(lat_max, max(0.0, value))
+            return bottom_y1 - ((clipped / lat_max) * bottom_h)
+
+        def loss_y(value: int) -> float:
+            clipped = min(loss_max, max(0, value))
+            return bottom_y1 - ((float(clipped) / float(loss_max)) * bottom_h)
+
+        for ratio, label in ((0.0, "0"), (0.5, "50"), (1.0, "100")):
+            y = top_y1 - (top_h * ratio)
+            canvas.create_line(x0, y, x1, y, fill="#1e293b", width=1)
+            canvas.create_text(x0 - 6, y, anchor="e", text=label, fill="#64748b", font=("Consolas", 8))
+
+        for ratio in (0.0, 0.5, 1.0):
+            y = bottom_y1 - (bottom_h * ratio)
+            canvas.create_line(x0, y, x1, y, fill="#1e293b", width=1)
+            lat_label = f"{lat_max * ratio:.0f}"
+            canvas.create_text(x0 - 6, y, anchor="e", text=lat_label, fill="#64748b", font=("Consolas", 8))
+            loss_label = f"{int(round(loss_max * ratio))}"
+            canvas.create_text(x1 + 6, y, anchor="w", text=loss_label, fill="#64748b", font=("Consolas", 8))
+
+        pdr_coords: list[float] = []
+        avg_coords: list[float] = []
+        p95_coords: list[float] = []
+        for idx, point in enumerate(points):
+            px = x_at(idx)
+            pdr_coords.extend([px, pdr_y(float(point["pdr"]))])
+            avg_coords.extend([px, lat_y(float(point["avg_ms"]))])
+            p95_coords.extend([px, lat_y(float(point["p95_ms"]))])
+            ly = loss_y(int(point["lost"]))
+            canvas.create_line(px, bottom_y1, px, ly, fill="#ef4444", width=1)
+
+        if len(pdr_coords) >= 4:
+            canvas.create_line(*pdr_coords, fill="#22c55e", width=2, smooth=True)
+            canvas.create_line(*avg_coords, fill="#38bdf8", width=2, smooth=True)
+            canvas.create_line(*p95_coords, fill="#f59e0b", width=2, smooth=True)
+        else:
+            canvas.create_oval(pdr_coords[0] - 2, pdr_coords[1] - 2, pdr_coords[0] + 2, pdr_coords[1] + 2, fill="#22c55e", outline="")
+            canvas.create_oval(avg_coords[0] - 2, avg_coords[1] - 2, avg_coords[0] + 2, avg_coords[1] + 2, fill="#38bdf8", outline="")
+            canvas.create_oval(p95_coords[0] - 2, p95_coords[1] - 2, p95_coords[0] + 2, p95_coords[1] + 2, fill="#f59e0b", outline="")
+
+        latest = points[-1]
+        canvas.create_text(
+            x1 - 6,
+            top_y0 + 8,
+            anchor="ne",
+            text=f"now pdr={latest['pdr']:.1f}%",
+            fill="#86efac",
+            font=("Consolas", 9, "bold"),
+        )
+        canvas.create_text(
+            x1 - 6,
+            bottom_y0 + 8,
+            anchor="ne",
+            text=f"avg={latest['avg_ms']:.1f}ms p95={latest['p95_ms']:.1f}ms loss={latest['lost']}",
+            fill="#bfdbfe",
+            font=("Consolas", 9),
+        )
+
     def reset_stats(self) -> None:
         self.ping_stats.reset()
         self.pending_ping_ids.clear()
         self.pending_ping_sent_ms.clear()
         self.current_ping_id = uuid.uuid4().hex[:8]
+        self.quality_points.clear()
+        self.quality_graph_status_var.set("品質グラフ: リセット済み")
         self.update_stats_view()
+        self._draw_quality_graph(force=True)
         self.append_log("統計情報をリセットしました。", level="SYSTEM", category="PING")
 
     def update_stats_view(self) -> None:
@@ -2823,6 +2999,8 @@ class LPWAApp(tk.Tk):
         self.min_var.set(f"{snapshot['min_ms']:.1f} ms")
         self.max_var.set(f"{snapshot['max_ms']:.1f} ms")
         self.p95_var.set(f"{snapshot['p95_ms']:.1f} ms")
+        self._record_quality_point(snapshot)
+        self._draw_quality_graph()
 
     def save_logs(self) -> None:
         if not self.log_lines:
