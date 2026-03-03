@@ -401,7 +401,7 @@ class LPWAApp(tk.Tk):
         self.topology_window_combo = ttk.Combobox(
             ctrl,
             textvariable=self.topology_window_var,
-            values=("10", "30", "60", "120", "300"),
+            values=("1", "2", "10", "30", "60", "120", "300"),
             width=6,
             state="readonly",
         )
@@ -716,7 +716,7 @@ class LPWAApp(tk.Tk):
         self.topology_window_combo = ttk.Combobox(
             ctrl,
             textvariable=self.topology_window_var,
-            values=("10", "30", "60", "120", "300"),
+            values=("1", "2", "10", "30", "60", "120", "300"),
             width=6,
             state="readonly",
         )
