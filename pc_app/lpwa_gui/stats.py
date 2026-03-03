@@ -38,6 +38,9 @@ class PingStats:
         self.sent_count += 1
         self._pending_sent_ts[seq] = sent_ts_ms if sent_ts_ms is not None else _now_ms()
 
+    def expire_pending(self, seq: int) -> bool:
+        return self._pending_sent_ts.pop(seq, None) is not None
+
     def register_received(
         self,
         seq: int,

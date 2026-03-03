@@ -96,7 +96,7 @@ class EspNowMesh {
   bool hasStaMac_ = false;
   uint8_t staMac_[6]{};
   uint32_t nextMessageId_ = 1;
-  uint32_t lastNodeInfoMs_ = 0;
+  uint32_t nextNodeInfoDueMs_ = 0;
 };
 
 }  // namespace lpwa

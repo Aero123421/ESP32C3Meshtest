@@ -10,7 +10,8 @@
 namespace lpwa {
 
 namespace {
-constexpr uint8_t kTraceTelemetryTtl = kDefaultTtl;
+constexpr uint8_t kTraceTelemetryTtl = 3;
+constexpr uint32_t kTraceTelemetryMinIntervalMs = 120;
 
 bool isBroadcastTarget(const char* dst) {
   if (dst == nullptr || dst[0] == '\0') {
@@ -45,6 +46,7 @@ void SerialJsonBridge::begin(Stream* stream) {
   serial_ = stream;
   lineLength_ = 0;
   bridgeStats_ = BridgeStats{};
+  lastTraceTelemetryMs_ = 0;
 
   if (serial_ == nullptr) {
     return;
@@ -377,6 +379,8 @@ void SerialJsonBridge::handleLine(const char* line) {
     meshObj["tx_frames"] = meshStats.txFrames;
     meshObj["tx_success"] = meshStats.txSuccess;
     meshObj["tx_failed"] = meshStats.txFailed;
+    meshObj["tx_no_mem_retries"] = meshStats.txNoMemRetries;
+    meshObj["tx_no_mem_drops"] = meshStats.txNoMemDrops;
     meshObj["rx_frames"] = meshStats.rxFrames;
     meshObj["rx_queue_dropped"] = meshStats.rxQueueDropped;
     meshObj["rx_parse_errors"] = meshStats.rxParseErrors;
@@ -557,10 +561,18 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (mesh_ == nullptr || appType[0] == '\0' || std::strcmp(appType, "trace_obs") == 0) {
           return;
         }
+        if (std::strcmp(appType, "delivery_ack") == 0) {
+          return;
+        }
         if (std::strcmp(appType, "image_chunk") == 0 || std::strcmp(appType, "long_text_chunk") == 0) {
           // 高頻度チャンクはトレース配信を抑制し、テレメトリ過負荷を避ける。
           return;
         }
+        const uint32_t nowMs = millis();
+        if ((nowMs - lastTraceTelemetryMs_) < kTraceTelemetryMinIntervalMs) {
+          return;
+        }
+        lastTraceTelemetryMs_ = nowMs;
         StaticJsonDocument<512> trace;
         trace["app"] = "lpwa";
         trace["type"] = "trace_obs";

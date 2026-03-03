@@ -8,6 +8,8 @@ struct MeshStats {
   uint32_t txFrames = 0;
   uint32_t txSuccess = 0;
   uint32_t txFailed = 0;
+  uint32_t txNoMemRetries = 0;
+  uint32_t txNoMemDrops = 0;
   uint32_t rxFrames = 0;
   uint32_t rxQueueDropped = 0;
   uint32_t rxParseErrors = 0;

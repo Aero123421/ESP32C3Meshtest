@@ -20,6 +20,7 @@
 - 画像ファイル送信（`image_start` / `image_chunk` / `image_end`）
 - 受信画像の再構成保存（欠損chunk/サイズ不一致/ハッシュ不一致は保存しない）
 - Ping単発送信 / 連続テスト
+- Broadcast Pingの複数応答を1ラウンドとして扱い、遅延Pongを誤警告しにくい集計
 - PDR / 遅延統計（sent, received, lost, pdr, avg, min, max, p95）
 - 試験タブ下部に通信品質グラフ（PDR / Avg / P95 / Loss）をリアルタイム表示
 - イベントログ表示と保存（レベル別色分け、横スクロール対応）

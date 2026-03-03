@@ -13,11 +13,12 @@ constexpr uint8_t kBleMagic = 0xC3;
 constexpr uint8_t kBleVersion = 1;
 constexpr uint8_t kBleTypeText = 1;
 constexpr uint32_t kDedupWindowMs = 30000;
-constexpr uint32_t kAdvertiseDurationMs = 220;
-constexpr uint32_t kAdvertiseGapMs = 15;
+constexpr uint32_t kAdvertiseDurationMs = 180;
+constexpr uint32_t kAdvertiseGapMs = 20;
+constexpr uint8_t kOriginAdvertiseRepeats = 14;
 
-constexpr uint16_t kScanInterval = 120;
-constexpr uint16_t kScanWindow = 20;
+constexpr uint16_t kScanInterval = 200;
+constexpr uint16_t kScanWindow = 25;
 
 #pragma pack(push, 1)
 struct BleAdvFrameHeader {
@@ -156,7 +157,14 @@ bool BleRelay::sendText(const char* text, uint8_t ttl, uint32_t* outMessageId) {
   std::memcpy(pending.text, text, len);
   pending.text[len] = '\0';
 
-  if (!enqueuePending(pending)) {
+  bool enqueued = false;
+  for (uint8_t i = 0; i < kOriginAdvertiseRepeats; ++i) {
+    if (enqueuePending(pending)) {
+      enqueued = true;
+    }
+  }
+
+  if (!enqueued) {
     stats_.txRejected++;
     return false;
   }

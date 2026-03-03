@@ -46,6 +46,7 @@ class SerialJsonBridge {
   char lineBuffer_[kLineBufferSize]{};
   size_t lineLength_ = 0;
   BridgeStats bridgeStats_{};
+  uint32_t lastTraceTelemetryMs_ = 0;
 };
 
 }  // namespace lpwa

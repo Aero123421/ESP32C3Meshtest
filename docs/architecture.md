@@ -75,11 +75,20 @@
 - ノードごとの個別設定なしで同一ファームを配布して使用する前提
 - ESP-NOW初期化時に以下を自動適用:
   - `esp_wifi_set_max_tx_power(84)`（21dBm相当、法規/実装制限に依存）
+  - `esp_wifi_set_ps(WIFI_PS_NONE)`（Wi-Fi省電力OFFで応答遅延を抑制）
+  - `esp_wifi_set_protocol(...11b/11g/11n + LR)`（長距離寄りの既定）
   - 送信フレームのオリジン側リピート送信（既定3回）
-  - 中継転送時のランダムジッタ（衝突確率低減）
+  - オリジン再送間隔と中継転送間隔のランダムジッタ（衝突確率低減）
+  - NodeInfo周期の延長（10s→15s）で常時オーバーヘッド抑制
+  - NodeInfo送信タイミングの個体ジッタ化（同時送信バースト緩和）
+  - フレーム種別ごとの中継再送回数（Fragment重視 / NodeInfo軽量）
+  - `esp_now_send` の `NO_MEM` 時に短いバックオフ再試行
+  - `trace_obs` は `TTL=3` + 最短送信間隔（120ms）でテレメトリ過負荷を抑制
 - 補足:
-  - BLE共存を維持するため、現行既定では `WIFI_PROTOCOL_LR` を有効化しない
-  - Wi-Fi専用ビルドでのみ LR を段階的に評価する
+  - 必要に応じて `platformio.ini` の build flag で切替可能
+    - `LPWA_ENABLE_WIFI_LR`（0/1）
+    - `LPWA_MESH_CHANNEL`（1..14）
+    - `LPWA_MESH_TX_POWER_QDBM`（8..84）
 
 ## 7. Wi-Fi/BLEメッシュの使い分け設計
 - Wi-Fiメッシュを優先する場面:

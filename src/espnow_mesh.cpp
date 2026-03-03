@@ -12,6 +12,25 @@ namespace lpwa {
 namespace {
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint32_t kParseRejectDuplicateWindowMs = 250;
+
+uint16_t randomDelayMs(uint16_t minMs, uint16_t maxMs) {
+  if (maxMs < minMs) {
+    return minMs;
+  }
+  if (maxMs == minMs) {
+    return minMs;
+  }
+  const uint32_t span = static_cast<uint32_t>(maxMs - minMs) + 1U;
+  const uint32_t r = esp_random() % span;
+  return static_cast<uint16_t>(static_cast<uint32_t>(minMs) + r);
+}
+
+void delayRandomRange(uint16_t minMs, uint16_t maxMs) {
+  const uint16_t waitMs = randomDelayMs(minMs, maxMs);
+  if (waitMs > 0) {
+    delay(waitMs);
+  }
+}
 }
 
 EspNowMesh* EspNowMesh::instance_ = nullptr;
@@ -58,6 +77,32 @@ bool EspNowMesh::begin() {
   WiFi.disconnect();
   delay(20);
 
+  // Best-effort tuning: if a platform build does not support one of these knobs,
+  // continue with defaults instead of failing mesh startup.
+#if LPWA_ENABLE_BLE_RELAY
+  // Wi-Fi + BLE coexist requires modem sleep enabled on ESP32-C3.
+  (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+#else
+  (void)esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
+  (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+  uint8_t protocolMask = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
+#ifdef WIFI_PROTOCOL_LR
+  protocolMask = static_cast<uint8_t>(protocolMask | WIFI_PROTOCOL_LR);
+#endif
+#endif
+  esp_err_t protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, protocolMask);
+#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
+#ifdef WIFI_PROTOCOL_LR
+  if (protocolResult != ESP_OK) {
+    protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  }
+#endif
+#endif
+  (void)protocolResult;
+
   hasStaMac_ = false;
   std::memset(staMac_, 0, sizeof(staMac_));
   if (esp_wifi_get_mac(WIFI_IF_STA, staMac_) == ESP_OK) {
@@ -70,7 +115,7 @@ bool EspNowMesh::begin() {
   }
 
   // 84 == 21.0 dBm in 0.25 dBm steps (chip/regulatory limits still apply).
-  const esp_err_t txPowerResult = esp_wifi_set_max_tx_power(84);
+  const esp_err_t txPowerResult = esp_wifi_set_max_tx_power(kMeshTxPowerQuarterDbm);
   if (txPowerResult != ESP_OK) {
     return false;
   }
@@ -107,7 +152,9 @@ bool EspNowMesh::begin() {
     selfNode->freeHeap = ESP.getFreeHeap();
   }
 
-  lastNodeInfoMs_ = millis();
+  const uint32_t nowMs = millis();
+  const uint32_t firstDelay = randomDelayMs(kNodeInfoInitialJitterMinMs, kNodeInfoInitialJitterMaxMs);
+  nextNodeInfoDueMs_ = nowMs + firstDelay;
   return true;
 }
 
@@ -119,9 +166,10 @@ void EspNowMesh::loop() {
   stats_.reassemblyTimeouts += droppedByTimeout;
 
   const uint32_t nowMs = millis();
-  if ((nowMs - lastNodeInfoMs_) >= kNodeInfoPeriodMs) {
+  if (static_cast<int32_t>(nowMs - nextNodeInfoDueMs_) >= 0) {
     sendNodeInfo(3);
-    lastNodeInfoMs_ = nowMs;
+    const uint32_t jitterMs = randomDelayMs(0, kNodeInfoJitterMaxMs);
+    nextNodeInfoDueMs_ = nowMs + kNodeInfoPeriodMs + jitterMs;
   }
 }
 
@@ -334,21 +382,23 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
       MeshFrameHeader* forwardHeader = reinterpret_cast<MeshFrameHeader*>(forwardBuffer);
       forwardHeader->ttl = static_cast<uint8_t>(forwardHeader->ttl - 1);
       forwardHeader->hops = static_cast<uint8_t>(forwardHeader->hops + 1);
-      const uint8_t attempts = kForwardSendAttempts > 0 ? kForwardSendAttempts : 1;
+      uint8_t attempts = 1;
+      if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
+        attempts = kForwardSendAttemptsNodeInfo;
+      } else {
+        attempts = kForwardSendAttemptsFragment;
+      }
+      if (attempts == 0) {
+        attempts = 1;
+      }
       bool forwarded = false;
       for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
         if (sendRaw(forwardBuffer, item.len)) {
           forwarded = true;
           break;
         }
-        if ((attempt + 1) < attempts && kForwardJitterMaxMs > 0) {
-          const uint32_t jitterMaxExclusive =
-              static_cast<uint32_t>(kForwardJitterMaxMs) + static_cast<uint32_t>(1);
-          const uint32_t jitterMs = static_cast<uint32_t>(
-              random(static_cast<long>(kForwardJitterMinMs), static_cast<long>(jitterMaxExclusive)));
-          if (jitterMs > 0) {
-            delay(jitterMs);
-          }
+        if ((attempt + 1) < attempts) {
+          delayRandomRange(kForwardJitterMinMs, kForwardJitterMaxMs);
         }
       }
       if (forwarded) {
@@ -539,15 +589,15 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
       if (sendRaw(frame, frameLen)) {
         sentAny = true;
       }
-      if ((attempt + 1) < kOriginFrameRepeatCount && kOriginFrameRepeatGapMs > 0) {
-        delay(kOriginFrameRepeatGapMs);
+      if ((attempt + 1) < kOriginFrameRepeatCount) {
+        delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
     if (!sentAny) {
       return false;
     }
-    if (kOriginFrameRepeatGapMs > 0) {
-      delay(kOriginFrameRepeatGapMs);
+    if ((index + 1) < fragmentCount) {
+      delayRandomRange(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
     }
   }
 
@@ -622,12 +672,24 @@ bool EspNowMesh::sendRaw(const uint8_t* data, size_t len) {
   }
 
   stats_.txFrames++;
-  const esp_err_t result = esp_now_send(kBroadcastMac, data, len);
-  if (result != ESP_OK) {
-    stats_.txFailed++;
-    return false;
+  const uint8_t maxAttempts = static_cast<uint8_t>(kSendRawNoMemRetries + 1U);
+  esp_err_t result = ESP_FAIL;
+  for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
+    result = esp_now_send(kBroadcastMac, data, len);
+    if (result == ESP_OK) {
+      return true;
+    }
+    if (result != ESP_ERR_ESPNOW_NO_MEM || (attempt + 1) >= maxAttempts) {
+      break;
+    }
+    stats_.txNoMemRetries++;
+    delayRandomRange(kSendRawNoMemBackoffMinMs, kSendRawNoMemBackoffMaxMs);
   }
-  return true;
+  if (result == ESP_ERR_ESPNOW_NO_MEM) {
+    stats_.txNoMemDrops++;
+  }
+  stats_.txFailed++;
+  return false;
 }
 
 bool EspNowMesh::queueInbound(const ReassembledMessage& message) {

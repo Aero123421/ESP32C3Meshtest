@@ -4,29 +4,74 @@
 
 namespace lpwa {
 
+#ifndef LPWA_MESH_CHANNEL
+#define LPWA_MESH_CHANNEL 1
+#endif
+
+#ifndef LPWA_ENABLE_WIFI_LR
+#define LPWA_ENABLE_WIFI_LR 1
+#endif
+
+#ifndef LPWA_ENABLE_BLE_RELAY
+#define LPWA_ENABLE_BLE_RELAY 1
+#endif
+
+#ifndef LPWA_ALLOW_WIFI_LR_WITH_BLE
+#define LPWA_ALLOW_WIFI_LR_WITH_BLE 0
+#endif
+
+#ifndef LPWA_MESH_TX_POWER_QDBM
+#define LPWA_MESH_TX_POWER_QDBM 84
+#endif
+
 constexpr uint16_t kMeshMagic = 0x4C50;
 constexpr uint8_t kMeshVersion = 1;
 constexpr uint8_t kDefaultTtl = 10;
-constexpr uint8_t kMeshChannel = 1;
+constexpr uint8_t kMeshChannel = LPWA_MESH_CHANNEL;
+constexpr int8_t kMeshTxPowerQuarterDbm = LPWA_MESH_TX_POWER_QDBM;
+#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
+constexpr bool kWifiLongRangeDefault = true;
+#else
+constexpr bool kWifiLongRangeDefault = false;
+#endif
+#if LPWA_ENABLE_BLE_RELAY
+constexpr bool kBleRelayDefault = true;
+#else
+constexpr bool kBleRelayDefault = false;
+#endif
 
 constexpr size_t kEspNowMaxPayload = 250;
 constexpr size_t kFragmentChunkSize = 180;
 constexpr size_t kMaxAppPayload = 1024;
 constexpr size_t kMaxFragments = (kMaxAppPayload + kFragmentChunkSize - 1) / kFragmentChunkSize;
 
-constexpr uint32_t kNodeInfoPeriodMs = 10000;
+constexpr uint32_t kNodeInfoPeriodMs = 15000;
+constexpr uint16_t kNodeInfoInitialJitterMinMs = 800;
+constexpr uint16_t kNodeInfoInitialJitterMaxMs = 4200;
+constexpr uint16_t kNodeInfoJitterMaxMs = 1800;
 constexpr uint32_t kDuplicateWindowMs = 30000;
-constexpr uint32_t kReassemblyTimeoutMs = 15000;
+constexpr uint32_t kReassemblyTimeoutMs = 22000;
+#if LPWA_ENABLE_BLE_RELAY
+constexpr uint8_t kOriginFrameRepeatCount = 5;
+#else
 constexpr uint8_t kOriginFrameRepeatCount = 3;
-constexpr uint8_t kOriginFrameRepeatGapMs = 4;
-constexpr uint8_t kForwardJitterMinMs = 2;
-constexpr uint8_t kForwardJitterMaxMs = 9;
-constexpr uint8_t kForwardSendAttempts = 2;
-constexpr uint8_t kRxProcessBudgetPerLoop = 24;
+#endif
+constexpr uint8_t kOriginFrameRepeatGapMinMs = 4;
+constexpr uint8_t kOriginFrameRepeatGapMaxMs = 10;
+constexpr uint8_t kInterFragmentGapMinMs = 5;
+constexpr uint8_t kInterFragmentGapMaxMs = 12;
+constexpr uint8_t kForwardJitterMinMs = 8;
+constexpr uint8_t kForwardJitterMaxMs = 28;
+constexpr uint8_t kForwardSendAttemptsFragment = 3;
+constexpr uint8_t kForwardSendAttemptsNodeInfo = 1;
+constexpr uint8_t kSendRawNoMemRetries = 2;
+constexpr uint8_t kSendRawNoMemBackoffMinMs = 2;
+constexpr uint8_t kSendRawNoMemBackoffMaxMs = 8;
+constexpr uint8_t kRxProcessBudgetPerLoop = 40;
 
 constexpr size_t kMaxKnownNodes = 32;
 constexpr size_t kInboundMessageQueueDepth = 32;
-constexpr size_t kRxQueueDepth = 96;
+constexpr size_t kRxQueueDepth = 128;
 
 enum class FrameType : uint8_t {
   Fragment = 1,
@@ -72,5 +117,8 @@ struct NodeInfoPayload {
 static_assert(sizeof(MeshFrameHeader) == 14, "MeshFrameHeader size mismatch");
 static_assert(sizeof(FragmentMeta) == 8, "FragmentMeta size mismatch");
 static_assert(sizeof(NodeInfoPayload) == 28, "NodeInfoPayload size mismatch");
+static_assert(kMeshChannel >= 1 && kMeshChannel <= 14, "LPWA_MESH_CHANNEL must be 1..14");
+static_assert(kMeshTxPowerQuarterDbm >= 8 && kMeshTxPowerQuarterDbm <= 84,
+              "LPWA_MESH_TX_POWER_QDBM must be 8..84");
 
 }  // namespace lpwa

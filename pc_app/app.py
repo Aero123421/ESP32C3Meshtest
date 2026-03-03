@@ -67,6 +67,7 @@ QUALITY_GRAPH_MIN_REDRAW_INTERVAL_MS = 200
 MAX_WORKER_EVENTS_PER_TICK = 120
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
 PING_PENDING_MAX_AGE_MS = 20000
+PING_BROADCAST_RESPONSE_WINDOW_MS = 2600
 TOPOLOGY_VIEW_CHOICES = ("tree", "flow", "both")
 TOPOLOGY_KIND_CHOICES = (
     "all",
@@ -129,9 +130,7 @@ class LPWAApp(tk.Tk):
         self.registry = NodeRegistry()
         self.ping_stats = PingStats()
         self.ping_seq = 0
-        self.current_ping_id = uuid.uuid4().hex[:8]
-        self.pending_ping_ids: dict[int, str] = {}
-        self.pending_ping_sent_ms: dict[int, int] = {}
+        self.pending_ping_rounds: dict[int, dict[str, Any]] = {}
         self.pending_e2e: dict[str, dict[str, Any]] = {}
         self.rx_seen_e2e: dict[str, int] = {}
         self.long_text_seen: dict[str, int] = {}
@@ -1046,22 +1045,37 @@ class LPWAApp(tk.Tk):
             )
 
     def _prune_stale_pending_pings(self) -> None:
-        if not self.pending_ping_ids:
+        if not self.pending_ping_rounds:
             return
         now = self._now_ms()
-        stale = []
-        for seq, ping_id in list(self.pending_ping_ids.items()):
-            sent_ms = self.pending_ping_sent_ms.get(seq)
-            if sent_ms is None:
-                stale.append((seq, ping_id, None))
+        stale: list[tuple[int, int, int]] = []
+        for seq, round_info in list(self.pending_ping_rounds.items()):
+            sent_ms = int(round_info.get("sent_ms") or 0)
+            if sent_ms <= 0:
+                stale.append((seq, 0, 0))
                 continue
-            if (now - sent_ms) > PING_PENDING_MAX_AGE_MS:
-                stale.append((seq, ping_id, now - sent_ms))
-        for seq, _ping_id, _age in stale:
-            self.pending_ping_ids.pop(seq, None)
-            self.pending_ping_sent_ms.pop(seq, None)
+            if bool(round_info.get("is_broadcast")):
+                deadline = int(round_info.get("response_deadline_ms") or 0)
+                if deadline > 0 and now >= deadline:
+                    replies = len(round_info.get("responders") or set())
+                    stale.append((seq, max(0, now - sent_ms), replies))
+                    continue
+            age = now - sent_ms
+            if age > PING_PENDING_MAX_AGE_MS:
+                replies = len(round_info.get("responders") or set())
+                stale.append((seq, age, replies))
+        for seq, _age, _replies in stale:
+            self.pending_ping_rounds.pop(seq, None)
+            self.ping_stats.expire_pending(seq)
         if stale:
-            self.append_log(f"ping pending prune: removed={len(stale)}", level="WARN", category="PING")
+            no_reply = sum(1 for _, _, replies in stale if replies <= 0)
+            if no_reply > 0:
+                with_reply = len(stale) - no_reply
+                self.append_log(
+                    f"ping pending prune: removed={len(stale)} no_reply={no_reply} partial_or_done={with_reply}",
+                    level="WARN",
+                    category="PING",
+                )
 
     def _prune_rx_sessions(self) -> None:
         now = self._now_ms()
@@ -1975,8 +1989,7 @@ class LPWAApp(tk.Tk):
 
     def _clear_runtime_state(self) -> None:
         self.stop_continuous_ping()
-        self.pending_ping_ids.clear()
-        self.pending_ping_sent_ms.clear()
+        self.pending_ping_rounds.clear()
         self.pending_e2e.clear()
         self.long_text_seen.clear()
         self.image_rx_sessions.clear()
@@ -2736,13 +2749,21 @@ class LPWAApp(tk.Tk):
         seq = self.ping_seq
         dst = self._normalize_target(self.ping_target_var.get())
         ttl = self._current_ttl()
-        payload = make_ping_message(seq=seq, dst=dst, ping_id=self.current_ping_id, via="wifi", ttl=ttl)
+        ping_id = uuid.uuid4().hex[:8]
+        payload = make_ping_message(seq=seq, dst=dst, ping_id=ping_id, via="wifi", ttl=ttl)
         if not self.send_json(payload):
             return False
         sent_ms = self._now_ms()
-        self.ping_stats.register_sent(seq)
-        self.pending_ping_ids[seq] = self.current_ping_id
-        self.pending_ping_sent_ms[seq] = sent_ms
+        self.ping_stats.register_sent(seq, sent_ts_ms=sent_ms)
+        self.pending_ping_rounds[seq] = {
+            "ping_id": ping_id,
+            "sent_ms": sent_ms,
+            "dst": dst or BROADCAST_LABEL,
+            "is_broadcast": dst is None,
+            "responders": set(),
+            "registered_first": False,
+            "response_deadline_ms": sent_ms + PING_BROADCAST_RESPONSE_WINDOW_MS,
+        }
         self.update_stats_view()
         return True
 
@@ -2759,18 +2780,18 @@ class LPWAApp(tk.Tk):
         if seq is None:
             return
 
-        expected_ping_id = self.pending_ping_ids.get(seq)
-        if expected_ping_id is None:
-            self.append_log(f"pong ignored: no pending seq={seq}", level="WARN", category="PING")
+        round_info = self.pending_ping_rounds.get(seq)
+        if round_info is None:
             return
+        expected_ping_id = str(round_info.get("ping_id") or "")
         received_ping_id = payload.get("ping_id")
         if isinstance(expected_ping_id, str) and expected_ping_id:
             if str(received_ping_id or "") != expected_ping_id:
-                sent_ms = self.pending_ping_sent_ms.get(seq)
-                age_ms = None if sent_ms is None else max(0, self._now_ms() - sent_ms)
+                sent_ms = int(round_info.get("sent_ms") or 0)
+                age_ms = max(0, self._now_ms() - sent_ms) if sent_ms > 0 else None
                 if age_ms is not None and age_ms > PING_PENDING_MAX_AGE_MS:
-                    self.pending_ping_ids.pop(seq, None)
-                    self.pending_ping_sent_ms.pop(seq, None)
+                    self.pending_ping_rounds.pop(seq, None)
+                    self.ping_stats.expire_pending(seq)
                     self.append_log(
                         (
                             f"pong stale pending dropped: seq={seq} expected={expected_ping_id} "
@@ -2790,14 +2811,44 @@ class LPWAApp(tk.Tk):
                 )
                 return
 
-        measured = self.ping_stats.register_received(seq, recv_ts_ms=int(time.time() * 1000), latency_ms=None)
-        self.pending_ping_ids.pop(seq, None)
-        self.pending_ping_sent_ms.pop(seq, None)
-        if measured is not None:
-            src = payload.get("src") or payload.get("from")
-            if isinstance(src, str) and src.strip():
-                self.registry.upsert_from_payload({"node_id": src, "latency_ms": measured})
-                self.refresh_node_table()
+        now_ms = self._now_ms()
+        if bool(round_info.get("is_broadcast")):
+            deadline = int(round_info.get("response_deadline_ms") or 0)
+            if deadline > 0 and now_ms > deadline:
+                self.pending_ping_rounds.pop(seq, None)
+                self.ping_stats.expire_pending(seq)
+                return
+
+        src_raw = payload.get("src") or payload.get("from")
+        src = str(src_raw).strip() if isinstance(src_raw, str) else ""
+        responders = round_info.get("responders")
+        if not isinstance(responders, set):
+            responders = set()
+            round_info["responders"] = responders
+        if src:
+            if src in responders:
+                return
+            responders.add(src)
+
+        sent_ms = int(round_info.get("sent_ms") or self._now_ms())
+        measured: float | None = None
+        if not bool(round_info.get("registered_first")):
+            measured = self.ping_stats.register_received(seq, recv_ts_ms=now_ms, latency_ms=None)
+            round_info["registered_first"] = True
+        else:
+            measured = float(max(0, now_ms - sent_ms))
+
+        if src and measured is not None:
+            self.registry.upsert_from_payload({"node_id": src, "latency_ms": measured})
+            self.refresh_node_table()
+
+        if not bool(round_info.get("is_broadcast")):
+            self.pending_ping_rounds.pop(seq, None)
+        else:
+            deadline = int(round_info.get("response_deadline_ms") or 0)
+            if deadline > 0 and now_ms >= deadline:
+                self.pending_ping_rounds.pop(seq, None)
+                self.ping_stats.expire_pending(seq)
 
         self.update_stats_view()
 
@@ -2980,9 +3031,7 @@ class LPWAApp(tk.Tk):
 
     def reset_stats(self) -> None:
         self.ping_stats.reset()
-        self.pending_ping_ids.clear()
-        self.pending_ping_sent_ms.clear()
-        self.current_ping_id = uuid.uuid4().hex[:8]
+        self.pending_ping_rounds.clear()
         self.quality_points.clear()
         self.quality_graph_status_var.set("品質グラフ: リセット済み")
         self.update_stats_view()
