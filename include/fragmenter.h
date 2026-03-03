@@ -33,7 +33,7 @@ class ReassemblyManager {
   void PruneExpired(uint32_t nowMs, uint32_t timeoutMs, uint32_t* droppedCount);
 
  private:
-  static constexpr size_t kSlotCount = 6;
+  static constexpr size_t kSlotCount = 16;
 
   struct Slot {
     bool active = false;
@@ -56,4 +56,3 @@ class ReassemblyManager {
 };
 
 }  // namespace lpwa
-

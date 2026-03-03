@@ -46,26 +46,44 @@ python -m platformio device list
 ```
 
 確認ポイント:
-- `COMx` が3台それぞれ固有に割り当てられている
+- `COMx` が各ノードに固有に割り当てられている
 - 接続し直すたびにCOM番号が変わる場合は試験前に固定メモを更新する
 
-## 7. 3台同時運用（推奨）
+## 7. 複数台同時運用（推奨）
 - 書き込み:
 
 ```powershell
 .\tools\flash_all.ps1 -Ports COM5,COM6,COM7
+# もしくは
+.\tools\flash_all.ps1 -Ports @("COM5","COM6","COM7")
+```
+
+10台例:
+
+```powershell
+.\tools\flash_all.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12
 ```
 
 - モニタ:
 
 ```powershell
 .\tools\monitor_all.ps1 -Ports COM5,COM6,COM7 -Baud 115200
+# もしくは
+.\tools\monitor_all.ps1 -Ports @("COM5","COM6","COM7") -Baud 115200
+```
+
+ログ保存先を固定したい場合:
+
+```powershell
+.\tools\monitor_all.ps1 -Ports COM5,COM6,COM7 -Baud 115200 -LogDir .\test_logs\session_20260303
 ```
 
 - 試験セッション準備:
 
 ```powershell
 .\tools\prepare_test_session.ps1 -Ports COM5,COM6,COM7
+# もしくは
+.\tools\prepare_test_session.ps1 -Ports @("COM5","COM6","COM7")
 ```
 
 ## 8. 典型的なトラブルと対処
@@ -80,5 +98,5 @@ python -m platformio device list
 
 ## 9. 運用ルール（推奨）
 - ノードとCOMポートの対応を毎回 `test_logs` に残す
-- 3台同時テスト時は同一コミットのファームを使用する
+- 複数台同時テスト時は同一コミットのファームを使用する
 - 失敗ログは「時刻・ポート・試験ID」を含めて保存する

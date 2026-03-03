@@ -64,8 +64,12 @@
   - `ttl > 0` のときのみ転送
   - 受信時に `ttl--`、`hop++`
 - ACK/再送:
-  - 現行バージョンでは ESP-NOW層の送信結果とアプリ層統計を中心に運用
-  - 宛先指向ACK/再送は次期拡張（`TODO`）
+  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `image_*` は `need_ack=true` + `e2e_id` を付与
+  - 受信ノードは `delivery_ack` を送信元へ返し、PC GUIは `e2e_id` で照合して完了判定する
+  - GUI再送ポリシー:
+    - timeout: 1500ms
+    - max retry: 2（合計3送信）
+  - Broadcast送信とBLE送信は `delivery_ack` 対象外
 
 ## 7. Wi-Fi/BLEメッシュの使い分け設計
 - Wi-Fiメッシュを優先する場面:

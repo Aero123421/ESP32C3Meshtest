@@ -62,9 +62,9 @@ class EspNowMesh {
   bool parseHeader(const uint8_t* data, size_t len, MeshFrameHeader* outHeader, const uint8_t** outBody,
                    size_t* outBodyLen) const;
 
-  void handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
+  bool handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                            uint32_t nowMs);
-  void handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
+  bool handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                            int8_t rssi, uint32_t nowMs);
 
   bool sendPayload(AppPayloadType payloadType, const uint8_t* payload, size_t len, uint8_t ttl,
@@ -96,4 +96,3 @@ class EspNowMesh {
 };
 
 }  // namespace lpwa
-

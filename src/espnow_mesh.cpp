@@ -262,12 +262,17 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
     originNode->lastRssi = item.rssi;
   }
 
+  bool parsedAndAccepted = false;
   if (header.type == static_cast<uint8_t>(FrameType::Fragment)) {
-    handleFragmentFrame(header, body, bodyLen, nowMs);
+    parsedAndAccepted = handleFragmentFrame(header, body, bodyLen, nowMs);
   } else if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
-    handleNodeInfoFrame(header, body, bodyLen, item.rssi, nowMs);
+    parsedAndAccepted = handleNodeInfoFrame(header, body, bodyLen, item.rssi, nowMs);
   } else {
     stats_.rxParseErrors++;
+    return;
+  }
+
+  if (!parsedAndAccepted) {
     return;
   }
 
@@ -310,11 +315,11 @@ bool EspNowMesh::parseHeader(const uint8_t* data, size_t len, MeshFrameHeader* o
   return true;
 }
 
-void EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
+bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                                      uint32_t nowMs) {
   if (body == nullptr || bodyLen < sizeof(FragmentMeta)) {
     stats_.rxParseErrors++;
-    return;
+    return false;
   }
 
   FragmentMeta fragmentMeta{};
@@ -325,11 +330,11 @@ void EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
   if (fragmentMeta.appType != static_cast<uint8_t>(AppPayloadType::Text) &&
       fragmentMeta.appType != static_cast<uint8_t>(AppPayloadType::Binary)) {
     stats_.rxParseErrors++;
-    return;
+    return false;
   }
   if (chunkLen != fragmentMeta.chunkLen) {
     stats_.rxParseErrors++;
-    return;
+    return false;
   }
 
   ReassembledMessage completed{};
@@ -338,7 +343,7 @@ void EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
       fragmentMeta.fragIndex, fragmentMeta.fragCount, fragmentMeta.totalLen, chunk,
       fragmentMeta.chunkLen, nowMs, &completed);
   if (!done) {
-    return;
+    return true;
   }
 
   if (queueInbound(completed)) {
@@ -346,26 +351,27 @@ void EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
   } else {
     stats_.rxQueueDropped++;
   }
+  return true;
 }
 
-void EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
+bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                                      int8_t rssi, uint32_t nowMs) {
   (void)header;
   if (body == nullptr || bodyLen < sizeof(NodeInfoPayload)) {
     stats_.rxParseErrors++;
-    return;
+    return false;
   }
 
   NodeInfoPayload remote{};
   std::memcpy(&remote, body, sizeof(remote));
   if (remote.nodeId == 0) {
     stats_.rxParseErrors++;
-    return;
+    return false;
   }
 
   NodeRecord* node = nullptr;
   if (!upsertNode(remote.nodeId, &node) || node == nullptr) {
-    return;
+    return false;
   }
 
   node->lastSeenMs = nowMs;
@@ -375,6 +381,7 @@ void EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_
   node->remoteRxFrames = remote.rxFrames;
   node->remoteTxFrames = remote.txFrames;
   stats_.nodeInfoReceived++;
+  return true;
 }
 
 bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload, size_t len, uint8_t ttl,
@@ -591,4 +598,3 @@ bool EspNowMesh::upsertNode(uint32_t nodeId, NodeRecord** outNode) {
 }
 
 }  // namespace lpwa
-

@@ -46,6 +46,10 @@ def make_chat_message(
     *,
     src: str = "pc",
     via: str = "wifi",
+    ttl: int | None = None,
+    require_ack: bool = False,
+    e2e_id: str | None = None,
+    retry_no: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "chat",
@@ -56,6 +60,13 @@ def make_chat_message(
     }
     if dst:
         payload["dst"] = dst
+    if ttl is not None:
+        payload["ttl"] = max(1, min(255, int(ttl)))
+    if require_ack and dst and via == "wifi":
+        payload["need_ack"] = True
+        payload["e2e_id"] = e2e_id or uuid.uuid4().hex
+    if retry_no is not None and int(retry_no) > 0:
+        payload["retry_no"] = int(retry_no)
     return payload
 
 
@@ -74,6 +85,7 @@ def make_ping_message(
     ping_id: str | None = None,
     src: str = "pc",
     via: str = "wifi",
+    ttl: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "ping",
@@ -85,6 +97,8 @@ def make_ping_message(
     }
     if dst:
         payload["dst"] = dst
+    if ttl is not None:
+        payload["ttl"] = max(1, min(255, int(ttl)))
     return payload
 
 
@@ -95,6 +109,8 @@ def make_image_messages(
     src: str = "pc",
     via: str = "wifi",
     chunk_size: int = MAX_IMAGE_CHUNK_BYTES,
+    ttl: int | None = None,
+    require_ack: bool = False,
 ) -> list[dict[str, Any]]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
@@ -119,6 +135,11 @@ def make_image_messages(
     }
     if dst:
         start["dst"] = dst
+    if ttl is not None:
+        start["ttl"] = max(1, min(255, int(ttl)))
+    if require_ack and dst and via == "wifi":
+        start["need_ack"] = True
+        start["e2e_id"] = f"{image_id}:s"
 
     messages: list[dict[str, Any]] = [start]
     for idx, offset in enumerate(range(0, len(raw), chunk_size)):
@@ -134,6 +155,11 @@ def make_image_messages(
         }
         if dst:
             packet["dst"] = dst
+        if ttl is not None:
+            packet["ttl"] = max(1, min(255, int(ttl)))
+        if require_ack and dst and via == "wifi":
+            packet["need_ack"] = True
+            packet["e2e_id"] = f"{image_id}:c:{idx}"
         messages.append(packet)
 
     end: dict[str, Any] = {
@@ -145,5 +171,10 @@ def make_image_messages(
     }
     if dst:
         end["dst"] = dst
+    if ttl is not None:
+        end["ttl"] = max(1, min(255, int(ttl)))
+    if require_ack and dst and via == "wifi":
+        end["need_ack"] = True
+        end["e2e_id"] = f"{image_id}:e"
     messages.append(end)
     return messages

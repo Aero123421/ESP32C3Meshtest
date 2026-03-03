@@ -11,7 +11,7 @@ namespace lpwa {
 class BleRelayScanCallbacks;
 
 constexpr size_t kBleRelayTextMax = 16;
-constexpr size_t kBleRelayQueueDepth = 12;
+constexpr size_t kBleRelayQueueDepth = 24;
 
 struct BleRelayMessage {
   uint32_t originId = 0;
@@ -95,7 +95,7 @@ class BleRelay {
   uint8_t inboundTail_ = 0;
   uint8_t inboundCount_ = 0;
 
-  DedupEntry dedup_[96]{};
+  DedupEntry dedup_[192]{};
   uint8_t dedupCursor_ = 0;
 
   bool scanStarted_ = false;

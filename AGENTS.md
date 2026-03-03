@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## 1. プロジェクトの目的
-- 対象ハード: Seeed Studio XIAO ESP32C3 を3台使用
+- 対象ハード: Seeed Studio XIAO ESP32C3 を3〜10台使用
 - 目的: 「P2P通信の確立」→「メッシュ化」→「通信距離の拡張」を段階的に実証する
 - 成果物:
   - 実機で再現できる書き込み・監視・試験手順
@@ -29,16 +29,16 @@
   - 使用地域の電波法規（日本: 技適、米国: FCC）に適合した範囲で運用する
   - 高負荷連続送信時は発熱に注意し、筐体内の放熱を確保する
 
-## 4. 実機テスト手順（3台）
+## 4. 実機テスト手順（複数台）
 1. 事前準備
-   - 3台のポートを固定割当（例: NodeA=`COM5`, NodeB=`COM6`, NodeC=`COM7`）
+   - ポートを固定割当（例: NodeA=`COM5`, NodeB=`COM6`, NodeC=`COM7` ...）
    - 外部アンテナ接続、電源ケーブル（データ対応）確認
 2. セッション初期化
-   - `tools/prepare_test_session.ps1` を実行し、記録テンプレートを生成
+   - `tools/prepare_test_session.ps1 -Ports <COM一覧>` を実行し、記録テンプレートを生成
 3. 一括書き込み
-   - `tools/flash_all.ps1 -Ports COM5,COM6,COM7` を実行
+   - `tools/flash_all.ps1 -Ports <COM一覧>` を実行
 4. 同時モニタ
-   - `tools/monitor_all.ps1 -Ports COM5,COM6,COM7` を実行
+   - `tools/monitor_all.ps1 -Ports <COM一覧> -LogDir test_logs/<session>` を実行
 5. 試験実施
    - `docs/test_plan.md` の順で実施し、結果を `test_logs/` に記録
 6. 片付け

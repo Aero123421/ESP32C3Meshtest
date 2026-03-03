@@ -6,7 +6,7 @@ namespace lpwa {
 
 constexpr uint16_t kMeshMagic = 0x4C50;
 constexpr uint8_t kMeshVersion = 1;
-constexpr uint8_t kDefaultTtl = 5;
+constexpr uint8_t kDefaultTtl = 10;
 constexpr uint8_t kMeshChannel = 1;
 
 constexpr size_t kEspNowMaxPayload = 250;
@@ -18,9 +18,9 @@ constexpr uint32_t kNodeInfoPeriodMs = 5000;
 constexpr uint32_t kDuplicateWindowMs = 30000;
 constexpr uint32_t kReassemblyTimeoutMs = 10000;
 
-constexpr size_t kMaxKnownNodes = 16;
-constexpr size_t kInboundMessageQueueDepth = 6;
-constexpr size_t kRxQueueDepth = 24;
+constexpr size_t kMaxKnownNodes = 32;
+constexpr size_t kInboundMessageQueueDepth = 16;
+constexpr size_t kRxQueueDepth = 64;
 
 enum class FrameType : uint8_t {
   Fragment = 1,
@@ -67,4 +67,3 @@ static_assert(sizeof(FragmentMeta) == 8, "FragmentMeta size mismatch");
 static_assert(sizeof(NodeInfoPayload) == 22, "NodeInfoPayload size mismatch");
 
 }  // namespace lpwa
-

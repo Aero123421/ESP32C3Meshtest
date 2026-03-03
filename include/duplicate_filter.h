@@ -17,7 +17,7 @@ class DuplicateFilter {
   void clear();
 
  private:
-  static constexpr size_t kCapacity = 192;
+  static constexpr size_t kCapacity = 512;
 
   struct Entry {
     DuplicateKey key{};
@@ -32,4 +32,3 @@ class DuplicateFilter {
 };
 
 }  // namespace lpwa
-

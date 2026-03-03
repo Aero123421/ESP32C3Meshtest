@@ -1,42 +1,76 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
     [string[]]$Ports,
 
     [int]$Baud = 115200,
 
-    [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$ProjectDir = "",
+
+    [string]$LogDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($Ports.Count -ne 3) {
-    throw "Ports は3台分を指定してください。例: -Ports COM5,COM6,COM7"
+$Ports = @(
+    $Ports |
+    ForEach-Object { $_ -split "," } |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne "" }
+)
+
+if ($Ports.Count -lt 1) {
+    throw "Specify at least one port. Example: -Ports COM5,COM6,COM7"
+}
+
+if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
+    $scriptRoot = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptRoot) -and $MyInvocation.MyCommand.Path) {
+        $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+        $scriptRoot = (Get-Location).Path
+    }
+    $ProjectDir = (Resolve-Path (Join-Path $scriptRoot "..")).Path
 }
 
 $pioCmd = Get-Command pio -ErrorAction SilentlyContinue
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pioCmd -and -not $pythonCmd) {
-    throw "pio も python も見つかりません。PlatformIO実行環境を確認してください。"
+    throw "Neither pio nor python was found. Check PlatformIO runtime."
 }
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if ([string]::IsNullOrWhiteSpace($LogDir)) {
+    $LogDir = Join-Path $ProjectDir ("test_logs\monitor_" + $timestamp)
+}
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 for ($i = 0; $i -lt $Ports.Count; $i++) {
     $port = $Ports[$i]
     $node = "Node$($i + 1)"
     $title = "PIO Monitor - $node ($port)"
+    $safePort = $port.Replace(":", "_").Replace("\", "_").Replace("/", "_")
+    $logFile = Join-Path $LogDir ("{0}_{1}.log" -f $node, $safePort)
+    $safeLogFile = $logFile.Replace("'", "''")
 
     $safeProjectDir = $ProjectDir.Replace("'", "''")
     if ($pioCmd) {
-        $monitorCmd = "pio device monitor --port $port --baud $Baud"
-    }
-    else {
-        $monitorCmd = "python -m platformio device monitor --port $port --baud $Baud"
-    }
-    $command = @"
+        $command = @"
 Set-Location '$safeProjectDir'
 `$Host.UI.RawUI.WindowTitle = '$title'
-$monitorCmd
+Write-Host 'Log file: $safeLogFile' -ForegroundColor DarkGray
+& pio device monitor --port '$port' --baud $Baud 2>&1 | Tee-Object -FilePath '$safeLogFile' -Append
 "@
+    }
+    else {
+        $command = @"
+Set-Location '$safeProjectDir'
+`$Host.UI.RawUI.WindowTitle = '$title'
+Write-Host 'Log file: $safeLogFile' -ForegroundColor DarkGray
+& python -m platformio device monitor --port '$port' --baud $Baud 2>&1 | Tee-Object -FilePath '$safeLogFile' -Append
+"@
+    }
 
     Start-Process powershell -ArgumentList @(
         "-NoExit",
@@ -44,7 +78,7 @@ $monitorCmd
         "-Command", $command
     ) | Out-Null
 
-    Write-Host ("モニタ起動: {0} ({1})" -f $node, $port) -ForegroundColor Green
+    Write-Host ("Monitor started: {0} ({1}) -> {2}" -f $node, $port, $logFile) -ForegroundColor Green
 }
 
-Write-Host "3台分のモニタを起動しました。" -ForegroundColor Cyan
+Write-Host ("Started monitors for {0} ports. Log root: {1}" -f $Ports.Count, $LogDir) -ForegroundColor Cyan

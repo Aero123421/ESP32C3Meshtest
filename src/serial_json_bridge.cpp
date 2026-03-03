@@ -171,6 +171,16 @@ void SerialJsonBridge::handleLine(const char* line) {
       if (!isBroadcastTarget(dst)) {
         envelope["dst"] = dst;
       }
+      if (request.containsKey("need_ack")) {
+        envelope["need_ack"] = request["need_ack"] | false;
+      }
+      if (request.containsKey("retry_no")) {
+        envelope["retry_no"] = request["retry_no"] | 0;
+      }
+      const char* e2eId = request["e2e_id"] | "";
+      if (e2eId[0] != '\0') {
+        envelope["e2e_id"] = e2eId;
+      }
 
       if (type == "chat") {
         String text = request["text"] | "";
@@ -433,6 +443,71 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       const char* appType = appDoc["type"] | "";
       const char* dst = appDoc["dst"] | "";
       const bool accepted = isSelfTarget(selfNodeId, dst);
+      const auto maybeSendDeliveryAck = [&](const char* ackFor) {
+        if (!accepted || mesh_ == nullptr || isBroadcastTarget(dst)) {
+          return;
+        }
+        const bool needAck = appDoc["need_ack"] | false;
+        if (!needAck) {
+          return;
+        }
+        const char* src = appDoc["src"] | "";
+        const char* e2eId = appDoc["e2e_id"] | "";
+        if (src[0] == '\0' || e2eId[0] == '\0' || equalsIgnoreCase(selfNodeId, src)) {
+          return;
+        }
+
+        StaticJsonDocument<384> ack;
+        ack["app"] = "lpwa";
+        ack["type"] = "delivery_ack";
+        ack["src"] = selfNodeId;
+        ack["dst"] = src;
+        ack["ack_for"] = (ackFor != nullptr) ? ackFor : "";
+        ack["e2e_id"] = e2eId;
+        ack["msg_id"] = message.messageId;
+        ack["status"] = "ok";
+        if (appDoc.containsKey("image_id")) {
+          ack["image_id"] = appDoc["image_id"] | "";
+        }
+        if (appDoc.containsKey("index")) {
+          ack["index"] = appDoc["index"] | 0;
+        }
+        if (appDoc.containsKey("retry_no")) {
+          ack["retry_no"] = appDoc["retry_no"] | 0;
+        }
+
+        String response;
+        serializeJson(ack, response);
+        mesh_->sendText(response.c_str(), appDoc["ttl"] | kDefaultTtl, nullptr);
+      };
+
+      if (std::strcmp(appType, "delivery_ack") == 0) {
+        if (!accepted) {
+          return;
+        }
+        DynamicJsonDocument out(384);
+        out["event"] = "delivery_ack";
+        out["type"] = "delivery_ack";
+        out["via"] = "wifi";
+        out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["ack_for"] = appDoc["ack_for"] | "";
+        out["e2e_id"] = appDoc["e2e_id"] | "";
+        out["msg_id"] = appDoc["msg_id"] | 0;
+        out["status"] = appDoc["status"] | "ok";
+        out["hops"] = message.hops;
+        if (appDoc.containsKey("image_id")) {
+          out["image_id"] = appDoc["image_id"] | "";
+        }
+        if (appDoc.containsKey("index")) {
+          out["index"] = appDoc["index"] | 0;
+        }
+        if (appDoc.containsKey("retry_no")) {
+          out["retry_no"] = appDoc["retry_no"] | 0;
+        }
+        serializeJson(out, *serial_);
+        serial_->println();
+        return;
+      }
 
       if (std::strcmp(appType, "ping") == 0) {
         if (accepted && mesh_ != nullptr) {
@@ -484,8 +559,15 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
         out["text"] = appDoc["text"] | "";
         out["hops"] = message.hops;
+        if (appDoc.containsKey("e2e_id")) {
+          out["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          out["retry_no"] = appDoc["retry_no"] | 0;
+        }
         serializeJson(out, *serial_);
         serial_->println();
+        maybeSendDeliveryAck("chat");
         return;
       }
 
@@ -502,6 +584,12 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
         out["hops"] = message.hops;
         out["image_id"] = appDoc["image_id"] | "";
+        if (appDoc.containsKey("e2e_id")) {
+          out["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          out["retry_no"] = appDoc["retry_no"] | 0;
+        }
         if (std::strcmp(appType, "image_start") == 0) {
           out["name"] = appDoc["name"] | "";
           out["size"] = appDoc["size"] | 0;
@@ -513,6 +601,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         }
         serializeJson(out, *serial_);
         serial_->println();
+        maybeSendDeliveryAck(appType);
         return;
       }
     }

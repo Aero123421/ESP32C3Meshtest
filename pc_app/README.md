@@ -6,14 +6,19 @@
 ## 機能
 
 - COMポート一覧表示 / 接続 / 切断
+- GUIからのBuild / ファーム書き込み（選択COM / 全COM）
 - ノード一覧表示（ID / RSSI / 最終受信時刻 / 最終メッセージ / 最新Ping）
+- ノード一覧の選択ノードをチャット/画像/Pingの宛先へ一括反映
+- 宛先コンボボックス（既知ノード候補 + Broadcast）
+- TTL設定（10ノード向けにGUIから調整可能）
 - チャット送信
 - チャット送信（`wifi` / `ble` 切替）
+- 宛先指定Wi-Fi送信のE2E配達確認（`delivery_ack`）と自動再送
 - 画像ファイル送信（`image_start` / `image_chunk` / `image_end`）
-- 受信画像の再構成保存（`received_images/`）
+- 受信画像の再構成保存（欠損chunk/サイズ不一致/ハッシュ不一致は保存しない）
 - Ping単発送信 / 連続テスト
 - PDR / 遅延統計（sent, received, lost, pdr, avg, min, max, p95）
-- イベントログ表示と保存
+- イベントログ表示と保存（レベル別色分け、横スクロール対応）
 
 ## ディレクトリ構成
 
@@ -77,6 +82,7 @@ python self_check.py
 
 - JSON Lines encode/decode roundtrip
 - 画像チャンク生成と再構築
+- E2E ACK関連フィールド（`need_ack` / `e2e_id` / `retry_no`）
 - Ping統計の基本計算
 
 ## JSON Lines プロトコル例
@@ -85,7 +91,7 @@ python self_check.py
 
 ```json
 {"type":"nodes_request","src":"pc","ts_ms":1710000000000}
-{"type":"chat","src":"pc","via":"wifi","dst":"0x00A1B2C3","text":"hello","ts_ms":1710000000001}
+{"type":"chat","src":"pc","via":"wifi","dst":"0x00A1B2C3","text":"hello","need_ack":true,"e2e_id":"chat-abc","ts_ms":1710000000001}
 {"type":"ping","src":"pc","dst":"node-2","seq":12,"ping_id":"a1b2c3d4","ts_ms":1710000000100}
 {"type":"image_start","src":"pc","dst":"node-2","image_id":"...","name":"photo.jpg","size":12345,"chunks":18,"sha256":"...","ts_ms":1710000000200}
 {"type":"image_chunk","src":"pc","dst":"node-2","image_id":"...","index":0,"data_b64":"...","ts_ms":1710000000201}
@@ -99,9 +105,11 @@ python self_check.py
 {"event":"mesh_rx","type":"chat","via":"wifi","src":"0x00A1B2C3","text":"hi from node","hops":1}
 {"event":"pong","type":"pong","src":"0x00A1B2C3","seq":12,"latency_ms":34.7}
 {"event":"ack","type":"ack","cmd":"chat","ok":true,"via":"wifi","msg_id":1234}
+{"event":"delivery_ack","type":"delivery_ack","src":"0x00A1B2C3","ack_for":"chat","e2e_id":"chat-abc","msg_id":1234,"status":"ok","hops":1}
 {"event":"error","type":"error","code":"payload_too_large","detail":"..."}
 ```
 
 注意:
 - BLE経路は広告メッシュのため短文用途です（実装上の文字数上限あり）。
 - 画像送信は `wifi` 前提です。
+- GUIから書き込みする場合、対象ポートを開いているシリアル接続は切断してから実行してください（アプリ側でも確認ダイアログを表示します）。

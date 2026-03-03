@@ -1,25 +1,43 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
     [string[]]$Ports,
 
     [string]$Environment = "seeed_xiao_esp32c3",
 
-    [string]$ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$ProjectDir = "",
 
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($Ports.Count -ne 3) {
-    throw "Ports は3台分を指定してください。例: -Ports COM5,COM6,COM7"
+$Ports = @(
+    $Ports |
+    ForEach-Object { $_ -split "," } |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne "" }
+)
+
+if ($Ports.Count -lt 1) {
+    throw "Specify at least one port. Example: -Ports COM5,COM6,COM7"
+}
+
+if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
+    $scriptRoot = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptRoot) -and $MyInvocation.MyCommand.Path) {
+        $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+        $scriptRoot = (Get-Location).Path
+    }
+    $ProjectDir = (Resolve-Path (Join-Path $scriptRoot "..")).Path
 }
 
 $pioCmd = Get-Command pio -ErrorAction SilentlyContinue
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pioCmd -and -not $pythonCmd) {
-    throw "pio も python も見つかりません。PlatformIO実行環境を確認してください。"
+    throw "Neither pio nor python was found. Check PlatformIO runtime."
 }
 
 function Invoke-Pio {
@@ -41,14 +59,15 @@ try {
         Write-Host "== Build start ($Environment) ==" -ForegroundColor Cyan
         Invoke-Pio -Args @("run", "-e", $Environment)
         if ($LASTEXITCODE -ne 0) {
-            throw "ビルドに失敗しました。"
+            throw "Build failed."
         }
     }
 
     $failed = @()
+    $total = $Ports.Count
     for ($i = 0; $i -lt $Ports.Count; $i++) {
         $port = $Ports[$i]
-        Write-Host ("== Upload [{0}/3] {1} ==" -f ($i + 1), $port) -ForegroundColor Yellow
+        Write-Host ("== Upload [{0}/{1}] {2} ==" -f ($i + 1), $total, $port) -ForegroundColor Yellow
         Invoke-Pio -Args @("run", "-e", $Environment, "-t", "upload", "--upload-port", $port)
         if ($LASTEXITCODE -ne 0) {
             $failed += $port
@@ -60,10 +79,10 @@ try {
     }
 
     if ($failed.Count -gt 0) {
-        throw ("書き込み失敗ポート: " + ($failed -join ", "))
+        throw ("Upload failed ports: " + ($failed -join ", "))
     }
 
-    Write-Host "3台すべて書き込み成功。" -ForegroundColor Green
+    Write-Host ("Upload succeeded on all {0} ports." -f $Ports.Count) -ForegroundColor Green
 }
 finally {
     Pop-Location
