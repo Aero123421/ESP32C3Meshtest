@@ -38,10 +38,12 @@ class SerialWorker:
         self.port = port
         self.baudrate = baudrate
         self._incoming_queue = incoming_queue
-        self._tx_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._tx_queue_max = 1024
+        self._tx_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self._tx_queue_max)
         self._read_timeout = read_timeout
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._tx_dropped = 0
 
     @property
     def is_running(self) -> bool:
@@ -60,8 +62,22 @@ class SerialWorker:
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
 
-    def send(self, payload: dict[str, Any]) -> None:
-        self._tx_queue.put(payload)
+    def send(self, payload: dict[str, Any]) -> bool:
+        try:
+            self._tx_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            self._tx_dropped += 1
+            self._emit(
+                {
+                    "_event": "error",
+                    "message": (
+                        f"送信キュー満杯: 新規送信要求を破棄しました "
+                        f"(dropped={self._tx_dropped}, max={self._tx_queue_max})"
+                    ),
+                }
+            )
+            return False
 
     def _emit(self, event: dict[str, Any]) -> None:
         self._incoming_queue.put(event)

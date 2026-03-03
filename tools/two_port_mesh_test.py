@@ -140,7 +140,13 @@ def main() -> int:
             if item is None:
                 continue
             history.append(item)
-            if item.get("_port") == "tx" and item.get("type") == "pong" and int(item.get("seq", -1)) == 99:
+            if (
+                item.get("_port") == "tx"
+                and item.get("type") == "pong"
+                and int(item.get("seq", -1)) == 99
+                and str(item.get("ping_id") or "") == "smoke99"
+                and str(item.get("src") or "").strip() == rx_node
+            ):
                 got_mesh_pong = item
         if got_mesh_pong is None:
             print("NG: mesh pong timeout")

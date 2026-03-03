@@ -14,13 +14,19 @@ constexpr size_t kFragmentChunkSize = 180;
 constexpr size_t kMaxAppPayload = 1024;
 constexpr size_t kMaxFragments = (kMaxAppPayload + kFragmentChunkSize - 1) / kFragmentChunkSize;
 
-constexpr uint32_t kNodeInfoPeriodMs = 5000;
+constexpr uint32_t kNodeInfoPeriodMs = 10000;
 constexpr uint32_t kDuplicateWindowMs = 30000;
-constexpr uint32_t kReassemblyTimeoutMs = 10000;
+constexpr uint32_t kReassemblyTimeoutMs = 15000;
+constexpr uint8_t kOriginFrameRepeatCount = 3;
+constexpr uint8_t kOriginFrameRepeatGapMs = 4;
+constexpr uint8_t kForwardJitterMinMs = 2;
+constexpr uint8_t kForwardJitterMaxMs = 9;
+constexpr uint8_t kForwardSendAttempts = 2;
+constexpr uint8_t kRxProcessBudgetPerLoop = 24;
 
 constexpr size_t kMaxKnownNodes = 32;
-constexpr size_t kInboundMessageQueueDepth = 16;
-constexpr size_t kRxQueueDepth = 64;
+constexpr size_t kInboundMessageQueueDepth = 32;
+constexpr size_t kRxQueueDepth = 96;
 
 enum class FrameType : uint8_t {
   Fragment = 1,

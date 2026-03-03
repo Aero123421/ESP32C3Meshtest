@@ -11,6 +11,9 @@ struct ReassembledMessage {
   uint32_t messageId = 0;
   AppPayloadType payloadType = AppPayloadType::Text;
   uint8_t hops = 0;
+  int8_t rssi = 0;
+  bool hasSenderMac = false;
+  uint8_t senderMac[6]{};
   uint16_t length = 0;
   uint8_t data[kMaxAppPayload]{};
 };
@@ -28,7 +31,8 @@ class ReassemblyManager {
 
   bool PushFragment(uint32_t originId, uint32_t messageId, AppPayloadType payloadType, uint8_t hops,
                     uint8_t fragIndex, uint8_t fragCount, uint16_t totalLen, const uint8_t* chunk,
-                    uint16_t chunkLen, uint32_t nowMs, ReassembledMessage* outMessage);
+                    uint16_t chunkLen, int8_t rssi, const uint8_t* senderMac, uint32_t nowMs,
+                    ReassembledMessage* outMessage);
 
   void PruneExpired(uint32_t nowMs, uint32_t timeoutMs, uint32_t* droppedCount);
 
@@ -45,6 +49,9 @@ class ReassemblyManager {
     uint16_t totalLen = 0;
     uint32_t receivedMask = 0;
     uint32_t lastUpdateMs = 0;
+    int8_t bestRssi = -128;
+    bool hasSenderMac = false;
+    uint8_t bestSenderMac[6]{};
     uint8_t data[kMaxAppPayload]{};
   };
 

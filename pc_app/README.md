@@ -14,6 +14,8 @@
 - チャット送信
 - チャット送信（`wifi` / `ble` 切替）
 - 宛先指定Wi-Fi送信のE2E配達確認（`delivery_ack`）と自動再送
+- 長文テキスト送信（大きいメッセージを `long_text_start/chunk/end` に自動分割）
+- 長文テキスト受信再構成（欠損/サイズ不一致/ハッシュ不一致は破棄）
 - 画像ファイル送信（`image_start` / `image_chunk` / `image_end`）
 - 受信画像の再構成保存（欠損chunk/サイズ不一致/ハッシュ不一致は保存しない）
 - Ping単発送信 / 連続テスト
@@ -40,6 +42,7 @@ pc_app/
 - Windows 10/11
 - Python 3.10 以上
 - `tkinter`（標準同梱）
+- `pyserial`（`pip install -r requirements.txt` で導入）
 
 ## セットアップ
 
@@ -82,6 +85,7 @@ python self_check.py
 
 - JSON Lines encode/decode roundtrip
 - 画像チャンク生成と再構築
+- 長文チャンク生成と再構築
 - E2E ACK関連フィールド（`need_ack` / `e2e_id` / `retry_no`）
 - Ping統計の基本計算
 
@@ -96,6 +100,9 @@ python self_check.py
 {"type":"image_start","src":"pc","dst":"node-2","image_id":"...","name":"photo.jpg","size":12345,"chunks":18,"sha256":"...","ts_ms":1710000000200}
 {"type":"image_chunk","src":"pc","dst":"node-2","image_id":"...","index":0,"data_b64":"...","ts_ms":1710000000201}
 {"type":"image_end","src":"pc","dst":"node-2","image_id":"...","ts_ms":1710000000300}
+{"type":"long_text_start","src":"pc","dst":"0x00A1B2C3","text_id":"...","encoding":"utf-8","size":1024,"chunks":6,"sha256":"...","need_ack":true,"e2e_id":"...:s","ts_ms":1710000000400}
+{"type":"long_text_chunk","src":"pc","dst":"0x00A1B2C3","text_id":"...","index":0,"data_b64":"...","need_ack":true,"e2e_id":"...:c:0","ts_ms":1710000000401}
+{"type":"long_text_end","src":"pc","dst":"0x00A1B2C3","text_id":"...","need_ack":true,"e2e_id":"...:e","ts_ms":1710000000402}
 ```
 
 ### Firmware -> PC（期待例）
@@ -112,4 +119,5 @@ python self_check.py
 注意:
 - BLE経路は広告メッシュのため短文用途です（実装上の文字数上限あり）。
 - 画像送信は `wifi` 前提です。
+- 長文テキストは既定で小さめチャンク（32 bytes）に分割し、宛先指定時は `delivery_ack` 再送を使って到達率を優先します。
 - GUIから書き込みする場合、対象ポートを開いているシリアル接続は切断してから実行してください（アプリ側でも確認ダイアログを表示します）。

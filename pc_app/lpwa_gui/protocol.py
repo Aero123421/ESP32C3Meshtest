@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 MAX_IMAGE_CHUNK_BYTES = 320
+MAX_LONG_TEXT_CHUNK_BYTES = 32
 
 
 class ProtocolError(Exception):
@@ -176,5 +177,89 @@ def make_image_messages(
     if require_ack and dst and via == "wifi":
         end["need_ack"] = True
         end["e2e_id"] = f"{image_id}:e"
+    messages.append(end)
+    return messages
+
+
+def make_long_text_messages(
+    text: str,
+    dst: str | None = None,
+    *,
+    src: str = "pc",
+    via: str = "wifi",
+    chunk_size: int = MAX_LONG_TEXT_CHUNK_BYTES,
+    ttl: int | None = None,
+    require_ack: bool = False,
+) -> list[dict[str, Any]]:
+    if via != "wifi":
+        raise ValueError("long text supports wifi only")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_size > MAX_LONG_TEXT_CHUNK_BYTES:
+        raise ValueError(f"chunk_size must be <= {MAX_LONG_TEXT_CHUNK_BYTES}")
+
+    raw = text.encode("utf-8")
+    text_id = uuid.uuid4().hex[:12]
+    ts = now_ms()
+    total_chunks = 0 if len(raw) == 0 else ((len(raw) - 1) // chunk_size) + 1
+    text_hash = hashlib.sha256(raw).hexdigest()
+
+    start: dict[str, Any] = {
+        "type": "long_text_start",
+        "src": src,
+        "via": via,
+        "text_id": text_id,
+        "encoding": "utf-8",
+        "size": len(raw),
+        "chunks": total_chunks,
+        "ts_ms": ts,
+    }
+    if dst:
+        start["dst"] = dst
+    if ttl is not None:
+        start["ttl"] = max(1, min(255, int(ttl)))
+    if require_ack and dst:
+        start["need_ack"] = True
+        start["e2e_id"] = f"{text_id}:s"
+
+    messages: list[dict[str, Any]] = [start]
+    for idx, offset in enumerate(range(0, len(raw), chunk_size)):
+        chunk = raw[offset : offset + chunk_size]
+        packet: dict[str, Any] = {
+            "type": "long_text_chunk",
+            "src": src,
+            "via": via,
+            "text_id": text_id,
+            "index": idx,
+            "data_b64": base64.b64encode(chunk).decode("ascii"),
+            "ts_ms": now_ms(),
+        }
+        if dst:
+            packet["dst"] = dst
+        if ttl is not None:
+            packet["ttl"] = max(1, min(255, int(ttl)))
+        if require_ack and dst:
+            packet["need_ack"] = True
+            packet["e2e_id"] = f"{text_id}:c:{idx}"
+        messages.append(packet)
+
+    end: dict[str, Any] = {
+        "type": "long_text_end",
+        "src": src,
+        "via": via,
+        "text_id": text_id,
+        "encoding": "utf-8",
+        "size": len(raw),
+        "chunks": total_chunks,
+        "sha256": text_hash,
+        "ts_ms": now_ms(),
+    }
+    if dst:
+        end["dst"] = dst
+    if ttl is not None:
+        end["ttl"] = max(1, min(255, int(ttl)))
+    if require_ack and dst:
+        end["need_ack"] = True
+        end["e2e_id"] = f"{text_id}:e"
     messages.append(end)
     return messages

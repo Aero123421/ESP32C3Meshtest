@@ -11,6 +11,7 @@ namespace lpwa {
 
 namespace {
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr uint32_t kParseRejectDuplicateWindowMs = 250;
 }
 
 EspNowMesh* EspNowMesh::instance_ = nullptr;
@@ -38,6 +39,7 @@ bool EspNowMesh::begin() {
   }
   stats_ = MeshStats{};
   duplicateFilter_.clear();
+  parseRejectFilter_.clear();
   nodeCount_ = 0;
   inboundHead_ = 0;
   inboundTail_ = 0;
@@ -56,7 +58,16 @@ bool EspNowMesh::begin() {
   WiFi.disconnect();
   delay(20);
 
-  esp_wifi_set_channel(kMeshChannel, WIFI_SECOND_CHAN_NONE);
+  const esp_err_t channelResult = esp_wifi_set_channel(kMeshChannel, WIFI_SECOND_CHAN_NONE);
+  if (channelResult != ESP_OK) {
+    return false;
+  }
+
+  // 84 == 21.0 dBm in 0.25 dBm steps (chip/regulatory limits still apply).
+  const esp_err_t txPowerResult = esp_wifi_set_max_tx_power(84);
+  if (txPowerResult != ESP_OK) {
+    return false;
+  }
 
   const esp_err_t initResult = esp_now_init();
   if (initResult != ESP_OK && initResult != ESP_ERR_ESPNOW_EXIST) {
@@ -219,8 +230,10 @@ void EspNowMesh::processRxQueue() {
   }
 
   RxQueueItem item{};
-  while (xQueueReceive(rxQueue_, &item, 0) == pdTRUE) {
+  uint8_t processed = 0;
+  while (processed < kRxProcessBudgetPerLoop && xQueueReceive(rxQueue_, &item, 0) == pdTRUE) {
     processFrame(item);
+    processed++;
   }
 }
 
@@ -251,7 +264,11 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   }
 
   const uint32_t nowMs = millis();
-  if (duplicateFilter_.seenAndRemember(dedupKey, nowMs, kDuplicateWindowMs)) {
+  if (duplicateFilter_.seen(dedupKey, nowMs, kDuplicateWindowMs)) {
+    stats_.droppedDuplicates++;
+    return;
+  }
+  if (parseRejectFilter_.seen(dedupKey, nowMs, kParseRejectDuplicateWindowMs)) {
     stats_.droppedDuplicates++;
     return;
   }
@@ -264,7 +281,7 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
 
   bool parsedAndAccepted = false;
   if (header.type == static_cast<uint8_t>(FrameType::Fragment)) {
-    parsedAndAccepted = handleFragmentFrame(header, body, bodyLen, nowMs);
+    parsedAndAccepted = handleFragmentFrame(header, body, bodyLen, item.rssi, item.senderMac, nowMs);
   } else if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
     parsedAndAccepted = handleNodeInfoFrame(header, body, bodyLen, item.rssi, nowMs);
   } else {
@@ -273,8 +290,10 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   }
 
   if (!parsedAndAccepted) {
+    parseRejectFilter_.remember(dedupKey, nowMs);
     return;
   }
+  duplicateFilter_.remember(dedupKey, nowMs);
 
   if (header.ttl > 1) {
     uint8_t forwardBuffer[kEspNowMaxPayload];
@@ -283,7 +302,24 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
       MeshFrameHeader* forwardHeader = reinterpret_cast<MeshFrameHeader*>(forwardBuffer);
       forwardHeader->ttl = static_cast<uint8_t>(forwardHeader->ttl - 1);
       forwardHeader->hops = static_cast<uint8_t>(forwardHeader->hops + 1);
-      if (sendRaw(forwardBuffer, item.len)) {
+      const uint8_t attempts = kForwardSendAttempts > 0 ? kForwardSendAttempts : 1;
+      bool forwarded = false;
+      for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+        if (sendRaw(forwardBuffer, item.len)) {
+          forwarded = true;
+          break;
+        }
+        if ((attempt + 1) < attempts && kForwardJitterMaxMs > 0) {
+          const uint32_t jitterMaxExclusive =
+              static_cast<uint32_t>(kForwardJitterMaxMs) + static_cast<uint32_t>(1);
+          const uint32_t jitterMs = static_cast<uint32_t>(
+              random(static_cast<long>(kForwardJitterMinMs), static_cast<long>(jitterMaxExclusive)));
+          if (jitterMs > 0) {
+            delay(jitterMs);
+          }
+        }
+      }
+      if (forwarded) {
         stats_.forwardedFrames++;
       }
     }
@@ -316,7 +352,7 @@ bool EspNowMesh::parseHeader(const uint8_t* data, size_t len, MeshFrameHeader* o
 }
 
 bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
-                                     uint32_t nowMs) {
+                                     int8_t rssi, const uint8_t* senderMac, uint32_t nowMs) {
   if (body == nullptr || bodyLen < sizeof(FragmentMeta)) {
     stats_.rxParseErrors++;
     return false;
@@ -340,8 +376,8 @@ bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
   ReassembledMessage completed{};
   const bool done = reassembly_.PushFragment(
       header.originId, header.messageId, static_cast<AppPayloadType>(fragmentMeta.appType), header.hops,
-      fragmentMeta.fragIndex, fragmentMeta.fragCount, fragmentMeta.totalLen, chunk,
-      fragmentMeta.chunkLen, nowMs, &completed);
+      fragmentMeta.fragIndex, fragmentMeta.fragCount, fragmentMeta.totalLen, chunk, fragmentMeta.chunkLen,
+      rssi, senderMac, nowMs, &completed);
   if (!done) {
     return true;
   }
@@ -356,7 +392,6 @@ bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
 
 bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                                      int8_t rssi, uint32_t nowMs) {
-  (void)header;
   if (body == nullptr || bodyLen < sizeof(NodeInfoPayload)) {
     stats_.rxParseErrors++;
     return false;
@@ -364,7 +399,7 @@ bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_
 
   NodeInfoPayload remote{};
   std::memcpy(&remote, body, sizeof(remote));
-  if (remote.nodeId == 0) {
+  if (remote.nodeId == 0 || remote.nodeId != header.originId) {
     stats_.rxParseErrors++;
     return false;
   }
@@ -444,10 +479,21 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
     localFrameKey.fragmentIndex = index;
     duplicateFilter_.seenAndRemember(localFrameKey, millis(), kDuplicateWindowMs);
 
-    if (!sendRaw(frame, frameLen)) {
+    bool sentAny = false;
+    for (uint8_t attempt = 0; attempt < kOriginFrameRepeatCount; ++attempt) {
+      if (sendRaw(frame, frameLen)) {
+        sentAny = true;
+      }
+      if ((attempt + 1) < kOriginFrameRepeatCount && kOriginFrameRepeatGapMs > 0) {
+        delay(kOriginFrameRepeatGapMs);
+      }
+    }
+    if (!sentAny) {
       return false;
     }
-    delay(2);
+    if (kOriginFrameRepeatGapMs > 0) {
+      delay(kOriginFrameRepeatGapMs);
+    }
   }
 
   if (outMessageId != nullptr) {

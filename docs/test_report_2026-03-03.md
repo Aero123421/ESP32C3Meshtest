@@ -41,15 +41,17 @@
 - `python tools/raw_send_watch.py COM6 --watch 8` で `chat` 送信時のクラッシュ再現なし
 - 以前発生していた `loopTask stack overflow` は、`DynamicJsonDocument` 化で解消
 
-### 3.4 E2E delivery_ack / 再送（今回実装分）
-- `python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 12 --ack-retries 2 --skip-ble` : 成功
+### 3.4 E2E delivery_ack / 再送 / long_text（今回更新）
+- `python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 4 --ack-retries 6 --skip-ble` : 成功
   - `node_list count=3` を確認
   - `wifi chat broadcast` 成功
-  - `Directed Wi-Fi chat + delivery_ack` 成功（`retry=1` でACK到達）
+  - `Directed Wi-Fi chat + delivery_ack` 成功
+  - `Directed long text (1045 bytes, 33 chunks) + delivery_ack` 成功
   - `Directed ping` 成功
-- `python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 12 --ack-retries 2` : 失敗
-  - Wi-Fi系は成功
-  - `BLE short chat` がタイムアウト
+  - `ALL TESTS PASSED`
+- `python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 12 --ack-retries 2 --skip-ble` : 失敗を確認
+  - `Directed long text` の chunk/end で `delivery_ack` タイムアウトが発生しやすい
+  - 再送パラメータを強化 (`ack-timeout=4`, `ack-retries=6`) すると安定化
 
 ## 4. 既知事項
 - BLE広告リレーは組み合わせ依存で成功/失敗が分かれる
@@ -57,6 +59,7 @@
   - COM6↔COM8 / COM7↔COM8: タイムアウトを確認
 - Wi-Fiメッシュ（ESP-NOW）系は3台で安定して動作
 - 宛先指定Wi-Fiの `delivery_ack` + 再送は実機で動作確認済み
+- 1000文字級 long_text は再送設定を強めた条件で実機成功
 
 ## 5. 改善優先度（次）
 1. BLE広告リレーの受信率改善（送信間隔、スキャン条件、電波環境ログを含む）

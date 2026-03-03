@@ -17,6 +17,8 @@ class SerialJsonBridge {
 
  private:
   static constexpr size_t kLineBufferSize = 4096;
+  static constexpr uint8_t kMaxMeshDrainPerLoop = 24;
+  static constexpr uint8_t kMaxBleDrainPerLoop = 24;
 
   struct BridgeStats {
     uint32_t commandCount = 0;
@@ -35,6 +37,7 @@ class SerialJsonBridge {
   String encodeBase64(const uint8_t* data, size_t len) const;
 
   static String formatNodeId(uint32_t nodeId);
+  static String formatMac(const uint8_t* mac);
 
   EspNowMesh* mesh_;
   BleRelay* ble_;
@@ -46,4 +49,3 @@ class SerialJsonBridge {
 };
 
 }  // namespace lpwa
-

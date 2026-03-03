@@ -63,7 +63,7 @@ class EspNowMesh {
                    size_t* outBodyLen) const;
 
   bool handleFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
-                           uint32_t nowMs);
+                           int8_t rssi, const uint8_t* senderMac, uint32_t nowMs);
   bool handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                            int8_t rssi, uint32_t nowMs);
 
@@ -79,6 +79,7 @@ class EspNowMesh {
 
   QueueHandle_t rxQueue_ = nullptr;
   DuplicateFilter duplicateFilter_;
+  DuplicateFilter parseRejectFilter_;
   ReassemblyManager reassembly_;
   MeshStats stats_{};
 

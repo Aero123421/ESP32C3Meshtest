@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import tempfile
 from pathlib import Path
 
-from lpwa_gui.protocol import decode_json_line, encode_json_line, make_chat_message, make_image_messages
+from lpwa_gui.protocol import (
+    MAX_LONG_TEXT_CHUNK_BYTES,
+    decode_json_line,
+    encode_json_line,
+    make_chat_message,
+    make_image_messages,
+    make_long_text_messages,
+)
 from lpwa_gui.stats import PingStats
 
 
@@ -61,6 +69,29 @@ def check_retry_id_stability() -> None:
     assert first.get("e2e_id") == retry.get("e2e_id") == "stable-id", "retry e2e_id must be stable"
 
 
+def check_long_text_chunking() -> None:
+    text = "長文テキスト検証-" + ("ABC123" * 240)
+    packets = make_long_text_messages(
+        text=text,
+        dst="0x0099AABB",
+        require_ack=True,
+        chunk_size=MAX_LONG_TEXT_CHUNK_BYTES,
+    )
+    assert packets[0]["type"] == "long_text_start", "missing long_text_start"
+    assert packets[-1]["type"] == "long_text_end", "missing long_text_end"
+    chunks = [p for p in packets if p.get("type") == "long_text_chunk"]
+    restored = b"".join(base64.b64decode(p["data_b64"]) for p in chunks).decode("utf-8")
+    assert restored == text, "long text reconstruction failed"
+    for p in packets:
+        assert p.get("need_ack") is True, "need_ack missing in long text payload"
+        assert isinstance(p.get("e2e_id"), str) and p["e2e_id"], "e2e_id missing in long text payload"
+    end = packets[-1]
+    assert end.get("encoding") == "utf-8", "long_text_end encoding missing"
+    assert int(end.get("size") or -1) == len(text.encode("utf-8")), "long_text_end size mismatch"
+    assert int(end.get("chunks") or -1) == len(chunks), "long_text_end chunks mismatch"
+    assert end.get("sha256") == hashlib.sha256(text.encode("utf-8")).hexdigest(), "long_text_end hash mismatch"
+
+
 def check_ping_stats() -> None:
     stats = PingStats()
     stats.register_sent(1, sent_ts_ms=1000)
@@ -80,6 +111,7 @@ def main() -> None:
     check_chat_e2e_fields()
     check_image_e2e_fields()
     check_retry_id_stability()
+    check_long_text_chunking()
     check_ping_stats()
     print("self_check: OK")
 

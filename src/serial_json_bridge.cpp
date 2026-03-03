@@ -87,15 +87,19 @@ void SerialJsonBridge::loop() {
 
   if (mesh_ != nullptr) {
     ReassembledMessage message{};
-    while (mesh_->popReceivedMessage(&message)) {
+    uint8_t drained = 0;
+    while (drained < kMaxMeshDrainPerLoop && mesh_->popReceivedMessage(&message)) {
       emitMeshMessage(message);
+      drained++;
     }
   }
 
   if (ble_ != nullptr) {
     BleRelayMessage message{};
-    while (ble_->popReceived(&message)) {
+    uint8_t drained = 0;
+    while (drained < kMaxBleDrainPerLoop && ble_->popReceived(&message)) {
       emitBleMessage(message);
+      drained++;
     }
   }
 }
@@ -129,7 +133,8 @@ void SerialJsonBridge::handleLine(const char* line) {
     if (type == "nodes_request") {
       cmd = "get_nodes";
     } else if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
-               type == "image_end") {
+               type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
+               type == "long_text_end") {
       if (via == "ble") {
         if (type != "chat") {
           bridgeStats_.commandErrors++;
@@ -206,6 +211,55 @@ void SerialJsonBridge::handleLine(const char* line) {
         envelope["data_b64"] = request["data_b64"] | "";
       } else if (type == "image_end") {
         envelope["image_id"] = request["image_id"] | "";
+      } else if (type == "long_text_start") {
+        const String textId = request["text_id"] | "";
+        const int size = request["size"] | -1;
+        const int chunks = request["chunks"] | -1;
+        if (textId.isEmpty() || size < 0 || chunks < 0) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_long_text_start", "text_id/size/chunks required");
+          return;
+        }
+        envelope["type"] = "lt_s";
+        envelope["id"] = textId;
+        envelope["e"] = request["encoding"] | "utf-8";
+        envelope["z"] = size;
+        envelope["n"] = chunks;
+      } else if (type == "long_text_chunk") {
+        const String textId = request["text_id"] | "";
+        const int index = request["index"] | -1;
+        const String dataB64 = request["data_b64"] | "";
+        if (textId.isEmpty() || index < 0 || dataB64.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_long_text_chunk", "text_id/index/data_b64 required");
+          return;
+        }
+        envelope["type"] = "lt_c";
+        envelope["id"] = textId;
+        envelope["i"] = index;
+        envelope["d"] = dataB64;
+      } else if (type == "long_text_end") {
+        const String textId = request["text_id"] | "";
+        if (textId.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_long_text_end", "text_id required");
+          return;
+        }
+        envelope["type"] = "lt_e";
+        envelope["id"] = textId;
+        if (request.containsKey("encoding")) {
+          envelope["e"] = request["encoding"] | "utf-8";
+        }
+        if (request.containsKey("size")) {
+          envelope["z"] = request["size"] | 0;
+        }
+        if (request.containsKey("chunks")) {
+          envelope["n"] = request["chunks"] | 0;
+        }
+        const char* hash = request["sha256"] | "";
+        if (hash != nullptr && hash[0] != '\0') {
+          envelope["h"] = hash;
+        }
       }
 
       String wireText;
@@ -221,7 +275,8 @@ void SerialJsonBridge::handleLine(const char* line) {
 
       if (ok) {
         if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
-            type == "image_end") {
+            type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
+            type == "long_text_end") {
           bridgeStats_.sentText++;
         }
       }
@@ -429,6 +484,8 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
   }
 
   const String selfNodeId = (mesh_ != nullptr) ? formatNodeId(mesh_->nodeId()) : String("0x00000000");
+  const int rxRssi = static_cast<int>(message.rssi);
+  const String viaMac = message.hasSenderMac ? formatMac(message.senderMac) : String("");
 
   if (message.payloadType == AppPayloadType::Text) {
     String text;
@@ -469,8 +526,15 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (appDoc.containsKey("image_id")) {
           ack["image_id"] = appDoc["image_id"] | "";
         }
+        if (appDoc.containsKey("text_id")) {
+          ack["text_id"] = appDoc["text_id"] | "";
+        } else if (appDoc.containsKey("id")) {
+          ack["text_id"] = appDoc["id"] | "";
+        }
         if (appDoc.containsKey("index")) {
           ack["index"] = appDoc["index"] | 0;
+        } else if (appDoc.containsKey("i")) {
+          ack["index"] = appDoc["i"] | 0;
         }
         if (appDoc.containsKey("retry_no")) {
           ack["retry_no"] = appDoc["retry_no"] | 0;
@@ -481,6 +545,47 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         mesh_->sendText(response.c_str(), appDoc["ttl"] | kDefaultTtl, nullptr);
       };
 
+      const auto emitObserved = [&]() {
+        if (appType[0] == '\0') {
+          return;
+        }
+        StaticJsonDocument<640> observed;
+        observed["event"] = "mesh_observed";
+        observed["type"] = "mesh_observed";
+        observed["app_type"] = appType;
+        observed["via"] = "wifi";
+        observed["src"] = appDoc["src"] | formatNodeId(message.originId);
+        observed["dst"] = (dst[0] == '\0') ? "*" : dst;
+        observed["msg_id"] = message.messageId;
+        observed["hops"] = message.hops;
+        observed["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          observed["via_mac"] = viaMac;
+        }
+        if (appDoc.containsKey("e2e_id")) {
+          observed["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          observed["retry_no"] = appDoc["retry_no"] | 0;
+        }
+        if (appDoc.containsKey("text_id")) {
+          observed["text_id"] = appDoc["text_id"] | "";
+        } else if (appDoc.containsKey("id")) {
+          observed["text_id"] = appDoc["id"] | "";
+        }
+        if (appDoc.containsKey("image_id")) {
+          observed["image_id"] = appDoc["image_id"] | "";
+        }
+        if (appDoc.containsKey("index")) {
+          observed["index"] = appDoc["index"] | 0;
+        } else if (appDoc.containsKey("i")) {
+          observed["index"] = appDoc["i"] | 0;
+        }
+        serializeJson(observed, *serial_);
+        serial_->println();
+      };
+      emitObserved();
+
       if (std::strcmp(appType, "delivery_ack") == 0) {
         if (!accepted) {
           return;
@@ -490,16 +595,29 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["type"] = "delivery_ack";
         out["via"] = "wifi";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
         out["ack_for"] = appDoc["ack_for"] | "";
         out["e2e_id"] = appDoc["e2e_id"] | "";
         out["msg_id"] = appDoc["msg_id"] | 0;
+        out["rx_msg_id"] = message.messageId;
         out["status"] = appDoc["status"] | "ok";
         out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
         if (appDoc.containsKey("image_id")) {
           out["image_id"] = appDoc["image_id"] | "";
         }
+        if (appDoc.containsKey("text_id")) {
+          out["text_id"] = appDoc["text_id"] | "";
+        } else if (appDoc.containsKey("id")) {
+          out["text_id"] = appDoc["id"] | "";
+        }
         if (appDoc.containsKey("index")) {
           out["index"] = appDoc["index"] | 0;
+        } else if (appDoc.containsKey("i")) {
+          out["index"] = appDoc["i"] | 0;
         }
         if (appDoc.containsKey("retry_no")) {
           out["retry_no"] = appDoc["retry_no"] | 0;
@@ -539,10 +657,16 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["event"] = "pong";
         out["type"] = "pong";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
         out["seq"] = appDoc["seq"] | 0;
         out["ping_id"] = appDoc["ping_id"] | "";
+        out["msg_id"] = message.messageId;
         out["latency_ms"] = appDoc["latency_ms"] | 0;
         out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
         serializeJson(out, *serial_);
         serial_->println();
         return;
@@ -557,8 +681,14 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["type"] = "chat";
         out["via"] = "wifi";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
         out["text"] = appDoc["text"] | "";
+        out["msg_id"] = message.messageId;
         out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
         if (appDoc.containsKey("e2e_id")) {
           out["e2e_id"] = appDoc["e2e_id"] | "";
         }
@@ -568,6 +698,114 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         serializeJson(out, *serial_);
         serial_->println();
         maybeSendDeliveryAck("chat");
+        return;
+      }
+
+      const bool isLongStart =
+          (std::strcmp(appType, "long_text_start") == 0) || (std::strcmp(appType, "lt_s") == 0);
+      const bool isLongChunk =
+          (std::strcmp(appType, "long_text_chunk") == 0) || (std::strcmp(appType, "lt_c") == 0);
+      const bool isLongEnd =
+          (std::strcmp(appType, "long_text_end") == 0) || (std::strcmp(appType, "lt_e") == 0);
+      if (isLongStart || isLongChunk || isLongEnd) {
+        if (!accepted) {
+          return;
+        }
+
+        bool validLongPayload = true;
+        DynamicJsonDocument out(1400);
+        out["event"] = "mesh_rx";
+        out["type"] = isLongStart ? "long_text_start" : (isLongChunk ? "long_text_chunk" : "long_text_end");
+        out["via"] = "wifi";
+        out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
+        out["msg_id"] = message.messageId;
+        out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
+        String textId = appDoc["text_id"] | "";
+        if (textId.isEmpty()) {
+          textId = appDoc["id"] | "";
+        }
+        if (textId.isEmpty()) {
+          validLongPayload = false;
+        }
+        out["text_id"] = textId;
+        if (appDoc.containsKey("e2e_id")) {
+          out["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          out["retry_no"] = appDoc["retry_no"] | 0;
+        }
+        if (isLongStart) {
+          const bool hasSize = appDoc.containsKey("size") || appDoc.containsKey("z");
+          const bool hasChunks = appDoc.containsKey("chunks") || appDoc.containsKey("n");
+          if (!hasSize || !hasChunks) {
+            validLongPayload = false;
+          }
+          String encoding = appDoc["encoding"] | "";
+          if (encoding.isEmpty()) {
+            encoding = appDoc["e"] | "utf-8";
+          }
+          const int size = hasSize ? (appDoc.containsKey("size") ? (appDoc["size"] | -1) : (appDoc["z"] | -1)) : -1;
+          const int chunks =
+              hasChunks ? (appDoc.containsKey("chunks") ? (appDoc["chunks"] | -1) : (appDoc["n"] | -1)) : -1;
+          if (size < 0 || chunks < 0) {
+            validLongPayload = false;
+          }
+          out["encoding"] = encoding;
+          out["size"] = size;
+          out["chunks"] = chunks;
+          String sha = appDoc["sha256"] | "";
+          if (sha.isEmpty()) {
+            sha = appDoc["h"] | "";
+          }
+          if (!sha.isEmpty()) {
+            out["sha256"] = sha;
+          }
+        } else if (isLongEnd) {
+          if (appDoc.containsKey("encoding") || appDoc.containsKey("e")) {
+            String encoding = appDoc["encoding"] | "";
+            if (encoding.isEmpty()) {
+              encoding = appDoc["e"] | "utf-8";
+            }
+            out["encoding"] = encoding;
+          }
+          if (appDoc.containsKey("size") || appDoc.containsKey("z")) {
+            const int size = appDoc.containsKey("size") ? (appDoc["size"] | 0) : (appDoc["z"] | 0);
+            out["size"] = size;
+          }
+          if (appDoc.containsKey("chunks") || appDoc.containsKey("n")) {
+            const int chunks = appDoc.containsKey("chunks") ? (appDoc["chunks"] | 0) : (appDoc["n"] | 0);
+            out["chunks"] = chunks;
+          }
+          String sha = appDoc["sha256"] | "";
+          if (sha.isEmpty()) {
+            sha = appDoc["h"] | "";
+          }
+          if (!sha.isEmpty()) {
+            out["sha256"] = sha;
+          }
+        } else if (isLongChunk) {
+          const int index = appDoc.containsKey("index") ? (appDoc["index"] | -1) : (appDoc["i"] | -1);
+          String chunkData = appDoc["data_b64"] | "";
+          if (chunkData.isEmpty()) {
+            chunkData = appDoc["d"] | "";
+          }
+          if (index < 0 || chunkData.isEmpty()) {
+            validLongPayload = false;
+          }
+          out["index"] = index;
+          out["data_b64"] = chunkData;
+        }
+        if (!validLongPayload) {
+          return;
+        }
+        serializeJson(out, *serial_);
+        serial_->println();
+        maybeSendDeliveryAck(isLongStart ? "long_text_start" : (isLongChunk ? "long_text_chunk" : "long_text_end"));
         return;
       }
 
@@ -582,7 +820,13 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["type"] = appType;
         out["via"] = "wifi";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
+        out["msg_id"] = message.messageId;
         out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
         out["image_id"] = appDoc["image_id"] | "";
         if (appDoc.containsKey("e2e_id")) {
           out["e2e_id"] = appDoc["e2e_id"] | "";
@@ -611,8 +855,13 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
     out["type"] = "chat";
     out["via"] = "wifi";
     out["src"] = formatNodeId(message.originId);
+    out["msg_id"] = message.messageId;
     out["text"] = text;
     out["hops"] = message.hops;
+    out["rssi"] = rxRssi;
+    if (!viaMac.isEmpty()) {
+      out["via_mac"] = viaMac;
+    }
     serializeJson(out, *serial_);
     serial_->println();
     return;
@@ -625,6 +874,10 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
   doc["src"] = formatNodeId(message.originId);
   doc["msg_id"] = message.messageId;
   doc["hops"] = message.hops;
+  doc["rssi"] = rxRssi;
+  if (!viaMac.isEmpty()) {
+    doc["via_mac"] = viaMac;
+  }
   doc["data_b64"] = encodeBase64(message.data, message.length);
   serializeJson(doc, *serial_);
   serial_->println();
@@ -683,6 +936,15 @@ String SerialJsonBridge::encodeBase64(const uint8_t* data, size_t len) const {
 String SerialJsonBridge::formatNodeId(uint32_t nodeId) {
   char buf[11];
   std::snprintf(buf, sizeof(buf), "0x%08" PRIX32, nodeId);
+  return String(buf);
+}
+
+String SerialJsonBridge::formatMac(const uint8_t* mac) {
+  if (mac == nullptr) {
+    return String("");
+  }
+  char buf[18];
+  std::snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(buf);
 }
 

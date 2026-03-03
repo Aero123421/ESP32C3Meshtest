@@ -13,6 +13,8 @@ struct DuplicateKey {
 
 class DuplicateFilter {
  public:
+  bool seen(const DuplicateKey& key, uint32_t nowMs, uint32_t windowMs);
+  void remember(const DuplicateKey& key, uint32_t nowMs);
   bool seenAndRemember(const DuplicateKey& key, uint32_t nowMs, uint32_t windowMs);
   void clear();
 

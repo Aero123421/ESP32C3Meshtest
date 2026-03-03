@@ -7,7 +7,7 @@ bool DuplicateFilter::equals(const DuplicateKey& a, const DuplicateKey& b) {
          a.fragmentIndex == b.fragmentIndex;
 }
 
-bool DuplicateFilter::seenAndRemember(const DuplicateKey& key, uint32_t nowMs, uint32_t windowMs) {
+bool DuplicateFilter::seen(const DuplicateKey& key, uint32_t nowMs, uint32_t windowMs) {
   for (size_t i = 0; i < kCapacity; ++i) {
     Entry& entry = entries_[i];
     if (!entry.used) {
@@ -23,13 +23,23 @@ bool DuplicateFilter::seenAndRemember(const DuplicateKey& key, uint32_t nowMs, u
       return true;
     }
   }
+  return false;
+}
 
+void DuplicateFilter::remember(const DuplicateKey& key, uint32_t nowMs) {
   Entry& slot = entries_[nextInsert_];
   slot.key = key;
   slot.firstSeenMs = nowMs;
   slot.used = true;
 
   nextInsert_ = (nextInsert_ + 1) % kCapacity;
+}
+
+bool DuplicateFilter::seenAndRemember(const DuplicateKey& key, uint32_t nowMs, uint32_t windowMs) {
+  if (seen(key, nowMs, windowMs)) {
+    return true;
+  }
+  remember(key, nowMs);
   return false;
 }
 
@@ -42,4 +52,3 @@ void DuplicateFilter::clear() {
 }
 
 }  // namespace lpwa
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import queue
 import shutil
 import subprocess
@@ -21,11 +22,13 @@ from lpwa_gui.models import NodeInfo, NodeRegistry
 from lpwa_gui.protocol import (
     make_chat_message,
     make_image_messages,
+    make_long_text_messages,
     make_nodes_request,
     make_ping_message,
 )
 from lpwa_gui.serial_worker import SerialWorker, list_serial_ports
 from lpwa_gui.stats import PingStats
+from lpwa_gui.topology import BROADCAST_NODE, TopologySnapshot, TopologyTracker
 
 
 def _format_seen_time(seen_ms: int) -> str:
@@ -46,9 +49,20 @@ def _to_int(value: str, default: int) -> int:
 BROADCAST_LABEL = "(broadcast)"
 LOG_TAGS = ("INFO", "WARN", "ERROR", "TX", "RX", "SYSTEM")
 LOG_PREVIEW_MAX = 220
-E2E_ACK_TIMEOUT_MS = 1500
-E2E_ACK_MAX_RETRIES = 2
+E2E_ACK_TIMEOUT_MS = 2200
+E2E_ACK_MAX_RETRIES = 4
 E2E_RX_DEDUP_WINDOW_MS = 60000
+LONG_TEXT_RX_DEDUP_WINDOW_MS = 120000
+LONG_TEXT_AUTO_SPLIT_BYTES = 700
+LONG_TEXT_CHUNK_BYTES = 32
+RX_SESSION_TIMEOUT_MS = 30000
+MAX_RX_SESSIONS = 24
+MAX_CHAT_LINES = 1200
+TOPOLOGY_REDRAW_INTERVAL_MS = 400
+TOPOLOGY_DEFAULT_WINDOW_SEC = 30
+MAX_WORKER_EVENTS_PER_TICK = 120
+WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
+PING_PENDING_MAX_AGE_MS = 20000
 
 
 class LPWAApp(tk.Tk):
@@ -66,16 +80,23 @@ class LPWAApp(tk.Tk):
         self.ping_seq = 0
         self.current_ping_id = uuid.uuid4().hex[:8]
         self.pending_ping_ids: dict[int, str] = {}
+        self.pending_ping_sent_ms: dict[int, int] = {}
         self.pending_e2e: dict[str, dict[str, Any]] = {}
         self.rx_seen_e2e: dict[str, int] = {}
+        self.long_text_seen: dict[str, int] = {}
         self.continuous_after_id: str | None = None
         self.continuous_remaining: int | None = None
         self.log_lines: list[str] = []
         self.max_log_lines = 3000
         self.image_rx_sessions: dict[str, dict[str, Any]] = {}
+        self.long_text_rx_sessions: dict[str, dict[str, Any]] = {}
         self.flash_busy = False
         self.flash_thread: threading.Thread | None = None
         self.project_root = Path(__file__).resolve().parents[1]
+        self.local_node_id: str | None = None
+        self.topology_tracker = TopologyTracker(max_events=20000)
+        self.topology_dirty = False
+        self._last_worker_backlog_log_ms = 0
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
@@ -92,6 +113,11 @@ class LPWAApp(tk.Tk):
         self.count_var = tk.StringVar(value="0")
         self.ttl_var = tk.StringVar(value="10")
         self.chat_via_var = tk.StringVar(value="wifi")
+        self.topology_window_var = tk.StringVar(value=str(TOPOLOGY_DEFAULT_WINDOW_SEC))
+        self.topology_via_var = tk.StringVar(value="all")
+        self.topology_kind_var = tk.StringVar(value="all")
+        self.topology_status_var = tk.StringVar(value="未更新")
+        self.topology_broadcast_var = tk.BooleanVar(value=False)
 
         self.sent_var = tk.StringVar(value="0")
         self.received_var = tk.StringVar(value="0")
@@ -106,6 +132,7 @@ class LPWAApp(tk.Tk):
         self.refresh_destination_choices()
         self.refresh_ports()
         self.after(100, self.poll_worker_events)
+        self.after(TOPOLOGY_REDRAW_INTERVAL_MS, self.refresh_topology_view)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -244,9 +271,10 @@ class LPWAApp(tk.Tk):
 
         right = ttk.Frame(body)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=3)
+        right.rowconfigure(0, weight=2)
         right.rowconfigure(1, weight=1)
-        right.rowconfigure(2, weight=3)
+        right.rowconfigure(2, weight=2)
+        right.rowconfigure(3, weight=3)
 
         chat_frame = ttk.LabelFrame(right, text="チャット")
         chat_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
@@ -301,6 +329,85 @@ class LPWAApp(tk.Tk):
         self.log_text.tag_configure("SYSTEM", foreground="#4b5563")
         ttk.Button(log_frame, text="ログ保存", command=self.save_logs).grid(row=2, column=1, padx=4, pady=4, sticky="e")
         ttk.Button(log_frame, text="クリア", command=self.clear_logs).grid(row=2, column=2, padx=4, pady=4, sticky="e")
+
+        topology_frame = ttk.LabelFrame(right, text="通信トポロジ (リアルタイム)")
+        topology_frame.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        topology_frame.columnconfigure(0, weight=3)
+        topology_frame.columnconfigure(1, weight=2)
+        topology_frame.rowconfigure(1, weight=1)
+
+        ctrl = ttk.Frame(topology_frame)
+        ctrl.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+        ctrl.columnconfigure(10, weight=1)
+        ttk.Label(ctrl, text="窓(sec)").grid(row=0, column=0, padx=2, sticky="w")
+        self.topology_window_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_window_var,
+            values=("10", "30", "60", "120", "300"),
+            width=6,
+            state="readonly",
+        )
+        self.topology_window_combo.grid(row=0, column=1, padx=2, sticky="w")
+        self.topology_window_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Label(ctrl, text="経路").grid(row=0, column=2, padx=(8, 2), sticky="w")
+        self.topology_via_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_via_var,
+            values=("all", "wifi", "ble"),
+            width=8,
+            state="readonly",
+        )
+        self.topology_via_combo.grid(row=0, column=3, padx=2, sticky="w")
+        self.topology_via_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Label(ctrl, text="種別").grid(row=0, column=4, padx=(8, 2), sticky="w")
+        self.topology_kind_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_kind_var,
+            values=("all", "chat", "ping", "pong", "delivery_ack", "long_text", "image"),
+            width=12,
+            state="readonly",
+        )
+        self.topology_kind_combo.grid(row=0, column=5, padx=2, sticky="w")
+        self.topology_kind_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Checkbutton(
+            ctrl,
+            text="Broadcast表示",
+            variable=self.topology_broadcast_var,
+            command=self._mark_topology_dirty,
+        ).grid(row=0, column=6, padx=(8, 2), sticky="w")
+        ttk.Button(ctrl, text="履歴クリア", command=self.clear_topology_history).grid(row=0, column=7, padx=(8, 2))
+        ttk.Label(ctrl, textvariable=self.topology_status_var).grid(row=0, column=10, padx=4, sticky="e")
+
+        self.topology_canvas = tk.Canvas(
+            topology_frame,
+            bg="#0b1220",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
+        )
+        self.topology_canvas.grid(row=1, column=0, sticky="nsew", padx=(4, 2), pady=(0, 4))
+        self.topology_canvas.bind("<Configure>", lambda _: self._mark_topology_dirty())
+
+        self.topology_tree = ttk.Treeview(
+            topology_frame,
+            columns=("src", "dst", "via", "type", "count", "bytes", "hops", "retry", "rssi", "last"),
+            show="headings",
+            height=8,
+        )
+        for key, title, width in (
+            ("src", "Src", 100),
+            ("dst", "Dst", 100),
+            ("via", "Via", 52),
+            ("type", "Type", 90),
+            ("count", "Count", 60),
+            ("bytes", "Bytes", 70),
+            ("hops", "Hops", 55),
+            ("retry", "Retry", 55),
+            ("rssi", "RSSI", 55),
+            ("last", "Last", 78),
+        ):
+            self.topology_tree.heading(key, text=title)
+            self.topology_tree.column(key, width=width, anchor="w")
+        self.topology_tree.grid(row=1, column=1, sticky="nsew", padx=(2, 4), pady=(0, 4))
 
         body.add(left, weight=1)
         body.add(right, weight=1)
@@ -374,6 +481,24 @@ class LPWAApp(tk.Tk):
         self.rx_seen_e2e[dedup_key] = now
         return previous is not None and (now - previous) <= E2E_RX_DEDUP_WINDOW_MS
 
+    def _is_recent_long_text(self, src: str, text_id: str) -> bool:
+        if not src or not text_id:
+            return False
+        now = self._now_ms()
+        cutoff = now - LONG_TEXT_RX_DEDUP_WINDOW_MS
+        stale_keys = [key for key, ts in self.long_text_seen.items() if ts < cutoff]
+        for key in stale_keys:
+            self.long_text_seen.pop(key, None)
+        key = f"{src}:{text_id}"
+        ts = self.long_text_seen.get(key)
+        return ts is not None and (now - ts) <= LONG_TEXT_RX_DEDUP_WINDOW_MS
+
+    def _remember_long_text(self, src: str, text_id: str) -> None:
+        if not src or not text_id:
+            return
+        now = self._now_ms()
+        self.long_text_seen[f"{src}:{text_id}"] = now
+
     def _register_pending_e2e(self, payload: dict[str, Any]) -> None:
         e2e_id = str(payload.get("e2e_id") or "").strip()
         if not e2e_id:
@@ -422,7 +547,17 @@ class LPWAApp(tk.Tk):
             attempt += 1
             payload["retry_no"] = attempt
             payload["ts_ms"] = now
-            worker.send(payload)
+            if not worker.send(payload):
+                entry["last_send_ms"] = now
+                self.append_log(
+                    (
+                        f"delivery retry pending(queue full): type={entry.get('type')} "
+                        f"dst={entry.get('dst')} e2e_id={e2e_id}"
+                    ),
+                    level="WARN",
+                    category="E2E",
+                )
+                continue
             entry["payload"] = payload
             entry["attempt"] = attempt
             entry["last_send_ms"] = now
@@ -431,6 +566,73 @@ class LPWAApp(tk.Tk):
                 level="WARN",
                 category="E2E",
             )
+
+    def _prune_stale_pending_pings(self) -> None:
+        if not self.pending_ping_ids:
+            return
+        now = self._now_ms()
+        stale = []
+        for seq, ping_id in list(self.pending_ping_ids.items()):
+            sent_ms = self.pending_ping_sent_ms.get(seq)
+            if sent_ms is None:
+                stale.append((seq, ping_id, None))
+                continue
+            if (now - sent_ms) > PING_PENDING_MAX_AGE_MS:
+                stale.append((seq, ping_id, now - sent_ms))
+        for seq, _ping_id, _age in stale:
+            self.pending_ping_ids.pop(seq, None)
+            self.pending_ping_sent_ms.pop(seq, None)
+        if stale:
+            self.append_log(f"ping pending prune: removed={len(stale)}", level="WARN", category="PING")
+
+    def _prune_rx_sessions(self) -> None:
+        now = self._now_ms()
+        cutoff = now - RX_SESSION_TIMEOUT_MS
+
+        expired_images = [
+            image_id
+            for image_id, session in self.image_rx_sessions.items()
+            if int(session.get("last_update_ms") or session.get("started_ms") or 0) < cutoff
+        ]
+        for image_id in expired_images:
+            self.image_rx_sessions.pop(image_id, None)
+            self.append_log(
+                f"image session expired: id={image_id}",
+                level="WARN",
+                category="IMAGE",
+            )
+
+        expired_texts = [
+            text_id
+            for text_id, session in self.long_text_rx_sessions.items()
+            if int(session.get("last_update_ms") or session.get("started_ms") or 0) < cutoff
+        ]
+        for text_id in expired_texts:
+            self.long_text_rx_sessions.pop(text_id, None)
+            self.append_log(
+                f"long_text session expired: id={text_id}",
+                level="WARN",
+                category="LONGTXT",
+            )
+
+    def _ensure_session_capacity(self, sessions: dict[str, dict[str, Any]], kind: str, incoming_id: str) -> None:
+        if incoming_id in sessions or len(sessions) < MAX_RX_SESSIONS:
+            return
+        oldest_id: str | None = None
+        oldest_ts = self._now_ms()
+        for sid, session in sessions.items():
+            ts = int(session.get("last_update_ms") or session.get("started_ms") or 0)
+            if oldest_id is None or ts < oldest_ts:
+                oldest_id = sid
+                oldest_ts = ts
+        if oldest_id is None:
+            return
+        sessions.pop(oldest_id, None)
+        self.append_log(
+            f"{kind} session evicted: id={oldest_id} (capacity={MAX_RX_SESSIONS})",
+            level="WARN",
+            category=kind.upper(),
+        )
 
     def _selected_node_id(self) -> str | None:
         selected = self.node_tree.selection()
@@ -501,6 +703,11 @@ class LPWAApp(tk.Tk):
             nodes = payload.get("nodes") or payload.get("items") or []
             count = len(nodes) if isinstance(nodes, list) else 0
             return f"node_list count={count}"
+        if kind == "mesh_observed":
+            return (
+                f"mesh_observed app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
+                f"hops={payload.get('hops')} rssi={payload.get('rssi')} msg_id={payload.get('msg_id')}"
+            )
         if kind == "chat":
             via = payload.get("via", "wifi")
             src = payload.get("src") or payload.get("from") or "?"
@@ -548,6 +755,23 @@ class LPWAApp(tk.Tk):
                 f"image_end id={payload.get('image_id')} "
                 f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
             )
+        if kind == "long_text_start":
+            return (
+                f"long_text_start id={payload.get('text_id')} size={payload.get('size')} "
+                f"chunks={payload.get('chunks')} e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "long_text_chunk":
+            data_b64 = payload.get("data_b64")
+            chunk_len = len(data_b64) if isinstance(data_b64, str) else 0
+            return (
+                f"long_text_chunk id={payload.get('text_id')} idx={payload.get('index')} "
+                f"b64={chunk_len} e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "long_text_end":
+            return (
+                f"long_text_end id={payload.get('text_id')} "
+                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
         if kind == "binary":
             data_b64 = payload.get("data_b64")
             size = len(data_b64) if isinstance(data_b64, str) else 0
@@ -557,8 +781,184 @@ class LPWAApp(tk.Tk):
     def append_chat(self, text: str) -> None:
         self.chat_history.configure(state=tk.NORMAL)
         self.chat_history.insert(tk.END, text + "\n")
+        line_count_str = self.chat_history.index("end-1c").split(".")[0]
+        try:
+            line_count = int(line_count_str)
+        except ValueError:
+            line_count = 0
+        if line_count > MAX_CHAT_LINES:
+            drop_count = line_count - MAX_CHAT_LINES
+            self.chat_history.delete("1.0", f"{drop_count + 1}.0")
         self.chat_history.see(tk.END)
         self.chat_history.configure(state=tk.DISABLED)
+
+    def _mark_topology_dirty(self) -> None:
+        self.topology_dirty = True
+
+    def clear_topology_history(self) -> None:
+        self.topology_tracker.clear()
+        self.topology_dirty = True
+        self.topology_status_var.set("履歴クリア")
+        self.append_log("トポロジ履歴をクリアしました。", level="SYSTEM", category="TOPO")
+
+    def _track_topology_payload(self, payload: dict[str, Any], *, direction: str) -> None:
+        try:
+            self.topology_tracker.ingest(
+                payload,
+                direction=direction,
+                local_node_id=self.local_node_id,
+                now_ms=self._now_ms(),
+            )
+            self.topology_dirty = True
+        except Exception as exc:
+            self.append_log(f"topology ingest error: {exc}", level="WARN", category="TOPO")
+
+    def refresh_topology_view(self) -> None:
+        try:
+            if self.topology_dirty:
+                now_ms = self._now_ms()
+                window_s = max(1, _to_int(self.topology_window_var.get(), TOPOLOGY_DEFAULT_WINDOW_SEC))
+                snapshot = self.topology_tracker.snapshot(
+                    now_ms=now_ms,
+                    window_s=window_s,
+                    via_filter=str(self.topology_via_var.get() or "all").strip().lower(),
+                    kind_filter=str(self.topology_kind_var.get() or "all").strip().lower(),
+                    include_broadcast=bool(self.topology_broadcast_var.get()),
+                )
+                self._draw_topology_canvas(snapshot)
+                self._refresh_topology_table(snapshot)
+                self.topology_status_var.set(
+                    f"nodes={len(snapshot.nodes)} links={len(snapshot.edges)} events={snapshot.event_count}"
+                )
+                self.topology_dirty = False
+        finally:
+            try:
+                self.after(TOPOLOGY_REDRAW_INTERVAL_MS, self.refresh_topology_view)
+            except tk.TclError:
+                pass
+
+    def _short_node_id(self, node_id: str) -> str:
+        if node_id == BROADCAST_NODE:
+            return "BROADCAST"
+        raw = node_id.strip()
+        if len(raw) <= 10:
+            return raw
+        return f"{raw[:4]}..{raw[-4:]}"
+
+    def _draw_topology_canvas(self, snapshot: TopologySnapshot) -> None:
+        canvas = self.topology_canvas
+        canvas.delete("all")
+        width = max(240, int(canvas.winfo_width()))
+        height = max(180, int(canvas.winfo_height()))
+        if width < 20 or height < 20:
+            return
+
+        nodes = list(snapshot.nodes)
+        if bool(self.topology_broadcast_var.get()):
+            for edge in snapshot.edges:
+                if edge.dst == BROADCAST_NODE and BROADCAST_NODE not in nodes:
+                    nodes.append(BROADCAST_NODE)
+        if not nodes:
+            canvas.create_text(
+                width // 2,
+                height // 2,
+                text="通信イベント待機中...",
+                fill="#94a3b8",
+                font=("Consolas", 11),
+            )
+            return
+
+        cx = width / 2.0
+        cy = height / 2.0
+        radius = max(40.0, min(width, height) * 0.38)
+        positions: dict[str, tuple[float, float]] = {}
+        count = len(nodes)
+        for idx, node_id in enumerate(sorted(nodes, key=lambda x: x.lower())):
+            if node_id == BROADCAST_NODE:
+                positions[node_id] = (cx, cy)
+                continue
+            angle = (2.0 * math.pi * idx) / max(1, count)
+            positions[node_id] = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+
+        now_ms = self._now_ms()
+        for edge in snapshot.edges:
+            if edge.src not in positions or edge.dst not in positions:
+                continue
+            x1, y1 = positions[edge.src]
+            x2, y2 = positions[edge.dst]
+            width_px = min(8, max(1, 1 + edge.count // 2))
+            recent = (now_ms - edge.last_seen_ms) <= 1500
+            if edge.via == "ble":
+                color = "#16a34a" if recent else "#14532d"
+            else:
+                color = "#38bdf8" if recent else "#1d4ed8"
+            if edge.kind == "delivery_ack":
+                color = "#f59e0b" if recent else "#b45309"
+            canvas.create_line(
+                x1,
+                y1,
+                x2,
+                y2,
+                fill=color,
+                width=width_px,
+                arrow=tk.LAST,
+                smooth=True,
+            )
+            mid_x = (x1 + x2) / 2.0
+            mid_y = (y1 + y2) / 2.0
+            label = f"{edge.kind}:{edge.count}"
+            canvas.create_text(
+                mid_x,
+                mid_y - 10,
+                text=label,
+                fill="#e2e8f0",
+                font=("Consolas", 9),
+            )
+
+        for node_id, (x, y) in positions.items():
+            is_broadcast = node_id == BROADCAST_NODE
+            fill = "#334155"
+            outline = "#94a3b8"
+            if is_broadcast:
+                fill = "#3f3f46"
+                outline = "#f59e0b"
+            elif self.local_node_id and node_id == self.local_node_id:
+                fill = "#0f766e"
+                outline = "#99f6e4"
+            canvas.create_oval(x - 16, y - 16, x + 16, y + 16, fill=fill, outline=outline, width=2)
+            canvas.create_text(
+                x,
+                y + 24,
+                text=self._short_node_id(node_id),
+                fill="#e5e7eb",
+                font=("Consolas", 9),
+            )
+
+    def _refresh_topology_table(self, snapshot: TopologySnapshot) -> None:
+        for item in self.topology_tree.get_children():
+            self.topology_tree.delete(item)
+        for edge in snapshot.edges[:160]:
+            if edge.rssi_avg is None:
+                rssi_label = "-"
+            else:
+                rssi_label = f"{edge.rssi_avg:.1f}"
+            age_ms = max(0, snapshot.generated_ms - edge.last_seen_ms)
+            self.topology_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    edge.src,
+                    edge.dst,
+                    edge.via,
+                    edge.kind,
+                    edge.count,
+                    edge.bytes_size,
+                    edge.hops_max,
+                    edge.retry_total,
+                    rssi_label,
+                    f"{age_ms}ms",
+                ),
+            )
 
     def refresh_ports(self) -> None:
         ports = list_serial_ports()
@@ -748,10 +1148,21 @@ class LPWAApp(tk.Tk):
         self.connection_var.set("接続処理中")
         self.append_log(f"接続開始: {port} @ {baud}", level="SYSTEM", category="COM")
 
-    def disconnect_serial(self) -> None:
+    def _clear_runtime_state(self) -> None:
         self.stop_continuous_ping()
         self.pending_ping_ids.clear()
+        self.pending_ping_sent_ms.clear()
         self.pending_e2e.clear()
+        self.long_text_seen.clear()
+        self.image_rx_sessions.clear()
+        self.long_text_rx_sessions.clear()
+        self.topology_tracker.clear()
+        self.topology_status_var.set("未更新")
+        self.local_node_id = None
+        self._mark_topology_dirty()
+
+    def disconnect_serial(self) -> None:
+        self._clear_runtime_state()
         if self.worker:
             self.worker.stop()
             self.worker = None
@@ -760,14 +1171,28 @@ class LPWAApp(tk.Tk):
         self.append_log("切断しました。", level="SYSTEM", category="COM")
 
     def poll_worker_events(self) -> None:
-        while True:
+        processed = 0
+        while processed < MAX_WORKER_EVENTS_PER_TICK:
             try:
                 event = self.incoming_queue.get_nowait()
             except queue.Empty:
                 break
             self.handle_worker_event(event)
+            processed += 1
+        backlog = 0
+        try:
+            backlog = self.incoming_queue.qsize()
+        except NotImplementedError:
+            backlog = 0
+        if backlog > 0 and processed >= MAX_WORKER_EVENTS_PER_TICK:
+            now = self._now_ms()
+            if (now - self._last_worker_backlog_log_ms) >= WORKER_BACKLOG_LOG_INTERVAL_MS:
+                self._last_worker_backlog_log_ms = now
+                self.append_log(f"worker event backlog={backlog} (UI処理を分割中)", level="WARN", category="EVENT")
         self._process_e2e_retries()
-        self.after(100, self.poll_worker_events)
+        self._prune_stale_pending_pings()
+        self._prune_rx_sessions()
+        self.after(30 if backlog > 0 else 100, self.poll_worker_events)
 
     def handle_worker_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("_event")
@@ -802,11 +1227,10 @@ class LPWAApp(tk.Tk):
                     category="COM",
                 )
             elif status == "disconnected":
+                self._clear_runtime_state()
                 self.connection_var.set("未接続")
                 self.connect_button.configure(text="接続", state=tk.NORMAL)
-                self.stop_continuous_ping()
-                if self.worker and not self.worker.is_running:
-                    self.worker = None
+                self.worker = None
                 self.append_log("シリアル接続が切断されました。", level="WARN", category="COM")
             return
 
@@ -818,6 +1242,7 @@ class LPWAApp(tk.Tk):
         if event_type == "tx":
             payload = event.get("payload")
             if isinstance(payload, dict):
+                self._track_topology_payload(payload, direction="tx")
                 self.append_log(self._summarize_payload(payload), level="TX", category=self._payload_type(payload))
             else:
                 self.append_log(f"tx_raw {payload}", level="TX", category="RAW")
@@ -826,10 +1251,13 @@ class LPWAApp(tk.Tk):
         if event_type == "rx":
             payload = event.get("payload")
             if isinstance(payload, dict):
+                self._track_topology_payload(payload, direction="rx")
+                kind = self._payload_type(payload)
                 level = "RX"
-                if self._payload_type(payload) == "error":
+                if kind == "error":
                     level = "ERROR"
-                self.append_log(self._summarize_payload(payload), level=level, category=self._payload_type(payload))
+                if kind != "mesh_observed":
+                    self.append_log(self._summarize_payload(payload), level=level, category=kind)
                 self.handle_payload(payload)
             else:
                 self.append_log(f"rx_invalid {payload}", level="WARN", category="RAW")
@@ -850,6 +1278,20 @@ class LPWAApp(tk.Tk):
     def handle_payload(self, payload: dict[str, Any]) -> None:
         message_type = str(payload.get("type") or payload.get("event") or "").strip().lower()
 
+        if message_type == "bridge_ready":
+            node_id = str(payload.get("node_id") or "").strip()
+            if node_id:
+                self.local_node_id = node_id
+                self.registry.upsert_from_payload({"node_id": node_id, "last_seen_ms": self._now_ms()})
+                self.refresh_node_table()
+                self._mark_topology_dirty()
+                self.append_log(f"bridge_ready: local node={node_id}", level="SYSTEM", category="COM")
+            return
+
+        if message_type == "mesh_observed":
+            # トポロジ表示向けの観測イベント。チャット表示などには流さない。
+            return
+
         if message_type in {"node_list", "nodes"}:
             nodes = payload.get("nodes") or payload.get("items")
             if isinstance(nodes, list):
@@ -857,9 +1299,19 @@ class LPWAApp(tk.Tk):
                 self.refresh_node_table()
             return
 
-        maybe_node = self.registry.upsert_from_payload(payload)
-        if maybe_node is not None:
-            self.refresh_node_table()
+        skip_node_refresh = message_type in {
+            "long_text_chunk",
+            "long_text_end",
+            "image_chunk",
+            "image_end",
+            "delivery_ack",
+            "ack",
+            "mesh_observed",
+        }
+        if not skip_node_refresh:
+            maybe_node = self.registry.upsert_from_payload(payload)
+            if maybe_node is not None:
+                self.refresh_node_table()
 
         if message_type == "chat":
             src = str(payload.get("src") or payload.get("from") or payload.get("origin") or "?")
@@ -884,6 +1336,10 @@ class LPWAApp(tk.Tk):
             self.handle_image_payload(payload)
             return
 
+        if message_type in {"long_text_start", "long_text_chunk", "long_text_end"}:
+            self.handle_long_text_payload(payload)
+            return
+
         if message_type == "delivery_ack":
             self.handle_delivery_ack(payload)
             return
@@ -895,6 +1351,61 @@ class LPWAApp(tk.Tk):
         e2e_id = str(payload.get("e2e_id") or "").strip()
         if not e2e_id:
             return
+        entry = self.pending_e2e.get(e2e_id)
+        if entry is None:
+            return
+
+        status = str(payload.get("status") or "ok").strip().lower()
+        if status != "ok":
+            self.pending_e2e.pop(e2e_id, None)
+            self.append_log(
+                (
+                    f"delivery failed: type={entry.get('type')} dst={entry.get('dst')} "
+                    f"e2e_id={e2e_id} status={status}"
+                ),
+                level="ERROR",
+                category="E2E",
+            )
+            return
+
+        expected_type = str(entry.get("type") or "").strip().lower()
+        ack_for = str(payload.get("ack_for") or "").strip().lower()
+        if expected_type and not ack_for:
+            self.append_log(
+                f"delivery_ack ignored: missing ack_for expected={expected_type} e2e_id={e2e_id}",
+                level="WARN",
+                category="E2E",
+            )
+            return
+        if expected_type and ack_for != expected_type:
+            self.append_log(
+                f"delivery_ack ignored: ack_for mismatch expected={expected_type} got={ack_for} e2e_id={e2e_id}",
+                level="WARN",
+                category="E2E",
+            )
+            return
+
+        expected_dst = str(entry.get("dst") or "").strip()
+        ack_src = str(payload.get("src") or "").strip()
+        if expected_dst and expected_dst != BROADCAST_LABEL and ack_src and ack_src.lower() != expected_dst.lower():
+            self.append_log(
+                f"delivery_ack ignored: src mismatch expected={expected_dst} got={ack_src} e2e_id={e2e_id}",
+                level="WARN",
+                category="E2E",
+            )
+            return
+        ack_dst = str(payload.get("dst") or "").strip()
+        if self.local_node_id and ack_dst and ack_dst.lower() != self.local_node_id.lower():
+            self.append_log(
+                (
+                    f"delivery_ack ignored: dst mismatch expected_local={self.local_node_id} "
+                    f"got={ack_dst} e2e_id={e2e_id}"
+                ),
+                level="WARN",
+                category="E2E",
+            )
+            return
+
         entry = self.pending_e2e.pop(e2e_id, None)
         if entry is None:
             return
@@ -909,6 +1420,198 @@ class LPWAApp(tk.Tk):
             category="E2E",
         )
 
+    def handle_long_text_payload(self, payload: dict[str, Any]) -> None:
+        kind = str(payload.get("type", "")).strip().lower()
+        text_id = str(payload.get("text_id", "")).strip()
+        src = str(payload.get("src", "")).strip()
+        if not text_id:
+            return
+        if src and self._is_recent_long_text(src, text_id):
+            return
+
+        def ensure_session(*, reason: str) -> dict[str, Any]:
+            session = self.long_text_rx_sessions.get(text_id)
+            if session is not None:
+                return session
+            now = self._now_ms()
+            self._ensure_session_capacity(self.long_text_rx_sessions, "longtxt", text_id)
+            session = {
+                "chunks": 0,
+                "size": 0,
+                "sha256": "",
+                "encoding": "utf-8",
+                "parts": {},
+                "src": str(payload.get("src", "?")),
+                "started_ms": now,
+                "last_update_ms": now,
+                "start_received": False,
+                "end_received": False,
+            }
+            self.long_text_rx_sessions[text_id] = session
+            self.append_log(
+                f"long_text session created: id={text_id} reason={reason}",
+                level="WARN",
+                category="LONGTXT",
+            )
+            return session
+
+        def merge_meta(session: dict[str, Any]) -> None:
+            src = str(payload.get("src", "")).strip()
+            if src:
+                session["src"] = src
+            encoding = str(payload.get("encoding") or "").strip()
+            if encoding:
+                session["encoding"] = encoding
+            size_raw = payload.get("size")
+            if size_raw is not None:
+                size = _to_int(str(size_raw), -1)
+                if size >= 0:
+                    session["size"] = size
+            chunks_raw = payload.get("chunks")
+            if chunks_raw is not None:
+                chunks = _to_int(str(chunks_raw), -1)
+                if chunks >= 0:
+                    session["chunks"] = chunks
+                    if chunks > 0:
+                        parts = session.get("parts")
+                        if isinstance(parts, dict):
+                            invalid_indexes = [idx for idx in list(parts.keys()) if idx < 0 or idx >= chunks]
+                            for idx in invalid_indexes:
+                                parts.pop(idx, None)
+                            if invalid_indexes:
+                                self.append_log(
+                                    f"long_text invalid chunks dropped: id={text_id} count={len(invalid_indexes)}",
+                                    level="WARN",
+                                    category="LONGTXT",
+                                )
+            sha256 = str(payload.get("sha256") or "").strip().lower()
+            if sha256:
+                session["sha256"] = sha256
+
+        def try_finalize(session: dict[str, Any]) -> bool:
+            parts: dict[int, bytes] = session.get("parts", {})
+            if not parts:
+                return False
+
+            expected_chunks = _to_int(str(session.get("chunks", "0")), 0)
+            if expected_chunks > 0:
+                missing = [i for i in range(expected_chunks) if i not in parts]
+                if missing:
+                    return False
+
+            merged = b"".join(parts[i] for i in sorted(parts.keys()))
+            expected_size = _to_int(str(session.get("size", "0")), 0)
+            if expected_size > 0 and expected_size != len(merged):
+                self.append_log(
+                    f"long_text_end rejected: id={text_id} size_mismatch expected={expected_size} got={len(merged)}",
+                    level="ERROR",
+                    category="LONGTXT",
+                )
+                return False
+
+            expected_hash = str(session.get("sha256", "")).strip().lower()
+            actual_hash = hashlib.sha256(merged).hexdigest()
+            if expected_hash and expected_hash != actual_hash:
+                self.append_log(
+                    f"long_text_end rejected: id={text_id} sha256 mismatch",
+                    level="ERROR",
+                    category="LONGTXT",
+                )
+                return False
+
+            encoding = str(session.get("encoding") or "utf-8")
+            try:
+                text = merged.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                self.append_log(
+                    f"long_text_end rejected: id={text_id} decode_failed encoding={encoding}",
+                    level="ERROR",
+                    category="LONGTXT",
+                )
+                return False
+
+            src = str(session.get("src", "?"))
+            self.append_chat(f"{src}(wifi): {text}")
+            self.append_log(
+                f"長文受信完了: id={text_id} bytes={len(merged)} chars={len(text)}",
+                level="SYSTEM",
+                category="LONGTXT",
+            )
+            self._remember_long_text(src, text_id)
+            self.long_text_rx_sessions.pop(text_id, None)
+            return True
+
+        if kind == "long_text_start":
+            session = ensure_session(reason="start")
+            is_first_start = not bool(session.get("start_received"))
+            merge_meta(session)
+            session["start_received"] = True
+            session["last_update_ms"] = self._now_ms()
+            if is_first_start:
+                self.append_log(
+                    f"長文受信開始: id={text_id} chunks={session.get('chunks', 0)}",
+                    level="SYSTEM",
+                    category="LONGTXT",
+                )
+            if session.get("end_received"):
+                try_finalize(session)
+            return
+
+        if kind == "long_text_chunk":
+            session = ensure_session(reason="chunk_before_start")
+            idx = payload.get("index")
+            if not isinstance(idx, int):
+                idx = _to_int(str(idx), -1)
+            if idx < 0:
+                return
+            expected_chunks = _to_int(str(session.get("chunks", "0")), 0)
+            if expected_chunks > 0 and idx >= expected_chunks:
+                self.append_log(
+                    f"long_text_chunk out of range: id={text_id} index={idx} expected<={expected_chunks - 1}",
+                    level="WARN",
+                    category="LONGTXT",
+                )
+                return
+            data_b64 = payload.get("data_b64")
+            if not isinstance(data_b64, str) or not data_b64:
+                return
+            try:
+                chunk = base64.b64decode(data_b64, validate=True)
+            except Exception:
+                self.append_log(
+                    f"long_text_chunk decode error: id={text_id} index={idx}",
+                    level="WARN",
+                    category="LONGTXT",
+                )
+                return
+            session["parts"][idx] = chunk
+            session["last_update_ms"] = self._now_ms()
+            if session.get("end_received"):
+                try_finalize(session)
+            return
+
+        if kind == "long_text_end":
+            session = ensure_session(reason="end_before_start")
+            merge_meta(session)
+            session["end_received"] = True
+            session["last_update_ms"] = self._now_ms()
+            if try_finalize(session):
+                return
+            expected_chunks = _to_int(str(session.get("chunks", "0")), 0)
+            parts: dict[int, bytes] = session.get("parts", {})
+            if not parts:
+                self.append_log(f"長文受信終了待機(空): id={text_id}", level="WARN", category="LONGTXT")
+                return
+            if expected_chunks > 0:
+                missing = [i for i in range(expected_chunks) if i not in parts]
+                if missing:
+                    self.append_log(
+                        f"long_text_end waiting: id={text_id} missing={len(missing)}",
+                        level="WARN",
+                        category="LONGTXT",
+                    )
+            return
+
     def handle_image_payload(self, payload: dict[str, Any]) -> None:
         kind = str(payload.get("type", "")).strip().lower()
         image_id = str(payload.get("image_id", "")).strip()
@@ -917,6 +1620,8 @@ class LPWAApp(tk.Tk):
 
         if kind == "image_start":
             if image_id not in self.image_rx_sessions:
+                now = self._now_ms()
+                self._ensure_session_capacity(self.image_rx_sessions, "image", image_id)
                 self.image_rx_sessions[image_id] = {
                     "name": str(payload.get("name") or f"{image_id}.bin"),
                     "chunks": _to_int(str(payload.get("chunks", "0")), 0),
@@ -924,6 +1629,8 @@ class LPWAApp(tk.Tk):
                     "sha256": str(payload.get("sha256", "")).strip().lower(),
                     "parts": {},
                     "src": str(payload.get("src", "?")),
+                    "started_ms": now,
+                    "last_update_ms": now,
                 }
                 self.append_log(
                     f"画像受信開始: id={image_id} name={self.image_rx_sessions[image_id]['name']}",
@@ -959,6 +1666,7 @@ class LPWAApp(tk.Tk):
                 self.append_log(f"画像チャンク破損: id={image_id} index={idx}", level="WARN", category="IMAGE")
                 return
             session["parts"][idx] = chunk
+            session["last_update_ms"] = self._now_ms()
             return
 
         if kind == "image_end":
@@ -1009,7 +1717,16 @@ class LPWAApp(tk.Tk):
             name = str(session.get("name", f"{image_id}.bin")).strip() or f"{image_id}.bin"
             safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}"
             out_path = recv_dir / safe_name
-            out_path.write_bytes(merged)
+            try:
+                out_path.write_bytes(merged)
+            except OSError as exc:
+                self.append_log(
+                    f"image save failed: id={image_id} path={out_path} error={exc}",
+                    level="ERROR",
+                    category="IMAGE",
+                )
+                self.image_rx_sessions.pop(image_id, None)
+                return
 
             self.append_log(
                 f"画像保存: {out_path} bytes={len(merged)} chunks={len(parts)} hash_ok={hash_ok} src={session.get('src')}",
@@ -1053,7 +1770,9 @@ class LPWAApp(tk.Tk):
         if worker is None or not worker.is_running:
             messagebox.showwarning("未接続", "先にCOMポートへ接続してください。")
             return False
-        worker.send(payload)
+        if not worker.send(payload):
+            self.append_log("送信キュー満杯のため送信を保留/破棄しました。", level="WARN", category="SERIAL")
+            return False
         return True
 
     def send_chat(self) -> None:
@@ -1064,6 +1783,41 @@ class LPWAApp(tk.Tk):
         via = self.chat_via_var.get().strip() or "wifi"
         ttl = self._current_ttl()
         reliable = self._is_reliable_target(via=via, dst=dst)
+        text_bytes = text.encode("utf-8")
+        if via == "wifi" and len(text_bytes) > LONG_TEXT_AUTO_SPLIT_BYTES:
+            try:
+                packets = make_long_text_messages(
+                    text=text,
+                    dst=dst,
+                    via="wifi",
+                    ttl=ttl,
+                    chunk_size=LONG_TEXT_CHUNK_BYTES,
+                    require_ack=reliable,
+                )
+            except Exception as exc:
+                messagebox.showerror("長文送信エラー", str(exc))
+                return
+            for payload in packets:
+                if not self.send_json(payload):
+                    return
+                if reliable:
+                    self._register_pending_e2e(payload)
+            shown_dst = self._target_label(dst)
+            chunk_count = max(0, len(packets) - 2)
+            self.append_chat(
+                f"me({via}) -> {shown_dst}: [long_text {len(text_bytes)} bytes / {chunk_count} chunks]"
+            )
+            self.append_log(
+                (
+                    f"長文送信キュー投入: bytes={len(text_bytes)} chunks={chunk_count} "
+                    f"dst={shown_dst} reliable={'on' if reliable else 'off'}"
+                ),
+                level="SYSTEM",
+                category="LONGTXT",
+            )
+            self.chat_input_var.set("")
+            return
+
         payload = make_chat_message(text=text, dst=dst, via=via, ttl=ttl, require_ack=reliable)
         if not self.send_json(payload):
             return
@@ -1147,8 +1901,10 @@ class LPWAApp(tk.Tk):
         payload = make_ping_message(seq=seq, dst=dst, ping_id=self.current_ping_id, via="wifi", ttl=ttl)
         if not self.send_json(payload):
             return False
+        sent_ms = self._now_ms()
         self.ping_stats.register_sent(seq)
         self.pending_ping_ids[seq] = self.current_ping_id
+        self.pending_ping_sent_ms[seq] = sent_ms
         self.update_stats_view()
         return True
 
@@ -1166,11 +1922,31 @@ class LPWAApp(tk.Tk):
             return
 
         expected_ping_id = self.pending_ping_ids.get(seq)
+        if expected_ping_id is None:
+            self.append_log(f"pong ignored: no pending seq={seq}", level="WARN", category="PING")
+            return
         received_ping_id = payload.get("ping_id")
         if isinstance(expected_ping_id, str) and expected_ping_id:
             if str(received_ping_id or "") != expected_ping_id:
+                sent_ms = self.pending_ping_sent_ms.get(seq)
+                age_ms = None if sent_ms is None else max(0, self._now_ms() - sent_ms)
+                if age_ms is not None and age_ms > PING_PENDING_MAX_AGE_MS:
+                    self.pending_ping_ids.pop(seq, None)
+                    self.pending_ping_sent_ms.pop(seq, None)
+                    self.append_log(
+                        (
+                            f"pong stale pending dropped: seq={seq} expected={expected_ping_id} "
+                            f"got={received_ping_id} age={age_ms}ms"
+                        ),
+                        level="WARN",
+                        category="PING",
+                    )
+                    return
                 self.append_log(
-                    f"pong ignored: seq={seq} ping_id mismatch expected={expected_ping_id} got={received_ping_id}",
+                    (
+                        f"pong ignored: seq={seq} ping_id mismatch expected={expected_ping_id} "
+                        f"got={received_ping_id} age={age_ms if age_ms is not None else '-'}ms"
+                    ),
                     level="WARN",
                     category="PING",
                 )
@@ -1178,6 +1954,7 @@ class LPWAApp(tk.Tk):
 
         measured = self.ping_stats.register_received(seq, recv_ts_ms=int(time.time() * 1000), latency_ms=None)
         self.pending_ping_ids.pop(seq, None)
+        self.pending_ping_sent_ms.pop(seq, None)
         if measured is not None:
             src = payload.get("src") or payload.get("from")
             if isinstance(src, str) and src.strip():
@@ -1228,6 +2005,7 @@ class LPWAApp(tk.Tk):
     def reset_stats(self) -> None:
         self.ping_stats.reset()
         self.pending_ping_ids.clear()
+        self.pending_ping_sent_ms.clear()
         self.current_ping_id = uuid.uuid4().hex[:8]
         self.update_stats_view()
         self.append_log("統計情報をリセットしました。", level="SYSTEM", category="PING")
@@ -1274,8 +2052,7 @@ class LPWAApp(tk.Tk):
             )
             if not should_close:
                 return
-        self.stop_continuous_ping()
-        self.pending_e2e.clear()
+        self._clear_runtime_state()
         if self.worker:
             self.worker.stop()
             self.worker = None

@@ -64,12 +64,22 @@
   - `ttl > 0` のときのみ転送
   - 受信時に `ttl--`、`hop++`
 - ACK/再送:
-  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `image_*` は `need_ack=true` + `e2e_id` を付与
+  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `long_text_*` / `image_*` は `need_ack=true` + `e2e_id` を付与
   - 受信ノードは `delivery_ack` を送信元へ返し、PC GUIは `e2e_id` で照合して完了判定する
   - GUI再送ポリシー:
-    - timeout: 1500ms
-    - max retry: 2（合計3送信）
+    - timeout: 2200ms
+    - max retry: 4（合計5送信）
   - Broadcast送信とBLE送信は `delivery_ack` 対象外
+
+## 6.1 長距離向け既定プロファイル（現行実装）
+- ノードごとの個別設定なしで同一ファームを配布して使用する前提
+- ESP-NOW初期化時に以下を自動適用:
+  - `esp_wifi_set_max_tx_power(84)`（21dBm相当、法規/実装制限に依存）
+  - 送信フレームのオリジン側リピート送信（既定3回）
+  - 中継転送時のランダムジッタ（衝突確率低減）
+- 補足:
+  - BLE共存を維持するため、現行既定では `WIFI_PROTOCOL_LR` を有効化しない
+  - Wi-Fi専用ビルドでのみ LR を段階的に評価する
 
 ## 7. Wi-Fi/BLEメッシュの使い分け設計
 - Wi-Fiメッシュを優先する場面:

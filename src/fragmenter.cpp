@@ -55,7 +55,8 @@ ReassemblyManager::ReassemblyManager() {
 bool ReassemblyManager::PushFragment(uint32_t originId, uint32_t messageId, AppPayloadType payloadType,
                                      uint8_t hops, uint8_t fragIndex, uint8_t fragCount,
                                      uint16_t totalLen, const uint8_t* chunk, uint16_t chunkLen,
-                                     uint32_t nowMs, ReassembledMessage* outMessage) {
+                                     int8_t rssi, const uint8_t* senderMac, uint32_t nowMs,
+                                     ReassembledMessage* outMessage) {
   if (outMessage == nullptr) {
     return false;
   }
@@ -93,12 +94,27 @@ bool ReassemblyManager::PushFragment(uint32_t originId, uint32_t messageId, AppP
     slot->receivedMask = 0;
     slot->hops = hops;
     slot->lastUpdateMs = nowMs;
+    slot->bestRssi = rssi;
+    if (senderMac != nullptr) {
+      slot->hasSenderMac = true;
+      std::memcpy(slot->bestSenderMac, senderMac, sizeof(slot->bestSenderMac));
+    } else {
+      slot->hasSenderMac = false;
+      std::memset(slot->bestSenderMac, 0, sizeof(slot->bestSenderMac));
+    }
   } else {
     if (slot->fragCount != fragCount || slot->totalLen != totalLen) {
       return false;
     }
     if (hops > slot->hops) {
       slot->hops = hops;
+    }
+    if (rssi > slot->bestRssi) {
+      slot->bestRssi = rssi;
+      if (senderMac != nullptr) {
+        slot->hasSenderMac = true;
+        std::memcpy(slot->bestSenderMac, senderMac, sizeof(slot->bestSenderMac));
+      }
     }
   }
 
@@ -122,6 +138,13 @@ bool ReassemblyManager::PushFragment(uint32_t originId, uint32_t messageId, AppP
   outMessage->messageId = slot->messageId;
   outMessage->payloadType = slot->payloadType;
   outMessage->hops = slot->hops;
+  outMessage->rssi = slot->bestRssi;
+  outMessage->hasSenderMac = slot->hasSenderMac;
+  if (slot->hasSenderMac) {
+    std::memcpy(outMessage->senderMac, slot->bestSenderMac, sizeof(outMessage->senderMac));
+  } else {
+    std::memset(outMessage->senderMac, 0, sizeof(outMessage->senderMac));
+  }
   outMessage->length = slot->totalLen;
   if (slot->totalLen > 0) {
     std::memcpy(outMessage->data, slot->data, slot->totalLen);
@@ -194,7 +217,9 @@ void ReassemblyManager::resetSlot(Slot* slot) {
   slot->totalLen = 0;
   slot->receivedMask = 0;
   slot->lastUpdateMs = 0;
+  slot->bestRssi = -128;
+  slot->hasSenderMac = false;
+  std::memset(slot->bestSenderMac, 0, sizeof(slot->bestSenderMac));
 }
 
 }  // namespace lpwa
-
