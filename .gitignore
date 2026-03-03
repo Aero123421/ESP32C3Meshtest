@@ -1,0 +1,18 @@
+# Build artifacts
+.pio/
+
+# Python artifacts
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+pc_app/.venv/
+
+# Runtime outputs
+received_images/
+test_logs/
+*.log
+
+# Local notes (do not publish)
+1.md
