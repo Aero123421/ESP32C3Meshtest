@@ -24,6 +24,8 @@ struct NodeRecord {
   uint32_t nodeId = 0;
   uint32_t lastSeenMs = 0;
   int8_t lastRssi = 0;
+  bool hasMac = false;
+  uint8_t staMac[6]{};
   uint32_t uptimeSec = 0;
   uint32_t freeHeap = 0;
   uint32_t remoteRxFrames = 0;
@@ -31,4 +33,3 @@ struct NodeRecord {
 };
 
 }  // namespace lpwa
-

@@ -34,6 +34,7 @@ class EspNowMesh {
 
   void getStats(MeshStats* outStats) const;
   size_t copyNodeRecords(NodeRecord* outRecords, size_t maxRecords) const;
+  bool resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) const;
   uint32_t nodeId() const { return nodeId_; }
 
  private:
@@ -92,6 +93,8 @@ class EspNowMesh {
   uint8_t inboundCount_ = 0;
 
   uint32_t nodeId_ = 0;
+  bool hasStaMac_ = false;
+  uint8_t staMac_[6]{};
   uint32_t nextMessageId_ = 1;
   uint32_t lastNodeInfoMs_ = 0;
 };

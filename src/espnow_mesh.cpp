@@ -58,6 +58,12 @@ bool EspNowMesh::begin() {
   WiFi.disconnect();
   delay(20);
 
+  hasStaMac_ = false;
+  std::memset(staMac_, 0, sizeof(staMac_));
+  if (esp_wifi_get_mac(WIFI_IF_STA, staMac_) == ESP_OK) {
+    hasStaMac_ = true;
+  }
+
   const esp_err_t channelResult = esp_wifi_set_channel(kMeshChannel, WIFI_SECOND_CHAN_NONE);
   if (channelResult != ESP_OK) {
     return false;
@@ -93,6 +99,10 @@ bool EspNowMesh::begin() {
   if (selfNode != nullptr) {
     selfNode->lastSeenMs = millis();
     selfNode->lastRssi = 0;
+    selfNode->hasMac = hasStaMac_;
+    if (hasStaMac_) {
+      std::memcpy(selfNode->staMac, staMac_, sizeof(staMac_));
+    }
     selfNode->uptimeSec = 0;
     selfNode->freeHeap = ESP.getFreeHeap();
   }
@@ -158,6 +168,28 @@ size_t EspNowMesh::copyNodeRecords(NodeRecord* outRecords, size_t maxRecords) co
     outRecords[i] = nodes_[i];
   }
   return count;
+}
+
+bool EspNowMesh::resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) const {
+  if (outNodeId != nullptr) {
+    *outNodeId = 0;
+  }
+  if (mac == nullptr) {
+    return false;
+  }
+  for (size_t i = 0; i < nodeCount_; ++i) {
+    const NodeRecord& node = nodes_[i];
+    if (!node.hasMac) {
+      continue;
+    }
+    if (std::memcmp(node.staMac, mac, 6) == 0) {
+      if (outNodeId != nullptr) {
+        *outNodeId = node.nodeId;
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 void EspNowMesh::onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -392,13 +424,24 @@ bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
 
 bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
                                      int8_t rssi, uint32_t nowMs) {
-  if (body == nullptr || bodyLen < sizeof(NodeInfoPayload)) {
+  constexpr size_t kLegacyNodeInfoPayloadSize = 22;
+  if (body == nullptr || bodyLen < kLegacyNodeInfoPayloadSize) {
     stats_.rxParseErrors++;
     return false;
   }
 
   NodeInfoPayload remote{};
-  std::memcpy(&remote, body, sizeof(remote));
+  if (bodyLen >= sizeof(remote)) {
+    std::memcpy(&remote, body, sizeof(remote));
+  } else {
+    std::memcpy(&remote.nodeId, body + 0, sizeof(remote.nodeId));
+    std::memcpy(&remote.uptimeSec, body + 4, sizeof(remote.uptimeSec));
+    std::memcpy(&remote.freeHeap, body + 8, sizeof(remote.freeHeap));
+    std::memcpy(&remote.rxFrames, body + 12, sizeof(remote.rxFrames));
+    std::memcpy(&remote.txFrames, body + 16, sizeof(remote.txFrames));
+    std::memcpy(&remote.seenNodes, body + 20, sizeof(remote.seenNodes));
+    std::memset(remote.staMac, 0, sizeof(remote.staMac));
+  }
   if (remote.nodeId == 0 || remote.nodeId != header.originId) {
     stats_.rxParseErrors++;
     return false;
@@ -411,6 +454,18 @@ bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_
 
   node->lastSeenMs = nowMs;
   node->lastRssi = rssi;
+  node->hasMac = false;
+  for (size_t i = 0; i < sizeof(remote.staMac); ++i) {
+    if (remote.staMac[i] != 0) {
+      node->hasMac = true;
+      break;
+    }
+  }
+  if (node->hasMac) {
+    std::memcpy(node->staMac, remote.staMac, sizeof(node->staMac));
+  } else {
+    std::memset(node->staMac, 0, sizeof(node->staMac));
+  }
   node->uptimeSec = remote.uptimeSec;
   node->freeHeap = remote.freeHeap;
   node->remoteRxFrames = remote.rxFrames;
@@ -523,10 +578,19 @@ bool EspNowMesh::sendNodeInfo(uint8_t ttl) {
   info.rxFrames = stats_.rxFrames;
   info.txFrames = stats_.txFrames;
   info.seenNodes = nodeCount_;
+  if (hasStaMac_) {
+    std::memcpy(info.staMac, staMac_, sizeof(info.staMac));
+  } else {
+    std::memset(info.staMac, 0, sizeof(info.staMac));
+  }
 
   NodeRecord* selfNode = findNode(nodeId_);
   if (selfNode != nullptr) {
     selfNode->lastSeenMs = millis();
+    selfNode->hasMac = hasStaMac_;
+    if (hasStaMac_) {
+      std::memcpy(selfNode->staMac, staMac_, sizeof(selfNode->staMac));
+    }
     selfNode->uptimeSec = info.uptimeSec;
     selfNode->freeHeap = info.freeHeap;
     selfNode->remoteRxFrames = info.rxFrames;

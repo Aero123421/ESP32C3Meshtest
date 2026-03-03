@@ -60,17 +60,65 @@ MAX_RX_SESSIONS = 24
 MAX_CHAT_LINES = 1200
 TOPOLOGY_REDRAW_INTERVAL_MS = 400
 TOPOLOGY_DEFAULT_WINDOW_SEC = 30
+TOPOLOGY_FLOW_EVENT_LIMIT = 240
 MAX_WORKER_EVENTS_PER_TICK = 120
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
 PING_PENDING_MAX_AGE_MS = 20000
+TOPOLOGY_VIEW_CHOICES = ("tree", "flow", "both")
+TOPOLOGY_KIND_CHOICES = (
+    "all",
+    "chat",
+    "ping",
+    "pong",
+    "delivery_ack",
+    "long_text_start",
+    "long_text_chunk",
+    "long_text_end",
+    "image_start",
+    "image_chunk",
+    "image_end",
+    "binary",
+    "unknown",
+)
+TOPOLOGY_TRACK_MESSAGE_TYPES = {
+    "chat",
+    "ping",
+    "ping_reply",
+    "pong",
+    "delivery_ack",
+    "long_text_start",
+    "long_text_chunk",
+    "long_text_end",
+    "lt_s",
+    "lt_c",
+    "lt_e",
+    "image_start",
+    "image_chunk",
+    "image_end",
+    "binary",
+}
+TOPOLOGY_EDGE_COLORS: dict[str, tuple[str, str]] = {
+    "chat": ("#22c55e", "#166534"),
+    "ping": ("#38bdf8", "#1d4ed8"),
+    "pong": ("#60a5fa", "#1e40af"),
+    "delivery_ack": ("#f59e0b", "#b45309"),
+    "long_text_start": ("#14b8a6", "#0f766e"),
+    "long_text_chunk": ("#06b6d4", "#155e75"),
+    "long_text_end": ("#22d3ee", "#0e7490"),
+    "image_start": ("#c084fc", "#6b21a8"),
+    "image_chunk": ("#a78bfa", "#5b21b6"),
+    "image_end": ("#8b5cf6", "#581c87"),
+    "binary": ("#94a3b8", "#334155"),
+    "unknown": ("#94a3b8", "#475569"),
+}
 
 
 class LPWAApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("LPWA Test PC App")
-        self.geometry("1180x760")
-        self.minsize(980, 640)
+        self.geometry("1340x860")
+        self.minsize(1100, 700)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.worker: SerialWorker | None = None
@@ -101,6 +149,7 @@ class LPWAApp(tk.Tk):
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
         self.connection_var = tk.StringVar(value="未接続")
+        self.self_node_var = tk.StringVar(value="未取得")
         self.flash_status_var = tk.StringVar(value="Idle")
         self.pio_env_var = tk.StringVar(value="seeed_xiao_esp32c3")
         self.chat_target_var = tk.StringVar(value=BROADCAST_LABEL)
@@ -116,6 +165,7 @@ class LPWAApp(tk.Tk):
         self.topology_window_var = tk.StringVar(value=str(TOPOLOGY_DEFAULT_WINDOW_SEC))
         self.topology_via_var = tk.StringVar(value="all")
         self.topology_kind_var = tk.StringVar(value="all")
+        self.topology_view_var = tk.StringVar(value="tree")
         self.topology_status_var = tk.StringVar(value="未更新")
         self.topology_broadcast_var = tk.BooleanVar(value=False)
 
@@ -128,13 +178,14 @@ class LPWAApp(tk.Tk):
         self.max_var = tk.StringVar(value="0.0 ms")
         self.p95_var = tk.StringVar(value="0.0 ms")
 
-        self._build_ui()
+        self._build_ui_tabbed()
         self.refresh_destination_choices()
         self.refresh_ports()
         self.after(100, self.poll_worker_events)
         self.after(TOPOLOGY_REDRAW_INTERVAL_MS, self.refresh_topology_view)
 
-    def _build_ui(self) -> None:
+    def _build_ui_legacy(self) -> None:
+        # 旧レイアウト。履歴参照用に残しているが現在は _build_ui_tabbed を使用する。
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
@@ -217,7 +268,7 @@ class LPWAApp(tk.Tk):
         ttk.Button(node_actions, text="選択ノード→宛先", command=self.apply_selected_node_to_targets).grid(
             row=0, column=2, padx=4
         )
-        ttk.Button(node_actions, text="宛先をBroadcast", command=self.set_broadcast_targets).grid(
+        ttk.Button(node_actions, text="宛先を全体送信", command=self.set_broadcast_targets).grid(
             row=0, column=3, padx=(2, 0)
         )
 
@@ -363,7 +414,7 @@ class LPWAApp(tk.Tk):
         self.topology_kind_combo = ttk.Combobox(
             ctrl,
             textvariable=self.topology_kind_var,
-            values=("all", "chat", "ping", "pong", "delivery_ack", "long_text", "image"),
+            values=TOPOLOGY_KIND_CHOICES,
             width=12,
             state="readonly",
         )
@@ -371,7 +422,7 @@ class LPWAApp(tk.Tk):
         self.topology_kind_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
         ttk.Checkbutton(
             ctrl,
-            text="Broadcast表示",
+            text="全体送信(Broadcast)表示",
             variable=self.topology_broadcast_var,
             command=self._mark_topology_dirty,
         ).grid(row=0, column=6, padx=(8, 2), sticky="w")
@@ -411,6 +462,398 @@ class LPWAApp(tk.Tk):
 
         body.add(left, weight=1)
         body.add(right, weight=1)
+
+    def _build_ui_tabbed(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        style = ttk.Style(self)
+        style.configure("TNotebook.Tab", padding=(14, 8))
+
+        self._build_top_bar_tabbed()
+
+        self.main_tabs = ttk.Notebook(self)
+        self.main_tabs.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        comm_tab = ttk.Frame(self.main_tabs, padding=8)
+        test_tab = ttk.Frame(self.main_tabs, padding=8)
+        topo_tab = ttk.Frame(self.main_tabs, padding=8)
+        log_tab = ttk.Frame(self.main_tabs, padding=8)
+        fw_tab = ttk.Frame(self.main_tabs, padding=8)
+        self.topology_tab = topo_tab
+
+        self.main_tabs.add(comm_tab, text="通信")
+        self.main_tabs.add(test_tab, text="試験")
+        self.main_tabs.add(topo_tab, text="トポロジ")
+        self.main_tabs.add(log_tab, text="ログ")
+        self.main_tabs.add(fw_tab, text="FW書込")
+
+        self._build_comm_tab(comm_tab)
+        self._build_test_tab(test_tab)
+        self._build_topology_tab(topo_tab)
+        self._build_log_tab(log_tab)
+        self._build_fw_tab(fw_tab)
+
+    def _build_top_bar_tabbed(self) -> None:
+        top = ttk.LabelFrame(self, text="接続")
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        top.columnconfigure(12, weight=1)
+
+        ttk.Label(top, text="ポート").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=16, state="readonly")
+        self.port_combo.grid(row=0, column=1, padx=4, pady=4, sticky="w")
+        ttk.Button(top, text="更新", command=self.refresh_ports).grid(row=0, column=2, padx=4, pady=4)
+
+        ttk.Label(top, text="Baud").grid(row=0, column=3, padx=4, pady=4, sticky="w")
+        ttk.Entry(top, textvariable=self.baud_var, width=10).grid(row=0, column=4, padx=4, pady=4)
+
+        self.connect_button = ttk.Button(top, text="接続", command=self.toggle_connection)
+        self.connect_button.grid(row=0, column=5, padx=4, pady=4)
+        ttk.Button(top, text="ノード要求", command=self.request_nodes).grid(row=0, column=6, padx=4, pady=4)
+
+        ttk.Label(top, text="状態").grid(row=0, column=7, padx=4, pady=4, sticky="e")
+        ttk.Label(top, textvariable=self.connection_var).grid(row=0, column=8, padx=4, pady=4, sticky="w")
+        ttk.Label(top, text="自ノード").grid(row=0, column=9, padx=(16, 4), pady=4, sticky="e")
+        ttk.Label(top, textvariable=self.self_node_var).grid(row=0, column=10, padx=4, pady=4, sticky="w")
+        ttk.Button(top, text="選択ノード→宛先", command=self.apply_selected_node_to_targets).grid(
+            row=0, column=11, padx=4, pady=4
+        )
+        ttk.Button(top, text="宛先を全体送信", command=self.set_broadcast_targets).grid(
+            row=0, column=12, padx=4, pady=4
+        )
+
+    def _build_comm_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=5)
+        parent.columnconfigure(1, weight=6)
+        parent.rowconfigure(0, weight=1)
+
+        nodes_frame = ttk.LabelFrame(parent, text="ノード一覧 / 宛先選択")
+        nodes_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        nodes_frame.columnconfigure(0, weight=1)
+        nodes_frame.rowconfigure(0, weight=1)
+
+        self.node_tree = ttk.Treeview(
+            nodes_frame,
+            columns=("id", "rssi", "ping", "seen", "msg"),
+            show="headings",
+            height=18,
+        )
+        for key, title, width in (
+            ("id", "Node", 170),
+            ("rssi", "RSSI", 70),
+            ("ping", "Ping(ms)", 85),
+            ("seen", "Last Seen", 95),
+            ("msg", "Last Msg", 320),
+        ):
+            self.node_tree.heading(key, text=title)
+            self.node_tree.column(key, width=width, anchor="w")
+        self.node_tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        node_scroll = ttk.Scrollbar(nodes_frame, orient=tk.VERTICAL, command=self.node_tree.yview)
+        node_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
+        self.node_tree.configure(yscrollcommand=node_scroll.set)
+        self.node_tree.bind("<<TreeviewSelect>>", self.on_node_tree_select)
+        self.node_tree.bind("<Double-1>", self.apply_selected_node_to_targets)
+
+        node_actions = ttk.Frame(nodes_frame)
+        node_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
+        node_actions.columnconfigure(1, weight=1)
+        ttk.Label(node_actions, text="操作ヒント").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(
+            node_actions,
+            text="ノードをダブルクリックすると宛先に反映されます",
+            foreground="#4b5563",
+        ).grid(row=0, column=1, sticky="w")
+
+        right = ttk.Frame(parent)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=3)
+        right.rowconfigure(1, weight=2)
+
+        chat_frame = ttk.LabelFrame(right, text="チャット")
+        chat_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        chat_frame.columnconfigure(1, weight=1)
+        chat_frame.rowconfigure(1, weight=1)
+        ttk.Label(chat_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.chat_target_combo = ttk.Combobox(chat_frame, textvariable=self.chat_target_var, width=20, state="readonly")
+        self.chat_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        ttk.Label(chat_frame, text="経路").grid(row=0, column=2, padx=4, pady=4, sticky="e")
+        ttk.Combobox(
+            chat_frame,
+            textvariable=self.chat_via_var,
+            values=("wifi", "ble"),
+            width=8,
+            state="readonly",
+        ).grid(row=0, column=3, padx=4, pady=4, sticky="w")
+        ttk.Label(chat_frame, text=f"※ {BROADCAST_LABEL} で全体送信", foreground="#4b5563").grid(
+            row=0, column=4, padx=(8, 4), pady=4, sticky="w"
+        )
+        self.chat_history = ScrolledText(chat_frame, height=14, state=tk.DISABLED, wrap=tk.WORD)
+        self.chat_history.grid(row=1, column=0, columnspan=5, sticky="nsew", padx=4, pady=4)
+        chat_entry = ttk.Entry(chat_frame, textvariable=self.chat_input_var)
+        chat_entry.grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(0, 4))
+        chat_entry.bind("<Return>", lambda _: self.send_chat())
+        ttk.Button(chat_frame, text="送信", command=self.send_chat).grid(row=2, column=4, padx=4, pady=(0, 4))
+
+        image_frame = ttk.LabelFrame(right, text="画像送信")
+        image_frame.grid(row=1, column=0, sticky="nsew")
+        image_frame.columnconfigure(1, weight=1)
+        ttk.Label(image_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.image_target_combo = ttk.Combobox(image_frame, textvariable=self.image_target_var, width=20, state="readonly")
+        self.image_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        ttk.Label(image_frame, text="ファイル").grid(row=1, column=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(image_frame, textvariable=self.image_path_var).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+        ttk.Button(image_frame, text="参照", command=self.browse_image).grid(row=1, column=2, padx=4, pady=4)
+        ttk.Label(
+            image_frame,
+            text="大きい画像はメッシュ負荷が高くなります",
+            foreground="#4b5563",
+        ).grid(row=2, column=0, columnspan=2, padx=4, sticky="w")
+        ttk.Button(image_frame, text="画像送信", command=self.send_image).grid(row=2, column=2, padx=4, pady=4, sticky="e")
+
+    def _build_test_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        help_line = ttk.Label(
+            parent,
+            text="長距離試験は TTL を 10〜12 目安で設定し、宛先指定で Ping と delivery_ack を確認してください。",
+            foreground="#4b5563",
+        )
+        help_line.grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        ping_frame = ttk.LabelFrame(parent, text="Ping / 連続試験")
+        ping_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
+        ping_frame.columnconfigure(1, weight=1)
+        ttk.Label(ping_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        self.ping_target_combo = ttk.Combobox(ping_frame, textvariable=self.ping_target_var, state="readonly")
+        self.ping_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        ttk.Button(ping_frame, text="Ping送信", command=self.send_ping).grid(row=0, column=2, padx=4, pady=4)
+
+        ttk.Label(ping_frame, text="間隔(ms)").grid(row=1, column=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(ping_frame, textvariable=self.interval_var, width=12).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        ttk.Label(ping_frame, text="回数(0=無限)").grid(row=2, column=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(ping_frame, textvariable=self.count_var, width=12).grid(row=2, column=1, padx=4, pady=4, sticky="w")
+        ttk.Label(ping_frame, text="TTL").grid(row=3, column=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(ping_frame, textvariable=self.ttl_var, width=12).grid(row=3, column=1, padx=4, pady=4, sticky="w")
+        self.start_test_btn = ttk.Button(ping_frame, text="連続開始", command=self.start_continuous_ping)
+        self.start_test_btn.grid(row=1, column=2, padx=4, pady=4)
+        self.stop_test_btn = ttk.Button(ping_frame, text="停止", command=self.stop_continuous_ping, state=tk.DISABLED)
+        self.stop_test_btn.grid(row=2, column=2, padx=4, pady=4)
+        ttk.Label(ping_frame, text="(10ノード目安: 10-12)", foreground="#4b5563").grid(
+            row=3, column=2, padx=4, pady=4, sticky="w"
+        )
+
+        stats_frame = ttk.LabelFrame(parent, text="PDR / 遅延統計")
+        stats_frame.grid(row=2, column=0, sticky="nsew")
+        for idx in range(4):
+            stats_frame.columnconfigure(idx, weight=1)
+        ttk.Label(stats_frame, text="Sent").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.sent_var).grid(row=0, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="Received").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.received_var).grid(row=0, column=3, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="Lost").grid(row=1, column=0, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.lost_var).grid(row=1, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="PDR").grid(row=1, column=2, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.pdr_var).grid(row=1, column=3, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="Avg").grid(row=2, column=0, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.avg_var).grid(row=2, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="Min").grid(row=2, column=2, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.min_var).grid(row=2, column=3, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="Max").grid(row=3, column=0, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.max_var).grid(row=3, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, text="P95").grid(row=3, column=2, padx=6, pady=6, sticky="w")
+        ttk.Label(stats_frame, textvariable=self.p95_var).grid(row=3, column=3, padx=6, pady=6, sticky="w")
+        ttk.Button(stats_frame, text="統計リセット", command=self.reset_stats).grid(
+            row=4, column=0, columnspan=4, padx=6, pady=(2, 8), sticky="e"
+        )
+
+    def _build_topology_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=6)
+        parent.rowconfigure(2, weight=3)
+
+        ctrl = ttk.Frame(parent)
+        ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ctrl.columnconfigure(14, weight=1)
+        ttk.Label(ctrl, text="窓(sec)").grid(row=0, column=0, padx=2, sticky="w")
+        self.topology_window_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_window_var,
+            values=("10", "30", "60", "120", "300"),
+            width=6,
+            state="readonly",
+        )
+        self.topology_window_combo.grid(row=0, column=1, padx=2, sticky="w")
+        self.topology_window_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Label(ctrl, text="経路").grid(row=0, column=2, padx=(8, 2), sticky="w")
+        self.topology_via_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_via_var,
+            values=("all", "wifi", "ble"),
+            width=8,
+            state="readonly",
+        )
+        self.topology_via_combo.grid(row=0, column=3, padx=2, sticky="w")
+        self.topology_via_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Label(ctrl, text="種別").grid(row=0, column=4, padx=(8, 2), sticky="w")
+        self.topology_kind_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_kind_var,
+            values=TOPOLOGY_KIND_CHOICES,
+            width=12,
+            state="readonly",
+        )
+        self.topology_kind_combo.grid(row=0, column=5, padx=2, sticky="w")
+        self.topology_kind_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Label(ctrl, text="表示").grid(row=0, column=6, padx=(8, 2), sticky="w")
+        self.topology_view_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self.topology_view_var,
+            values=TOPOLOGY_VIEW_CHOICES,
+            width=10,
+            state="readonly",
+        )
+        self.topology_view_combo.grid(row=0, column=7, padx=2, sticky="w")
+        self.topology_view_combo.bind("<<ComboboxSelected>>", lambda _: self._mark_topology_dirty())
+        ttk.Checkbutton(
+            ctrl,
+            text="全体送信(Broadcast)表示",
+            variable=self.topology_broadcast_var,
+            command=self._mark_topology_dirty,
+        ).grid(row=0, column=8, padx=(8, 2), sticky="w")
+        ttk.Button(ctrl, text="履歴クリア", command=self.clear_topology_history).grid(row=0, column=9, padx=(8, 2))
+        ttk.Label(ctrl, textvariable=self.topology_status_var).grid(row=0, column=14, padx=4, sticky="e")
+
+        self.topology_canvas = tk.Canvas(
+            parent,
+            bg="#0b1220",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
+        )
+        self.topology_canvas.grid(row=1, column=0, sticky="nsew")
+        self.topology_canvas.bind("<Configure>", lambda _: self._mark_topology_dirty())
+
+        table_frame = ttk.Frame(parent)
+        table_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        self.topology_detail_tabs = ttk.Notebook(table_frame)
+        self.topology_detail_tabs.grid(row=0, column=0, sticky="nsew")
+
+        links_tab = ttk.Frame(self.topology_detail_tabs)
+        links_tab.columnconfigure(0, weight=1)
+        links_tab.rowconfigure(0, weight=1)
+        self.topology_tree = ttk.Treeview(
+            links_tab,
+            columns=("src", "dst", "via", "type", "count", "bytes", "hops", "retry", "rssi", "last"),
+            show="headings",
+            height=9,
+        )
+        for key, title, width in (
+            ("src", "Src", 120),
+            ("dst", "Dst", 120),
+            ("via", "Via", 62),
+            ("type", "Type", 110),
+            ("count", "Count", 70),
+            ("bytes", "Bytes", 80),
+            ("hops", "Hops", 62),
+            ("retry", "Retry", 62),
+            ("rssi", "RSSI", 62),
+            ("last", "Last", 86),
+        ):
+            self.topology_tree.heading(key, text=title)
+            self.topology_tree.column(key, width=width, anchor="w")
+        self.topology_tree.grid(row=0, column=0, sticky="nsew")
+        topo_scroll = ttk.Scrollbar(links_tab, orient=tk.VERTICAL, command=self.topology_tree.yview)
+        topo_scroll.grid(row=0, column=1, sticky="ns")
+        self.topology_tree.configure(yscrollcommand=topo_scroll.set)
+        self.topology_detail_tabs.add(links_tab, text="リンク集計")
+
+        flow_tab = ttk.Frame(self.topology_detail_tabs)
+        flow_tab.columnconfigure(0, weight=1)
+        flow_tab.rowconfigure(0, weight=1)
+        self.topology_flow_tree = ttk.Treeview(
+            flow_tab,
+            columns=("time", "type", "src", "dst", "observer", "via_node", "hops", "msg"),
+            show="headings",
+            height=9,
+        )
+        for key, title, width in (
+            ("time", "Time", 90),
+            ("type", "Type", 100),
+            ("src", "Src", 120),
+            ("dst", "Dst", 120),
+            ("observer", "Observer", 120),
+            ("via_node", "ViaNode", 120),
+            ("hops", "Hops", 62),
+            ("msg", "Msg", 160),
+        ):
+            self.topology_flow_tree.heading(key, text=title)
+            self.topology_flow_tree.column(key, width=width, anchor="w")
+        self.topology_flow_tree.grid(row=0, column=0, sticky="nsew")
+        flow_scroll = ttk.Scrollbar(flow_tab, orient=tk.VERTICAL, command=self.topology_flow_tree.yview)
+        flow_scroll.grid(row=0, column=1, sticky="ns")
+        self.topology_flow_tree.configure(yscrollcommand=flow_scroll.set)
+        self.topology_detail_tabs.add(flow_tab, text="通信フロー")
+
+    def _build_log_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        log_frame = ttk.LabelFrame(parent, text="イベントログ")
+        log_frame.grid(row=0, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_text = ScrolledText(log_frame, state=tk.DISABLED, wrap=tk.NONE, font=("Consolas", 10))
+        self.log_text.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=4, pady=(4, 2))
+        log_x_scroll = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL, command=self.log_text.xview)
+        log_x_scroll.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 2))
+        self.log_text.configure(xscrollcommand=log_x_scroll.set)
+        self.log_text.tag_configure("INFO", foreground="#1f2937")
+        self.log_text.tag_configure("WARN", foreground="#9a6700")
+        self.log_text.tag_configure("ERROR", foreground="#b42318")
+        self.log_text.tag_configure("TX", foreground="#0f5132")
+        self.log_text.tag_configure("RX", foreground="#0c4a6e")
+        self.log_text.tag_configure("SYSTEM", foreground="#4b5563")
+        ttk.Button(log_frame, text="ログ保存", command=self.save_logs).grid(row=2, column=1, padx=4, pady=4, sticky="e")
+        ttk.Button(log_frame, text="クリア", command=self.clear_logs).grid(row=2, column=2, padx=4, pady=4, sticky="e")
+
+    def _build_fw_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        flash_frame = ttk.LabelFrame(parent, text="Build / 書き込み")
+        flash_frame.grid(row=0, column=0, sticky="ew")
+        flash_frame.columnconfigure(6, weight=1)
+
+        ttk.Label(flash_frame, text="FW Env").grid(row=0, column=0, padx=4, pady=6, sticky="w")
+        ttk.Entry(flash_frame, textvariable=self.pio_env_var, width=24).grid(row=0, column=1, padx=4, pady=6, sticky="w")
+
+        self.build_fw_button = ttk.Button(flash_frame, text="Build", command=self.start_build_only)
+        self.build_fw_button.grid(row=0, column=2, padx=4, pady=6)
+        self.flash_selected_button = ttk.Button(flash_frame, text="書込(選択COM)", command=self.start_flash_selected_port)
+        self.flash_selected_button.grid(row=0, column=3, padx=4, pady=6)
+        self.flash_all_button = ttk.Button(flash_frame, text="書込(全COM)", command=self.start_flash_all_ports)
+        self.flash_all_button.grid(row=0, column=4, padx=4, pady=6)
+
+        ttk.Label(flash_frame, text="Flash状態").grid(row=0, column=5, padx=4, pady=6, sticky="e")
+        ttk.Label(flash_frame, textvariable=self.flash_status_var).grid(row=0, column=6, padx=4, pady=6, sticky="w")
+
+        guide = ttk.LabelFrame(parent, text="使い方")
+        guide.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        guide.columnconfigure(0, weight=1)
+        ttk.Label(
+            guide,
+            justify=tk.LEFT,
+            text=(
+                "1. 上部の接続エリアで COM と Baud を選択\n"
+                "2. Build でビルド確認\n"
+                "3. 単体書込みは 書込(選択COM)、複数台は 書込(全COM)\n"
+                "4. 通信確認は 通信/試験/トポロジ タブで実施"
+            ),
+            foreground="#4b5563",
+        ).grid(row=0, column=0, padx=8, pady=8, sticky="w")
 
     def append_log(self, text: str, level: str = "INFO", category: str = "APP") -> None:
         level_tag = level.upper().strip()
@@ -706,7 +1149,14 @@ class LPWAApp(tk.Tk):
         if kind == "mesh_observed":
             return (
                 f"mesh_observed app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
+                f"observer={payload.get('observer')} via_node={payload.get('via_node')} "
                 f"hops={payload.get('hops')} rssi={payload.get('rssi')} msg_id={payload.get('msg_id')}"
+            )
+        if kind == "mesh_trace":
+            return (
+                f"mesh_trace app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
+                f"observer={payload.get('observer')} via_node={payload.get('via_node')} "
+                f"hops={payload.get('hops')} msg_id={payload.get('msg_id')}"
             )
         if kind == "chat":
             via = payload.get("via", "wifi")
@@ -801,7 +1251,19 @@ class LPWAApp(tk.Tk):
         self.topology_status_var.set("履歴クリア")
         self.append_log("トポロジ履歴をクリアしました。", level="SYSTEM", category="TOPO")
 
+    def _should_track_topology_payload(self, payload: dict[str, Any], *, direction: str) -> bool:
+        kind = self._payload_type(payload)
+        if direction == "tx":
+            return kind in TOPOLOGY_TRACK_MESSAGE_TYPES
+        if kind in {"mesh_observed", "mesh_trace"}:
+            return True
+        via = str(payload.get("via") or "").strip().lower()
+        # Wi-Fi受信は mesh_observed に集約し、BLEは従来イベントを採用する。
+        return via == "ble" and kind in TOPOLOGY_TRACK_MESSAGE_TYPES
+
     def _track_topology_payload(self, payload: dict[str, Any], *, direction: str) -> None:
+        if not self._should_track_topology_payload(payload, direction=direction):
+            return
         try:
             self.topology_tracker.ingest(
                 payload,
@@ -813,9 +1275,59 @@ class LPWAApp(tk.Tk):
         except Exception as exc:
             self.append_log(f"topology ingest error: {exc}", level="WARN", category="TOPO")
 
+    def _infer_local_node_id_from_entries(self, entries: list[Any]) -> str | None:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            node_id = str(entry.get("node_id") or entry.get("id") or "").strip()
+            if not node_id:
+                continue
+            rssi_raw = entry.get("rssi")
+            rssi: int | None = None
+            if isinstance(rssi_raw, bool):
+                rssi = None
+            elif isinstance(rssi_raw, int):
+                rssi = rssi_raw
+            elif isinstance(rssi_raw, float):
+                rssi = int(rssi_raw)
+            elif isinstance(rssi_raw, str):
+                raw = rssi_raw.strip()
+                if raw and (raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit())):
+                    rssi = int(raw)
+            if rssi == 0:
+                return node_id
+        return None
+
+    def _update_topology_kind_choices(self, snapshot: TopologySnapshot) -> None:
+        known = {str(kind).strip().lower() for kind in TOPOLOGY_KIND_CHOICES}
+        for edge in snapshot.edges:
+            kind = str(edge.kind).strip().lower()
+            if kind:
+                known.add(kind)
+        choices = tuple(["all"] + sorted(k for k in known if k != "all"))
+        try:
+            current_values = tuple(self.topology_kind_combo["values"])
+        except Exception:
+            current_values = ()
+        if current_values != choices:
+            self.topology_kind_combo["values"] = choices
+        current = str(self.topology_kind_var.get() or "all").strip().lower() or "all"
+        if current not in known:
+            self.topology_kind_var.set("all")
+            self.topology_dirty = True
+
     def refresh_topology_view(self) -> None:
         try:
             if self.topology_dirty:
+                if hasattr(self, "main_tabs") and hasattr(self, "topology_tab"):
+                    try:
+                        selected = str(self.main_tabs.select() or "")
+                        topo_widget = str(self.topology_tab)
+                        if selected != topo_widget:
+                            # 非表示タブ中は再描画を遅延してUI負荷を下げる。
+                            return
+                    except Exception:
+                        pass
                 now_ms = self._now_ms()
                 window_s = max(1, _to_int(self.topology_window_var.get(), TOPOLOGY_DEFAULT_WINDOW_SEC))
                 snapshot = self.topology_tracker.snapshot(
@@ -825,10 +1337,23 @@ class LPWAApp(tk.Tk):
                     kind_filter=str(self.topology_kind_var.get() or "all").strip().lower(),
                     include_broadcast=bool(self.topology_broadcast_var.get()),
                 )
+                self._update_topology_kind_choices(snapshot)
                 self._draw_topology_canvas(snapshot)
                 self._refresh_topology_table(snapshot)
+                self._refresh_topology_flow_table(snapshot)
+                self_label = self.local_node_id if self.local_node_id else "未取得"
+                mode = str(self.topology_view_var.get() or "tree").strip().lower() or "tree"
                 self.topology_status_var.set(
-                    f"nodes={len(snapshot.nodes)} links={len(snapshot.edges)} events={snapshot.event_count}"
+                    " ".join(
+                        [
+                            f"mode={mode}",
+                            f"self={self_label}",
+                            f"nodes={len(snapshot.nodes)}",
+                            f"flow_links={len(snapshot.edges)}",
+                            f"relay_links={len(snapshot.relay_links)}",
+                            f"events={snapshot.event_count}",
+                        ]
+                    )
                 )
                 self.topology_dirty = False
         finally:
@@ -839,11 +1364,121 @@ class LPWAApp(tk.Tk):
 
     def _short_node_id(self, node_id: str) -> str:
         if node_id == BROADCAST_NODE:
-            return "BROADCAST"
+            return "ALL"
         raw = node_id.strip()
         if len(raw) <= 10:
             return raw
         return f"{raw[:4]}..{raw[-4:]}"
+
+    def _pick_focus_node(self, snapshot: TopologySnapshot, nodes: list[str]) -> str | None:
+        focus_node = self.local_node_id if (self.local_node_id and self.local_node_id in nodes) else None
+        if focus_node:
+            return focus_node
+        activity: dict[str, int] = {}
+        for edge in snapshot.edges:
+            activity[edge.src] = activity.get(edge.src, 0) + max(1, edge.count)
+            activity[edge.dst] = activity.get(edge.dst, 0) + max(1, edge.count)
+        for link in snapshot.relay_links:
+            activity[link.parent] = activity.get(link.parent, 0) + max(1, link.count)
+            activity[link.child] = activity.get(link.child, 0) + max(1, link.count)
+        if activity:
+            return max(activity.items(), key=lambda kv: kv[1])[0]
+        if nodes:
+            return sorted(nodes, key=lambda x: x.lower())[0]
+        return None
+
+    def _compute_ring_positions(
+        self, *, nodes: list[str], width: int, height: int, focus_node: str | None
+    ) -> dict[str, tuple[float, float]]:
+        cx = width / 2.0
+        cy = height / 2.0
+        radius = max(56.0, min(width, height) * 0.34)
+        positions: dict[str, tuple[float, float]] = {}
+        if focus_node and focus_node in nodes:
+            positions[focus_node] = (cx, cy)
+        if BROADCAST_NODE in nodes:
+            positions[BROADCAST_NODE] = (cx, cy - min(height * 0.32, radius))
+        ring_nodes = [n for n in sorted(nodes, key=lambda x: x.lower()) if n not in positions]
+        for idx, node_id in enumerate(ring_nodes):
+            angle = (-math.pi / 2.0) + (2.0 * math.pi * idx / max(1, len(ring_nodes)))
+            positions[node_id] = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+        return positions
+
+    def _compute_tree_positions(
+        self,
+        *,
+        nodes: list[str],
+        snapshot: TopologySnapshot,
+        width: int,
+        height: int,
+        focus_node: str | None,
+    ) -> dict[str, tuple[float, float]]:
+        if not nodes:
+            return {}
+
+        children: dict[str, set[str]] = {}
+        indegree: dict[str, int] = {node: 0 for node in nodes}
+        for link in snapshot.relay_links:
+            parent = link.parent
+            child = link.child
+            if parent == child:
+                continue
+            if parent not in indegree:
+                indegree[parent] = 0
+            if child not in indegree:
+                indegree[child] = 0
+            bucket = children.setdefault(parent, set())
+            if child not in bucket:
+                bucket.add(child)
+                indegree[child] = indegree.get(child, 0) + 1
+
+        root = focus_node if (focus_node and focus_node in indegree) else None
+        if root is None:
+            roots = sorted([node for node, deg in indegree.items() if deg == 0], key=lambda x: x.lower())
+            if roots:
+                root = roots[0]
+            else:
+                root = sorted(nodes, key=lambda x: x.lower())[0]
+
+        levels: dict[str, int] = {root: 0}
+        queue_nodes: list[str] = [root]
+        while queue_nodes:
+            current = queue_nodes.pop(0)
+            current_level = levels.get(current, 0)
+            for child in sorted(children.get(current, set()), key=lambda x: x.lower()):
+                if child in levels:
+                    continue
+                levels[child] = current_level + 1
+                queue_nodes.append(child)
+
+        max_level = max(levels.values()) if levels else 0
+        for node in sorted(nodes, key=lambda x: x.lower()):
+            if node in levels:
+                continue
+            max_level += 1
+            levels[node] = max_level
+
+        level_to_nodes: dict[int, list[str]] = {}
+        for node, level in levels.items():
+            level_to_nodes.setdefault(level, []).append(node)
+
+        margin_x = 48.0
+        margin_top = 96.0
+        margin_bottom = 42.0
+        usable_h = max(80.0, float(height) - margin_top - margin_bottom)
+        max_depth = max(level_to_nodes.keys()) if level_to_nodes else 0
+        positions: dict[str, tuple[float, float]] = {}
+        for level in sorted(level_to_nodes.keys()):
+            row = sorted(level_to_nodes[level], key=lambda x: x.lower())
+            y = margin_top + (usable_h * (float(level) / float(max(1, max_depth))))
+            span = max(80.0, float(width) - (margin_x * 2.0))
+            for idx, node in enumerate(row):
+                x = margin_x + (span * (float(idx + 1) / float(len(row) + 1)))
+                positions[node] = (x, y)
+
+        if BROADCAST_NODE in nodes:
+            positions[BROADCAST_NODE] = (float(width) / 2.0, margin_top - 42.0)
+        return positions
 
     def _draw_topology_canvas(self, snapshot: TopologySnapshot) -> None:
         canvas = self.topology_canvas
@@ -853,7 +1488,13 @@ class LPWAApp(tk.Tk):
         if width < 20 or height < 20:
             return
 
+        mode = str(self.topology_view_var.get() or "tree").strip().lower() or "tree"
+        if mode not in TOPOLOGY_VIEW_CHOICES:
+            mode = "tree"
+
         nodes = list(snapshot.nodes)
+        if self.local_node_id and self.local_node_id not in nodes:
+            nodes.append(self.local_node_id)
         if bool(self.topology_broadcast_var.get()):
             for edge in snapshot.edges:
                 if edge.dst == BROADCAST_NODE and BROADCAST_NODE not in nodes:
@@ -868,64 +1509,176 @@ class LPWAApp(tk.Tk):
             )
             return
 
-        cx = width / 2.0
-        cy = height / 2.0
-        radius = max(40.0, min(width, height) * 0.38)
-        positions: dict[str, tuple[float, float]] = {}
-        count = len(nodes)
-        for idx, node_id in enumerate(sorted(nodes, key=lambda x: x.lower())):
-            if node_id == BROADCAST_NODE:
-                positions[node_id] = (cx, cy)
-                continue
-            angle = (2.0 * math.pi * idx) / max(1, count)
-            positions[node_id] = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+        focus_node = self._pick_focus_node(snapshot, nodes)
+        use_tree_layout = mode in {"tree", "both"} and len(snapshot.relay_links) > 0
+        if use_tree_layout:
+            positions = self._compute_tree_positions(
+                nodes=nodes,
+                snapshot=snapshot,
+                width=width,
+                height=height,
+                focus_node=focus_node,
+            )
+        else:
+            positions = self._compute_ring_positions(nodes=nodes, width=width, height=height, focus_node=focus_node)
+
+        legend_x = 10
+        legend_y = 10
+        legend_w = min(580, width - 20)
+        legend_h = 64
+        canvas.create_rectangle(
+            legend_x,
+            legend_y,
+            legend_x + legend_w,
+            legend_y + legend_h,
+            fill="#0f172a",
+            outline="#334155",
+            width=1,
+        )
+        if self.local_node_id:
+            focus_text = f"自ノード: {self.local_node_id}"
+        else:
+            focus_text = "自ノード: 未取得（接続直後はノード要求で更新）"
+        canvas.create_text(
+            legend_x + 10,
+            legend_y + 16,
+            anchor="w",
+            text=focus_text,
+            fill="#99f6e4",
+            font=("Consolas", 10, "bold"),
+        )
+        mode_text = "通信フロー(src->dst)"
+        if mode == "tree":
+            mode_text = "系統図(親->子)"
+        elif mode == "both":
+            mode_text = "系統図 + 通信フロー"
+        canvas.create_text(
+            legend_x + 10,
+            legend_y + 34,
+            anchor="w",
+            text=f"表示: {mode_text} / 線太さ: 回数 / 色: 種別",
+            fill="#cbd5e1",
+            font=("Consolas", 9),
+        )
+        kind_counts: dict[str, int] = {}
+        for edge in snapshot.edges:
+            kind_counts[edge.kind] = kind_counts.get(edge.kind, 0) + edge.count
+        top_kinds = sorted(kind_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        legend_cursor_x = legend_x + 10
+        legend_cursor_y = legend_y + 52
+        for kind, count in top_kinds:
+            palette = TOPOLOGY_EDGE_COLORS.get(kind, TOPOLOGY_EDGE_COLORS["unknown"])
+            canvas.create_rectangle(
+                legend_cursor_x,
+                legend_cursor_y - 5,
+                legend_cursor_x + 10,
+                legend_cursor_y + 5,
+                fill=palette[0],
+                outline="",
+            )
+            canvas.create_text(
+                legend_cursor_x + 14,
+                legend_cursor_y,
+                anchor="w",
+                text=f"{kind}:{count}",
+                fill="#cbd5e1",
+                font=("Consolas", 8),
+            )
+            legend_cursor_x += 86
 
         now_ms = self._now_ms()
-        for edge in snapshot.edges:
-            if edge.src not in positions or edge.dst not in positions:
-                continue
-            x1, y1 = positions[edge.src]
-            x2, y2 = positions[edge.dst]
-            width_px = min(8, max(1, 1 + edge.count // 2))
-            recent = (now_ms - edge.last_seen_ms) <= 1500
-            if edge.via == "ble":
-                color = "#16a34a" if recent else "#14532d"
-            else:
-                color = "#38bdf8" if recent else "#1d4ed8"
-            if edge.kind == "delivery_ack":
-                color = "#f59e0b" if recent else "#b45309"
-            canvas.create_line(
-                x1,
-                y1,
-                x2,
-                y2,
-                fill=color,
-                width=width_px,
-                arrow=tk.LAST,
-                smooth=True,
-            )
-            mid_x = (x1 + x2) / 2.0
-            mid_y = (y1 + y2) / 2.0
-            label = f"{edge.kind}:{edge.count}"
-            canvas.create_text(
-                mid_x,
-                mid_y - 10,
-                text=label,
-                fill="#e2e8f0",
-                font=("Consolas", 9),
-            )
+        if mode in {"tree", "both"}:
+            for link in snapshot.relay_links:
+                if link.parent not in positions or link.child not in positions:
+                    continue
+                x1, y1 = positions[link.parent]
+                x2, y2 = positions[link.child]
+                width_px = min(8, max(1, 1 + link.count // 2))
+                recent = (now_ms - link.last_seen_ms) <= 1500
+                tree_color = "#60a5fa" if recent else "#1e3a8a"
+                if mode == "both":
+                    tree_color = "#334155" if recent else "#1f2937"
+                canvas.create_line(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill=tree_color,
+                    width=width_px,
+                    arrow=tk.LAST,
+                    arrowshape=(10, 12, 4),
+                )
+                canvas.create_text(
+                    x1 + (x2 - x1) * 0.58,
+                    y1 + (y2 - y1) * 0.58 - 10,
+                    text=f"relay x{link.count}",
+                    fill="#cbd5e1",
+                    font=("Consolas", 8),
+                )
+
+        if mode in {"flow", "both"}:
+            for edge in snapshot.edges:
+                if edge.src not in positions or edge.dst not in positions:
+                    continue
+                x1, y1 = positions[edge.src]
+                x2, y2 = positions[edge.dst]
+                width_px = min(8, max(1, 1 + edge.count // 2))
+                recent = (now_ms - edge.last_seen_ms) <= 1500
+                palette = TOPOLOGY_EDGE_COLORS.get(edge.kind, TOPOLOGY_EDGE_COLORS["unknown"])
+                color = palette[0] if recent else palette[1]
+                canvas.create_line(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill=color,
+                    width=width_px,
+                    arrow=tk.LAST,
+                    arrowshape=(10, 12, 4),
+                )
+                mid_x = x1 + (x2 - x1) * 0.62
+                mid_y = y1 + (y2 - y1) * 0.62
+                canvas.create_text(
+                    mid_x,
+                    mid_y - 8,
+                    text=f"{edge.kind} x{edge.count}",
+                    fill="#e2e8f0",
+                    font=("Consolas", 9),
+                )
 
         for node_id, (x, y) in positions.items():
             is_broadcast = node_id == BROADCAST_NODE
             fill = "#334155"
             outline = "#94a3b8"
+            node_radius = 16
+            role_text = ""
             if is_broadcast:
                 fill = "#3f3f46"
                 outline = "#f59e0b"
-            elif self.local_node_id and node_id == self.local_node_id:
+                role_text = "BCAST"
+            elif focus_node and node_id == focus_node:
                 fill = "#0f766e"
                 outline = "#99f6e4"
-            canvas.create_oval(x - 16, y - 16, x + 16, y + 16, fill=fill, outline=outline, width=2)
+                node_radius = 18
+                canvas.create_oval(x - 23, y - 23, x + 23, y + 23, outline="#99f6e4", width=2)
+                role_text = "SELF" if (self.local_node_id and node_id == self.local_node_id) else ""
+            canvas.create_oval(
+                x - node_radius,
+                y - node_radius,
+                x + node_radius,
+                y + node_radius,
+                fill=fill,
+                outline=outline,
+                width=2,
+            )
+            if role_text:
+                canvas.create_text(
+                    x,
+                    y - 25,
+                    text=role_text,
+                    fill="#99f6e4",
+                    font=("Consolas", 8, "bold"),
+                )
             canvas.create_text(
                 x,
                 y + 24,
@@ -942,13 +1695,20 @@ class LPWAApp(tk.Tk):
                 rssi_label = "-"
             else:
                 rssi_label = f"{edge.rssi_avg:.1f}"
+            src_label = self._short_node_id(edge.src)
+            dst_label = self._short_node_id(edge.dst)
+            if self.local_node_id:
+                if edge.src == self.local_node_id:
+                    src_label = f"★ {src_label}"
+                if edge.dst == self.local_node_id:
+                    dst_label = f"★ {dst_label}"
             age_ms = max(0, snapshot.generated_ms - edge.last_seen_ms)
             self.topology_tree.insert(
                 "",
                 tk.END,
                 values=(
-                    edge.src,
-                    edge.dst,
+                    src_label,
+                    dst_label,
                     edge.via,
                     edge.kind,
                     edge.count,
@@ -957,6 +1717,36 @@ class LPWAApp(tk.Tk):
                     edge.retry_total,
                     rssi_label,
                     f"{age_ms}ms",
+                ),
+            )
+
+    def _refresh_topology_flow_table(self, snapshot: TopologySnapshot) -> None:
+        for item in self.topology_flow_tree.get_children():
+            self.topology_flow_tree.delete(item)
+        for ev in snapshot.flow_events[:TOPOLOGY_FLOW_EVENT_LIMIT]:
+            ts_label = datetime.fromtimestamp(ev.ts_ms / 1000.0).strftime("%H:%M:%S")
+            src_label = self._short_node_id(ev.src)
+            dst_label = self._short_node_id(ev.dst)
+            observer_label = self._short_node_id(ev.observer) if ev.observer else "-"
+            via_node_label = self._short_node_id(ev.via_node) if ev.via_node else "-"
+            if self.local_node_id:
+                if ev.src == self.local_node_id:
+                    src_label = f"★ {src_label}"
+                if ev.observer == self.local_node_id:
+                    observer_label = f"★ {observer_label}"
+            msg_label = ev.msg_id or ev.e2e_id or "-"
+            self.topology_flow_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    ts_label,
+                    ev.kind,
+                    src_label,
+                    dst_label,
+                    observer_label,
+                    via_node_label,
+                    ev.hops,
+                    self._shorten(msg_label, 24),
                 ),
             )
 
@@ -1159,6 +1949,7 @@ class LPWAApp(tk.Tk):
         self.topology_tracker.clear()
         self.topology_status_var.set("未更新")
         self.local_node_id = None
+        self.self_node_var.set("未取得")
         self._mark_topology_dirty()
 
     def disconnect_serial(self) -> None:
@@ -1256,7 +2047,7 @@ class LPWAApp(tk.Tk):
                 level = "RX"
                 if kind == "error":
                     level = "ERROR"
-                if kind != "mesh_observed":
+                if kind not in {"mesh_observed", "mesh_trace"}:
                     self.append_log(self._summarize_payload(payload), level=level, category=kind)
                 self.handle_payload(payload)
             else:
@@ -1281,14 +2072,18 @@ class LPWAApp(tk.Tk):
         if message_type == "bridge_ready":
             node_id = str(payload.get("node_id") or "").strip()
             if node_id:
+                previous = self.local_node_id
                 self.local_node_id = node_id
+                self.self_node_var.set(node_id)
+                if previous != node_id:
+                    self.topology_tracker.clear()
                 self.registry.upsert_from_payload({"node_id": node_id, "last_seen_ms": self._now_ms()})
                 self.refresh_node_table()
                 self._mark_topology_dirty()
                 self.append_log(f"bridge_ready: local node={node_id}", level="SYSTEM", category="COM")
             return
 
-        if message_type == "mesh_observed":
+        if message_type in {"mesh_observed", "mesh_trace"}:
             # トポロジ表示向けの観測イベント。チャット表示などには流さない。
             return
 
@@ -1296,6 +2091,14 @@ class LPWAApp(tk.Tk):
             nodes = payload.get("nodes") or payload.get("items")
             if isinstance(nodes, list):
                 self.registry.update_from_list(nodes)
+                self.topology_tracker.update_node_records(nodes)
+                if not self.local_node_id:
+                    inferred = self._infer_local_node_id_from_entries(nodes)
+                    if inferred:
+                        self.local_node_id = inferred
+                        self.self_node_var.set(f"{inferred} (推定)")
+                        self._mark_topology_dirty()
+                        self.append_log(f"自ノードを node_list から推定: {inferred}", level="SYSTEM", category="TOPO")
                 self.refresh_node_table()
             return
 

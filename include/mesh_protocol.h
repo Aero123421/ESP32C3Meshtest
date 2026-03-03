@@ -65,11 +65,12 @@ struct NodeInfoPayload {
   uint32_t rxFrames;
   uint32_t txFrames;
   uint16_t seenNodes;
+  uint8_t staMac[6];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(MeshFrameHeader) == 14, "MeshFrameHeader size mismatch");
 static_assert(sizeof(FragmentMeta) == 8, "FragmentMeta size mismatch");
-static_assert(sizeof(NodeInfoPayload) == 22, "NodeInfoPayload size mismatch");
+static_assert(sizeof(NodeInfoPayload) == 28, "NodeInfoPayload size mismatch");
 
 }  // namespace lpwa

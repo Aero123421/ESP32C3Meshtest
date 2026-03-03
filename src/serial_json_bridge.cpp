@@ -10,6 +10,7 @@
 namespace lpwa {
 
 namespace {
+constexpr uint8_t kTraceTelemetryTtl = kDefaultTtl;
 
 bool isBroadcastTarget(const char* dst) {
   if (dst == nullptr || dst[0] == '\0') {
@@ -418,6 +419,9 @@ void SerialJsonBridge::handleLine(const char* line) {
         node["node_id"] = formatNodeId(records[i].nodeId);
         node["last_seen_ms"] = records[i].lastSeenMs;
         node["rssi"] = records[i].lastRssi;
+        if (records[i].hasMac) {
+          node["mac"] = formatMac(records[i].staMac);
+        }
         node["uptime_sec"] = records[i].uptimeSec;
         node["free_heap"] = records[i].freeHeap;
         node["remote_rx_frames"] = records[i].remoteRxFrames;
@@ -486,6 +490,10 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
   const String selfNodeId = (mesh_ != nullptr) ? formatNodeId(mesh_->nodeId()) : String("0x00000000");
   const int rxRssi = static_cast<int>(message.rssi);
   const String viaMac = message.hasSenderMac ? formatMac(message.senderMac) : String("");
+  uint32_t viaNodeIdRaw = 0;
+  const bool hasViaNode = message.hasSenderMac && (mesh_ != nullptr) &&
+                          mesh_->resolveNodeIdByMac(message.senderMac, &viaNodeIdRaw);
+  const String viaNodeId = hasViaNode ? formatNodeId(viaNodeIdRaw) : String("");
 
   if (message.payloadType == AppPayloadType::Text) {
     String text;
@@ -545,8 +553,45 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         mesh_->sendText(response.c_str(), appDoc["ttl"] | kDefaultTtl, nullptr);
       };
 
+      const auto emitTraceTelemetry = [&]() {
+        if (mesh_ == nullptr || appType[0] == '\0' || std::strcmp(appType, "trace_obs") == 0) {
+          return;
+        }
+        if (std::strcmp(appType, "image_chunk") == 0 || std::strcmp(appType, "long_text_chunk") == 0) {
+          // 高頻度チャンクはトレース配信を抑制し、テレメトリ過負荷を避ける。
+          return;
+        }
+        StaticJsonDocument<512> trace;
+        trace["app"] = "lpwa";
+        trace["type"] = "trace_obs";
+        trace["observer"] = selfNodeId;
+        trace["app_type"] = appType;
+        trace["src"] = appDoc["src"] | formatNodeId(message.originId);
+        trace["dst"] = (dst[0] == '\0') ? "*" : dst;
+        trace["msg_id"] = message.messageId;
+        trace["hops"] = message.hops;
+        trace["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          trace["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          trace["via_node"] = viaNodeId;
+        }
+        if (appDoc.containsKey("e2e_id")) {
+          trace["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          trace["retry_no"] = appDoc["retry_no"] | 0;
+        }
+        String wire;
+        serializeJson(trace, wire);
+        if (wire.length() <= kMaxAppPayload) {
+          mesh_->sendText(wire.c_str(), kTraceTelemetryTtl, nullptr);
+        }
+      };
+
       const auto emitObserved = [&]() {
-        if (appType[0] == '\0') {
+        if (appType[0] == '\0' || std::strcmp(appType, "trace_obs") == 0) {
           return;
         }
         StaticJsonDocument<640> observed;
@@ -554,6 +599,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         observed["type"] = "mesh_observed";
         observed["app_type"] = appType;
         observed["via"] = "wifi";
+        observed["observer"] = selfNodeId;
         observed["src"] = appDoc["src"] | formatNodeId(message.originId);
         observed["dst"] = (dst[0] == '\0') ? "*" : dst;
         observed["msg_id"] = message.messageId;
@@ -561,6 +607,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         observed["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           observed["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          observed["via_node"] = viaNodeId;
         }
         if (appDoc.containsKey("e2e_id")) {
           observed["e2e_id"] = appDoc["e2e_id"] | "";
@@ -583,7 +632,42 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         }
         serializeJson(observed, *serial_);
         serial_->println();
+        emitTraceTelemetry();
       };
+
+      if (std::strcmp(appType, "trace_obs") == 0) {
+        StaticJsonDocument<768> traceOut;
+        traceOut["event"] = "mesh_trace";
+        traceOut["type"] = "mesh_trace";
+        traceOut["via"] = "wifi";
+        traceOut["observer"] = appDoc["observer"] | (appDoc["src"] | formatNodeId(message.originId));
+        traceOut["app_type"] = appDoc["app_type"] | "";
+        traceOut["src"] = appDoc["src"] | formatNodeId(message.originId);
+        traceOut["dst"] = appDoc["dst"] | "*";
+        traceOut["msg_id"] = appDoc["msg_id"] | 0;
+        traceOut["hops"] = appDoc["hops"] | 0;
+        traceOut["rssi"] = appDoc["rssi"] | 0;
+        traceOut["trace_msg_id"] = message.messageId;
+        if (!viaMac.isEmpty()) {
+          traceOut["relay_mac"] = viaMac;
+        }
+        if (appDoc.containsKey("via_mac")) {
+          traceOut["via_mac"] = appDoc["via_mac"] | "";
+        }
+        if (appDoc.containsKey("via_node")) {
+          traceOut["via_node"] = appDoc["via_node"] | "";
+        }
+        if (appDoc.containsKey("e2e_id")) {
+          traceOut["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          traceOut["retry_no"] = appDoc["retry_no"] | 0;
+        }
+        serializeJson(traceOut, *serial_);
+        serial_->println();
+        return;
+      }
+
       emitObserved();
 
       if (std::strcmp(appType, "delivery_ack") == 0) {
@@ -605,6 +689,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
         }
         if (appDoc.containsKey("image_id")) {
           out["image_id"] = appDoc["image_id"] | "";
@@ -667,6 +754,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
         }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
+        }
         serializeJson(out, *serial_);
         serial_->println();
         return;
@@ -688,6 +778,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
         }
         if (appDoc.containsKey("e2e_id")) {
           out["e2e_id"] = appDoc["e2e_id"] | "";
@@ -724,6 +817,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
         }
         String textId = appDoc["text_id"] | "";
         if (textId.isEmpty()) {
@@ -827,6 +923,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
         }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
+        }
         out["image_id"] = appDoc["image_id"] | "";
         if (appDoc.containsKey("e2e_id")) {
           out["e2e_id"] = appDoc["e2e_id"] | "";
@@ -862,6 +961,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
     if (!viaMac.isEmpty()) {
       out["via_mac"] = viaMac;
     }
+    if (!viaNodeId.isEmpty()) {
+      out["via_node"] = viaNodeId;
+    }
     serializeJson(out, *serial_);
     serial_->println();
     return;
@@ -877,6 +979,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
   doc["rssi"] = rxRssi;
   if (!viaMac.isEmpty()) {
     doc["via_mac"] = viaMac;
+  }
+  if (!viaNodeId.isEmpty()) {
+    doc["via_node"] = viaNodeId;
   }
   doc["data_b64"] = encodeBase64(message.data, message.length);
   serializeJson(doc, *serial_);
