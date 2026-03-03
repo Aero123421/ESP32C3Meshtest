@@ -25,6 +25,8 @@ class SerialJsonBridge {
     uint32_t commandErrors = 0;
     uint32_t sentText = 0;
     uint32_t sentBinary = 0;
+    uint32_t sentReliable = 0;
+    uint32_t rxReliable = 0;
   };
 
   void handleLine(const char* line);
@@ -45,6 +47,7 @@ class SerialJsonBridge {
 
   char lineBuffer_[kLineBufferSize]{};
   size_t lineLength_ = 0;
+  bool droppingInputLine_ = false;
   BridgeStats bridgeStats_{};
   uint32_t lastTraceTelemetryMs_ = 0;
 };

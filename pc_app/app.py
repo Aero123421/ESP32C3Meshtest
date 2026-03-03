@@ -21,14 +21,21 @@ from tkinter.scrolledtext import ScrolledText
 
 from lpwa_gui.models import NodeInfo, NodeRegistry
 from lpwa_gui.protocol import (
+    RELIABLE_1K_BYTES,
+    decode_reliable_1k_from_shards,
     make_chat_message,
     make_image_messages,
     make_long_text_messages,
     make_nodes_request,
-    make_ping_message,
+    make_ping_probe_command,
+    make_reliable_1k_messages,
+    make_reliable_1k_nack_message,
+    make_reliable_1k_repair_message,
+    make_routes_request,
+    missing_reliable_shards,
 )
 from lpwa_gui.serial_worker import SerialWorker, list_serial_ports
-from lpwa_gui.stats import PingStats
+from lpwa_gui.stats import PingStats, ReliableStats
 from lpwa_gui.topology import BROADCAST_NODE, TopologySnapshot, TopologyTracker
 
 
@@ -68,6 +75,11 @@ MAX_WORKER_EVENTS_PER_TICK = 120
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
 PING_PENDING_MAX_AGE_MS = 20000
 PING_BROADCAST_RESPONSE_WINDOW_MS = 2600
+PING_PROBE_BYTES = 1000
+RELIABLE_MODE_CHOICES = ("normal", "reliable_1k")
+RELIABLE_PROFILE_CHOICES = ("auto", "25+8", "25+10")
+RELIABLE_PROFILE_NAME_TO_ID = {"25+8": 0, "25+10": 1}
+RELIABLE_PROFILE_ID_TO_NAME = {value: key for key, value in RELIABLE_PROFILE_NAME_TO_ID.items()}
 TOPOLOGY_VIEW_CHOICES = ("tree", "flow", "both")
 TOPOLOGY_KIND_CHOICES = (
     "all",
@@ -81,6 +93,12 @@ TOPOLOGY_KIND_CHOICES = (
     "image_start",
     "image_chunk",
     "image_end",
+    "reliable_1k_start",
+    "reliable_1k_chunk",
+    "reliable_1k_end",
+    "reliable_1k_nack",
+    "reliable_1k_repair",
+    "reliable_1k_result",
     "binary",
     "unknown",
 )
@@ -99,6 +117,18 @@ TOPOLOGY_TRACK_MESSAGE_TYPES = {
     "image_start",
     "image_chunk",
     "image_end",
+    "reliable_1k_start",
+    "reliable_1k_chunk",
+    "reliable_1k_end",
+    "reliable_1k_nack",
+    "reliable_1k_repair",
+    "reliable_1k_result",
+    "r1k_s",
+    "r1k_d",
+    "r1k_e",
+    "r1k_n",
+    "r1k_r",
+    "r1k_o",
     "binary",
 }
 TOPOLOGY_EDGE_COLORS: dict[str, tuple[str, str]] = {
@@ -112,6 +142,12 @@ TOPOLOGY_EDGE_COLORS: dict[str, tuple[str, str]] = {
     "image_start": ("#c084fc", "#6b21a8"),
     "image_chunk": ("#a78bfa", "#5b21b6"),
     "image_end": ("#8b5cf6", "#581c87"),
+    "reliable_1k_start": ("#f97316", "#9a3412"),
+    "reliable_1k_chunk": ("#fb7185", "#9f1239"),
+    "reliable_1k_end": ("#f43f5e", "#881337"),
+    "reliable_1k_nack": ("#facc15", "#a16207"),
+    "reliable_1k_repair": ("#eab308", "#854d0e"),
+    "reliable_1k_result": ("#34d399", "#047857"),
     "binary": ("#94a3b8", "#334155"),
     "unknown": ("#94a3b8", "#475569"),
 }
@@ -129,6 +165,7 @@ class LPWAApp(tk.Tk):
         self.incoming_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.registry = NodeRegistry()
         self.ping_stats = PingStats()
+        self.reliable_stats = ReliableStats()
         self.ping_seq = 0
         self.pending_ping_rounds: dict[int, dict[str, Any]] = {}
         self.pending_e2e: dict[str, dict[str, Any]] = {}
@@ -140,6 +177,15 @@ class LPWAApp(tk.Tk):
         self.max_log_lines = 3000
         self.image_rx_sessions: dict[str, dict[str, Any]] = {}
         self.long_text_rx_sessions: dict[str, dict[str, Any]] = {}
+        self.reliable_tx_sessions: dict[str, dict[str, Any]] = {}
+        self.reliable_rx_sessions: dict[str, dict[str, Any]] = {}
+        self.reliable_profile_pref_by_dst: dict[str, int] = {}
+        self.reliable_auto_state_by_dst: dict[str, dict[str, Any]] = {}
+        self.reliable_result_deadline_ms = 15000
+        self.reliable_rx_session_timeout_ms = 30000
+        self.reliable_auto_up_retry_rate_pct = 20.0
+        self.reliable_auto_down_retry_rate_pct = 5.0
+        self.reliable_auto_down_success_streak = 3
         self.flash_busy = False
         self.flash_thread: threading.Thread | None = None
         self.project_root = Path(__file__).resolve().parents[1]
@@ -159,6 +205,9 @@ class LPWAApp(tk.Tk):
         self.image_target_var = tk.StringVar(value=BROADCAST_LABEL)
         self.image_path_var = tk.StringVar()
         self.ping_target_var = tk.StringVar(value=BROADCAST_LABEL)
+        self.reliable_mode_var = tk.StringVar(value="normal")
+        self.reliable_profile_var = tk.StringVar(value="auto")
+        self.reliable_auto_var = tk.BooleanVar(value=True)
         self.selected_node_var = tk.StringVar(value="未選択")
         self.interval_var = tk.StringVar(value="1000")
         self.count_var = tk.StringVar(value="0")
@@ -170,6 +219,7 @@ class LPWAApp(tk.Tk):
         self.topology_view_var = tk.StringVar(value="tree")
         self.topology_status_var = tk.StringVar(value="未更新")
         self.topology_broadcast_var = tk.BooleanVar(value=False)
+        self.latest_routes: list[dict[str, Any]] = []
 
         self.sent_var = tk.StringVar(value="0")
         self.received_var = tk.StringVar(value="0")
@@ -179,6 +229,10 @@ class LPWAApp(tk.Tk):
         self.min_var = tk.StringVar(value="0.0 ms")
         self.max_var = tk.StringVar(value="0.0 ms")
         self.p95_var = tk.StringVar(value="0.0 ms")
+        self.reliable_restore_var = tk.StringVar(value="0.0%")
+        self.reliable_retry_rate_var = tk.StringVar(value="0.0%")
+        self.reliable_profile_used_var = tk.StringVar(value="n/a")
+        self.reliable_fail_var = tk.StringVar(value="none")
         self.quality_graph_status_var = tk.StringVar(value="品質グラフ: 待機中")
         self.quality_points: deque[dict[str, float | int]] = deque(maxlen=QUALITY_GRAPH_MAX_POINTS)
         self._quality_last_draw_ms = 0
@@ -503,7 +557,7 @@ class LPWAApp(tk.Tk):
     def _build_top_bar_tabbed(self) -> None:
         top = ttk.LabelFrame(self, text="接続")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        top.columnconfigure(12, weight=1)
+        top.columnconfigure(13, weight=1)
 
         ttk.Label(top, text="ポート").grid(row=0, column=0, padx=4, pady=4, sticky="w")
         self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=16, state="readonly")
@@ -516,16 +570,17 @@ class LPWAApp(tk.Tk):
         self.connect_button = ttk.Button(top, text="接続", command=self.toggle_connection)
         self.connect_button.grid(row=0, column=5, padx=4, pady=4)
         ttk.Button(top, text="ノード要求", command=self.request_nodes).grid(row=0, column=6, padx=4, pady=4)
+        ttk.Button(top, text="経路要求", command=self.request_routes).grid(row=0, column=7, padx=4, pady=4)
 
-        ttk.Label(top, text="状態").grid(row=0, column=7, padx=4, pady=4, sticky="e")
-        ttk.Label(top, textvariable=self.connection_var).grid(row=0, column=8, padx=4, pady=4, sticky="w")
-        ttk.Label(top, text="自ノード").grid(row=0, column=9, padx=(16, 4), pady=4, sticky="e")
-        ttk.Label(top, textvariable=self.self_node_var).grid(row=0, column=10, padx=4, pady=4, sticky="w")
+        ttk.Label(top, text="状態").grid(row=0, column=8, padx=4, pady=4, sticky="e")
+        ttk.Label(top, textvariable=self.connection_var).grid(row=0, column=9, padx=4, pady=4, sticky="w")
+        ttk.Label(top, text="自ノード").grid(row=0, column=10, padx=(16, 4), pady=4, sticky="e")
+        ttk.Label(top, textvariable=self.self_node_var).grid(row=0, column=11, padx=4, pady=4, sticky="w")
         ttk.Button(top, text="選択ノード→宛先", command=self.apply_selected_node_to_targets).grid(
-            row=0, column=11, padx=4, pady=4
+            row=0, column=12, padx=4, pady=4
         )
         ttk.Button(top, text="宛先を全体送信", command=self.set_broadcast_targets).grid(
-            row=0, column=12, padx=4, pady=4
+            row=0, column=13, padx=4, pady=4
         )
 
     def _build_comm_tab(self, parent: ttk.Frame) -> None:
@@ -621,11 +676,12 @@ class LPWAApp(tk.Tk):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
         parent.rowconfigure(2, weight=1)
-        parent.rowconfigure(3, weight=2)
+        parent.rowconfigure(3, weight=1)
+        parent.rowconfigure(4, weight=2)
 
         help_line = ttk.Label(
             parent,
-            text="長距離試験は TTL を 10〜12 目安で設定し、宛先指定で Ping と delivery_ack を確認してください。",
+            text="長距離試験は TTL を 10〜12 目安で設定し、宛先指定で 1KB Ping Probe と delivery_ack を確認してください。",
             foreground="#4b5563",
         )
         help_line.grid(row=0, column=0, sticky="w", pady=(0, 6))
@@ -636,7 +692,7 @@ class LPWAApp(tk.Tk):
         ttk.Label(ping_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
         self.ping_target_combo = ttk.Combobox(ping_frame, textvariable=self.ping_target_var, state="readonly")
         self.ping_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Button(ping_frame, text="Ping送信", command=self.send_ping).grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(ping_frame, text="Ping送信(1KB)", command=self.send_ping).grid(row=0, column=2, padx=4, pady=4)
 
         ttk.Label(ping_frame, text="間隔(ms)").grid(row=1, column=0, padx=4, pady=4, sticky="w")
         ttk.Entry(ping_frame, textvariable=self.interval_var, width=12).grid(row=1, column=1, padx=4, pady=4, sticky="w")
@@ -652,8 +708,53 @@ class LPWAApp(tk.Tk):
             row=3, column=2, padx=4, pady=4, sticky="w"
         )
 
+        reliable_frame = ttk.LabelFrame(parent, text="Reliable 1KB")
+        reliable_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
+        reliable_frame.columnconfigure(1, weight=1)
+        reliable_frame.columnconfigure(3, weight=1)
+        ttk.Label(reliable_frame, text="モード").grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        ttk.Combobox(
+            reliable_frame,
+            textvariable=self.reliable_mode_var,
+            values=RELIABLE_MODE_CHOICES,
+            width=14,
+            state="readonly",
+        ).grid(row=0, column=1, padx=6, pady=4, sticky="w")
+        ttk.Label(reliable_frame, text="Profile").grid(row=0, column=2, padx=6, pady=4, sticky="w")
+        ttk.Combobox(
+            reliable_frame,
+            textvariable=self.reliable_profile_var,
+            values=RELIABLE_PROFILE_CHOICES,
+            width=10,
+            state="readonly",
+        ).grid(row=0, column=3, padx=6, pady=4, sticky="w")
+        ttk.Checkbutton(
+            reliable_frame,
+            text="Auto最適化",
+            variable=self.reliable_auto_var,
+        ).grid(row=0, column=4, padx=6, pady=4, sticky="w")
+        ttk.Button(reliable_frame, text="Reliable送信(1KB)", command=self.send_reliable_1k).grid(
+            row=0, column=5, padx=6, pady=4, sticky="e"
+        )
+        ttk.Label(reliable_frame, text="restore").grid(row=1, column=0, padx=6, pady=(2, 6), sticky="w")
+        ttk.Label(reliable_frame, textvariable=self.reliable_restore_var).grid(
+            row=1, column=1, padx=6, pady=(2, 6), sticky="w"
+        )
+        ttk.Label(reliable_frame, text="retry_rate").grid(row=1, column=2, padx=6, pady=(2, 6), sticky="w")
+        ttk.Label(reliable_frame, textvariable=self.reliable_retry_rate_var).grid(
+            row=1, column=3, padx=6, pady=(2, 6), sticky="w"
+        )
+        ttk.Label(reliable_frame, text="profile").grid(row=1, column=4, padx=6, pady=(2, 6), sticky="w")
+        ttk.Label(reliable_frame, textvariable=self.reliable_profile_used_var).grid(
+            row=1, column=5, padx=6, pady=(2, 6), sticky="w"
+        )
+        ttk.Label(reliable_frame, text="top_fail").grid(row=2, column=0, padx=6, pady=(0, 6), sticky="w")
+        ttk.Label(reliable_frame, textvariable=self.reliable_fail_var).grid(
+            row=2, column=1, columnspan=5, padx=6, pady=(0, 6), sticky="w"
+        )
+
         stats_frame = ttk.LabelFrame(parent, text="PDR / 遅延統計")
-        stats_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
+        stats_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
         for idx in range(4):
             stats_frame.columnconfigure(idx, weight=1)
         ttk.Label(stats_frame, text="Sent").grid(row=0, column=0, padx=6, pady=6, sticky="w")
@@ -677,7 +778,7 @@ class LPWAApp(tk.Tk):
         )
 
         quality_frame = ttk.LabelFrame(parent, text="通信品質（リアルタイム）")
-        quality_frame.grid(row=3, column=0, sticky="nsew")
+        quality_frame.grid(row=4, column=0, sticky="nsew")
         quality_frame.columnconfigure(0, weight=1)
         quality_frame.rowconfigure(1, weight=1)
 
@@ -944,6 +1045,100 @@ class LPWAApp(tk.Tk):
     def _is_reliable_target(self, *, via: str, dst: str | None) -> bool:
         return via == "wifi" and dst is not None
 
+    def _parse_reliable_profile_choice(self, raw_choice: str) -> int:
+        choice = (raw_choice or "").strip().lower()
+        if choice == "1":
+            return 1
+        return int(RELIABLE_PROFILE_NAME_TO_ID.get(choice, 0))
+
+    def _resolve_reliable_profile_for_send(self, dst: str) -> int:
+        selected = (self.reliable_profile_var.get() or "").strip().lower()
+        if not self.reliable_auto_var.get():
+            return self._parse_reliable_profile_choice(selected)
+        if selected == "auto":
+            return int(self.reliable_profile_pref_by_dst.get(dst, 0))
+        return self._parse_reliable_profile_choice(selected)
+
+    def _reliable_payload_text(self, r1k_id: str, dst: str) -> str:
+        header = f"R1K-{r1k_id}-{dst}-"
+        pattern = "0123456789abcdef"
+        base = (header + pattern) * ((RELIABLE_1K_BYTES // (len(header) + len(pattern))) + 4)
+        return base[:RELIABLE_1K_BYTES]
+
+    def _apply_reliable_adaptation(
+        self,
+        *,
+        dst: str,
+        success: bool,
+        nack_count: int,
+        retry_packets: int,
+        total_packets: int,
+    ) -> None:
+        if not self.reliable_auto_var.get():
+            return
+        if not dst:
+            return
+        state = self.reliable_auto_state_by_dst.setdefault(dst, {"success_streak": 0})
+        current = int(self.reliable_profile_pref_by_dst.get(dst, 0))
+        retry_rate = (float(retry_packets) / float(max(1, total_packets))) * 100.0
+        should_upgrade = (not success) or nack_count >= 2 or retry_rate >= self.reliable_auto_up_retry_rate_pct
+        if should_upgrade:
+            state["success_streak"] = 0
+            if current < 1:
+                self.reliable_profile_pref_by_dst[dst] = 1
+                self.append_log(
+                    f"reliable adaptive: dst={dst} profile 25+8 -> 25+10 (success={success} nacks={nack_count} retry={retry_rate:.1f}%)",
+                    level="SYSTEM",
+                    category="R1K",
+                )
+            return
+
+        if retry_rate <= self.reliable_auto_down_retry_rate_pct:
+            state["success_streak"] = int(state.get("success_streak") or 0) + 1
+        else:
+            state["success_streak"] = 0
+        if current > 0 and int(state.get("success_streak") or 0) >= self.reliable_auto_down_success_streak:
+            self.reliable_profile_pref_by_dst[dst] = 0
+            state["success_streak"] = 0
+            self.append_log(
+                f"reliable adaptive: dst={dst} profile 25+10 -> 25+8 (retry={retry_rate:.1f}%)",
+                level="SYSTEM",
+                category="R1K",
+            )
+
+    def _send_reliable_result(
+        self,
+        *,
+        dst: str,
+        r1k_id: str,
+        status: str,
+        recovered: int = 0,
+        missing: list[int] | None = None,
+        latency_ms: int | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": "reliable_1k_result",
+            "src": "pc",
+            "via": "wifi",
+            "dst": dst,
+            "r1k_id": r1k_id,
+            "status": status,
+            "recovered": max(0, int(recovered)),
+            "need_ack": True,
+            "e2e_id": f"{r1k_id}:o:{uuid.uuid4().hex[:6]}",
+            "ts_ms": self._now_ms(),
+        }
+        ttl = self._current_ttl()
+        if ttl > 0:
+            payload["ttl"] = ttl
+        if missing:
+            payload["missing"] = [int(v) for v in missing if int(v) >= 0]
+        if latency_ms is not None:
+            payload["latency_ms"] = max(0, int(latency_ms))
+        if not self.send_json(payload):
+            return
+        self._register_pending_e2e(payload)
+
     def _remember_rx_e2e(self, src: str, e2e_id: str) -> bool:
         if not src or not e2e_id:
             return False
@@ -1002,6 +1197,7 @@ class LPWAApp(tk.Tk):
             return
 
         now = self._now_ms()
+        stats_dirty = False
         for e2e_id, entry in list(self.pending_e2e.items()):
             last_send_ms = int(entry.get("last_send_ms") or 0)
             if (now - last_send_ms) < E2E_ACK_TIMEOUT_MS:
@@ -1038,11 +1234,24 @@ class LPWAApp(tk.Tk):
             entry["payload"] = payload
             entry["attempt"] = attempt
             entry["last_send_ms"] = now
+            payload_type = str(payload.get("type") or entry.get("type") or "").strip().lower()
+            if payload_type.startswith("reliable_1k"):
+                self.reliable_stats.register_retry(1)
+                r1k_id = str(payload.get("r1k_id") or "").strip().lower()
+                if r1k_id:
+                    tx = self.reliable_tx_sessions.get(r1k_id)
+                    if tx is not None:
+                        tx["retry_packets"] = int(tx.get("retry_packets") or 0) + 1
+                        tx["last_update_ms"] = now
+                        tx["result_deadline_ms"] = now + self.reliable_result_deadline_ms
+                stats_dirty = True
             self.append_log(
                 f"delivery retry#{attempt}: type={entry.get('type')} dst={entry.get('dst')} e2e_id={e2e_id}",
                 level="WARN",
                 category="E2E",
             )
+        if stats_dirty:
+            self.update_stats_view()
 
     def _prune_stale_pending_pings(self) -> None:
         if not self.pending_ping_rounds:
@@ -1080,6 +1289,8 @@ class LPWAApp(tk.Tk):
     def _prune_rx_sessions(self) -> None:
         now = self._now_ms()
         cutoff = now - RX_SESSION_TIMEOUT_MS
+        reliable_cutoff = now - self.reliable_rx_session_timeout_ms
+        reliable_stats_dirty = False
 
         expired_images = [
             image_id
@@ -1106,6 +1317,54 @@ class LPWAApp(tk.Tk):
                 level="WARN",
                 category="LONGTXT",
             )
+
+        expired_reliable_rx = [
+            r1k_id
+            for r1k_id, session in self.reliable_rx_sessions.items()
+            if int(session.get("last_update_ms") or session.get("started_ms") or 0) < reliable_cutoff
+        ]
+        for r1k_id in expired_reliable_rx:
+            self.reliable_rx_sessions.pop(r1k_id, None)
+            self.reliable_stats.register_failure("rx_timeout")
+            reliable_stats_dirty = True
+            self.append_log(
+                f"reliable session expired: id={r1k_id}",
+                level="WARN",
+                category="R1K",
+            )
+
+        expired_reliable_tx = [
+            r1k_id
+            for r1k_id, session in self.reliable_tx_sessions.items()
+            if int(session.get("result_deadline_ms") or 0) > 0
+            and int(session.get("result_deadline_ms") or 0) < now
+        ]
+        for r1k_id in expired_reliable_tx:
+            session = self.reliable_tx_sessions.pop(r1k_id, None)
+            if session is None:
+                continue
+            self.reliable_stats.register_failure("result_timeout")
+            retry_packets = int(session.get("retry_packets") or 0) + int(session.get("repair_packets") or 0)
+            total_packets = int(session.get("packet_count") or 0) + int(session.get("repair_packets") or 0)
+            self._apply_reliable_adaptation(
+                dst=str(session.get("dst") or ""),
+                success=False,
+                nack_count=int(session.get("nack_count") or 0),
+                retry_packets=retry_packets,
+                total_packets=total_packets,
+            )
+            reliable_stats_dirty = True
+            self.append_log(
+                (
+                    f"reliable result timeout: id={r1k_id} dst={session.get('dst')} "
+                    f"elapsed={max(0, now - int(session.get('start_ms') or now))}ms"
+                ),
+                level="WARN",
+                category="R1K",
+            )
+
+        if reliable_stats_dirty:
+            self.update_stats_view()
 
     def _ensure_session_capacity(self, sessions: dict[str, dict[str, Any]], kind: str, incoming_id: str) -> None:
         if incoming_id in sessions or len(sessions) < MAX_RX_SESSIONS:
@@ -1195,6 +1454,10 @@ class LPWAApp(tk.Tk):
             nodes = payload.get("nodes") or payload.get("items") or []
             count = len(nodes) if isinstance(nodes, list) else 0
             return f"node_list count={count}"
+        if kind in {"routes", "route_list"}:
+            routes = payload.get("routes") or payload.get("items") or []
+            count = len(routes) if isinstance(routes, list) else 0
+            return f"route_list count={count}"
         if kind == "mesh_observed":
             return (
                 f"mesh_observed app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
@@ -1219,7 +1482,8 @@ class LPWAApp(tk.Tk):
         if kind == "ping":
             return (
                 f"ping seq={payload.get('seq')} ping_id={payload.get('ping_id')} "
-                f"dst={payload.get('dst') or BROADCAST_LABEL} ttl={payload.get('ttl')}"
+                f"dst={payload.get('dst') or BROADCAST_LABEL} ttl={payload.get('ttl')} "
+                f"probe={payload.get('probe_bytes', '-')}B"
             )
         if kind == "pong":
             return f"pong seq={payload.get('seq')} src={payload.get('src')} latency={payload.get('latency_ms')}ms"
@@ -1270,6 +1534,45 @@ class LPWAApp(tk.Tk):
             return (
                 f"long_text_end id={payload.get('text_id')} "
                 f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "reliable_1k_start":
+            return (
+                f"reliable_1k_start id={payload.get('r1k_id')} dst={payload.get('dst') or BROADCAST_LABEL} "
+                f"profile={payload.get('profile_id')}({payload.get('profile_name')}) size={payload.get('size')} "
+                f"shards={payload.get('data_shards')}+{payload.get('parity_shards')} e2e_id={payload.get('e2e_id')}"
+            )
+        if kind == "reliable_1k_chunk":
+            data_b64 = payload.get("data_b64")
+            chunk_len = len(data_b64) if isinstance(data_b64, str) else 0
+            return (
+                f"reliable_1k_chunk id={payload.get('r1k_id')} idx={payload.get('index')} b64={chunk_len} "
+                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "reliable_1k_end":
+            return (
+                f"reliable_1k_end id={payload.get('r1k_id')} size={payload.get('size')} "
+                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "reliable_1k_nack":
+            missing = payload.get("missing")
+            miss_count = len(missing) if isinstance(missing, list) else 0
+            return (
+                f"reliable_1k_nack id={payload.get('r1k_id')} src={payload.get('src')} "
+                f"missing={miss_count} e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "reliable_1k_repair":
+            data_b64 = payload.get("data_b64")
+            chunk_len = len(data_b64) if isinstance(data_b64, str) else 0
+            return (
+                f"reliable_1k_repair id={payload.get('r1k_id')} idx={payload.get('index')} b64={chunk_len} "
+                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
+            )
+        if kind == "reliable_1k_result":
+            missing = payload.get("missing")
+            miss_count = len(missing) if isinstance(missing, list) else 0
+            return (
+                f"reliable_1k_result id={payload.get('r1k_id')} status={payload.get('status')} "
+                f"recovered={payload.get('recovered')} missing={miss_count} latency={payload.get('latency_ms')}"
             )
         if kind == "binary":
             data_b64 = payload.get("data_b64")
@@ -1994,6 +2297,10 @@ class LPWAApp(tk.Tk):
         self.long_text_seen.clear()
         self.image_rx_sessions.clear()
         self.long_text_rx_sessions.clear()
+        self.reliable_tx_sessions.clear()
+        self.reliable_rx_sessions.clear()
+        self.reliable_auto_state_by_dst.clear()
+        self.latest_routes.clear()
         self.topology_tracker.clear()
         self.topology_status_var.set("未更新")
         self.local_node_id = None
@@ -2150,11 +2457,26 @@ class LPWAApp(tk.Tk):
                 self.refresh_node_table()
             return
 
+        if message_type in {"route_list", "routes"}:
+            routes = payload.get("routes") or payload.get("items")
+            if isinstance(routes, list):
+                self.latest_routes = [r for r in routes if isinstance(r, dict)]
+            else:
+                self.latest_routes = []
+            self.topology_status_var.set(f"経路情報: {len(self.latest_routes)}")
+            return
+
         skip_node_refresh = message_type in {
             "long_text_chunk",
             "long_text_end",
             "image_chunk",
             "image_end",
+            "reliable_1k_start",
+            "reliable_1k_chunk",
+            "reliable_1k_repair",
+            "reliable_1k_end",
+            "reliable_1k_nack",
+            "reliable_1k_result",
             "delivery_ack",
             "ack",
             "mesh_observed",
@@ -2189,6 +2511,17 @@ class LPWAApp(tk.Tk):
 
         if message_type in {"long_text_start", "long_text_chunk", "long_text_end"}:
             self.handle_long_text_payload(payload)
+            return
+
+        if message_type in {
+            "reliable_1k_start",
+            "reliable_1k_chunk",
+            "reliable_1k_end",
+            "reliable_1k_nack",
+            "reliable_1k_repair",
+            "reliable_1k_result",
+        }:
+            self.handle_reliable_payload(payload)
             return
 
         if message_type == "delivery_ack":
@@ -2461,6 +2794,294 @@ class LPWAApp(tk.Tk):
                         level="WARN",
                         category="LONGTXT",
                     )
+            return
+
+    def handle_reliable_payload(self, payload: dict[str, Any]) -> None:
+        kind = str(payload.get("type") or "").strip().lower()
+        r1k_id = str(payload.get("r1k_id") or "").strip().lower()
+        if not r1k_id:
+            return
+        now = self._now_ms()
+
+        def ensure_rx_session(*, reason: str) -> dict[str, Any]:
+            session = self.reliable_rx_sessions.get(r1k_id)
+            if session is not None:
+                return session
+            self._ensure_session_capacity(self.reliable_rx_sessions, "r1k", r1k_id)
+            session = {
+                "r1k_id": r1k_id,
+                "src": str(payload.get("src") or "").strip(),
+                "dst": str(payload.get("dst") or "").strip(),
+                "profile_id": 0,
+                "profile_name": "",
+                "size": 0,
+                "data_shards": 0,
+                "parity_shards": 0,
+                "shard_size": 0,
+                "shards": {},
+                "started_ms": now,
+                "last_update_ms": now,
+                "start_received": False,
+                "end_received": False,
+                "last_nack_ms": 0,
+            }
+            self.reliable_rx_sessions[r1k_id] = session
+            if reason != "start":
+                self.append_log(
+                    f"reliable session created: id={r1k_id} reason={reason}",
+                    level="WARN",
+                    category="R1K",
+                )
+            return session
+
+        def merge_rx_meta(session: dict[str, Any]) -> None:
+            src = str(payload.get("src") or "").strip()
+            if src:
+                session["src"] = src
+            dst = str(payload.get("dst") or "").strip()
+            if dst:
+                session["dst"] = dst
+            for key in ("profile_id", "size", "data_shards", "parity_shards", "shard_size"):
+                raw = payload.get(key)
+                if raw is None:
+                    continue
+                value = _to_int(str(raw), -1)
+                if value >= 0:
+                    session[key] = value
+            profile_name = str(payload.get("profile_name") or "").strip()
+            if profile_name:
+                session["profile_name"] = profile_name
+
+        def try_finalize_reliable(
+            session: dict[str, Any],
+            *,
+            allow_nack: bool,
+            now_ms: int,
+        ) -> bool:
+            profile_id = int(session.get("profile_id") or 0)
+            size = int(session.get("size") or 0)
+            shards_b64 = session.get("shards")
+            if not isinstance(shards_b64, dict):
+                shards_b64 = {}
+                session["shards"] = shards_b64
+            present_indexes = sorted(int(idx) for idx in shards_b64.keys())
+
+            try:
+                restored = decode_reliable_1k_from_shards(
+                    shard_map_b64={int(idx): str(val) for idx, val in shards_b64.items()},
+                    profile_id=profile_id,
+                    original_size=size,
+                )
+            except Exception:
+                restored = None
+
+            if restored is not None:
+                src = str(session.get("src") or payload.get("src") or "?")
+                try:
+                    text = restored.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = restored.decode("utf-8", errors="replace")
+                preview = self._shorten(text, 160)
+                self.append_chat(f"{src}(wifi): [reliable_1k {len(restored)}B] {preview}")
+                latency_ms = max(0, now_ms - int(session.get("started_ms") or now_ms))
+                missing_before: list[int] = []
+                try:
+                    missing_before = missing_reliable_shards(present_indexes=present_indexes, profile_id=profile_id)
+                except Exception:
+                    missing_before = []
+                self.reliable_stats.register_success(latency_ms=latency_ms)
+                if src and src.lower() != "pc":
+                    self._send_reliable_result(
+                        dst=src,
+                        r1k_id=r1k_id,
+                        status="ok",
+                        recovered=len(missing_before),
+                        latency_ms=latency_ms,
+                    )
+                self.reliable_rx_sessions.pop(r1k_id, None)
+                self.append_log(
+                    (
+                        f"reliable_1k 復元成功: id={r1k_id} src={src} bytes={len(restored)} "
+                        f"missing={len(missing_before)} latency={latency_ms}ms"
+                    ),
+                    level="SYSTEM",
+                    category="R1K",
+                )
+                self.update_stats_view()
+                return True
+
+            try:
+                missing_indexes = missing_reliable_shards(present_indexes=present_indexes, profile_id=profile_id)
+            except Exception:
+                missing_indexes = []
+
+            src = str(session.get("src") or payload.get("src") or "").strip()
+            if allow_nack and src and missing_indexes:
+                last_nack_ms = int(session.get("last_nack_ms") or 0)
+                if (now_ms - last_nack_ms) >= 500:
+                    nack = make_reliable_1k_nack_message(
+                        r1k_id=r1k_id,
+                        dst=src,
+                        missing_indexes=missing_indexes,
+                        ttl=self._current_ttl(),
+                    )
+                    if self.send_json(nack):
+                        self._register_pending_e2e(nack)
+                        self.reliable_stats.register_nack()
+                        session["last_nack_ms"] = now_ms
+                        session["last_update_ms"] = now_ms
+                        self.append_log(
+                            (
+                                f"reliable_1k NACK送信: id={r1k_id} src={src} "
+                                f"missing={missing_indexes[:10]} total={len(missing_indexes)}"
+                            ),
+                            level="WARN",
+                            category="R1K",
+                        )
+                        self.update_stats_view()
+                return False
+
+            if src and src.lower() != "pc":
+                self._send_reliable_result(
+                    dst=src,
+                    r1k_id=r1k_id,
+                    status="decode_failed",
+                    missing=missing_indexes if missing_indexes else None,
+                )
+            self.reliable_stats.register_failure("decode_failed")
+            self.reliable_rx_sessions.pop(r1k_id, None)
+            self.update_stats_view()
+            return True
+
+        if kind == "reliable_1k_start":
+            session = ensure_rx_session(reason="start")
+            merge_rx_meta(session)
+            first_start = not bool(session.get("start_received"))
+            session["start_received"] = True
+            session["last_update_ms"] = now
+            if first_start:
+                self.append_log(
+                    (
+                        f"reliable_1k 受信開始: id={r1k_id} src={session.get('src') or '?'} "
+                        f"profile={session.get('profile_id')} size={session.get('size')}"
+                    ),
+                    level="SYSTEM",
+                    category="R1K",
+                )
+            return
+
+        if kind in {"reliable_1k_chunk", "reliable_1k_repair"}:
+            session = ensure_rx_session(reason=("repair_before_start" if kind.endswith("repair") else "chunk_before_start"))
+            merge_rx_meta(session)
+            idx = payload.get("index")
+            if not isinstance(idx, int):
+                idx = _to_int(str(idx), -1)
+            if idx < 0:
+                return
+            data_b64 = payload.get("data_b64")
+            if not isinstance(data_b64, str) or not data_b64:
+                return
+            shards = session.get("shards")
+            if not isinstance(shards, dict):
+                shards = {}
+                session["shards"] = shards
+            shards[idx] = data_b64
+            session["last_update_ms"] = now
+            if kind == "reliable_1k_repair" and bool(session.get("end_received")):
+                try_finalize_reliable(session, allow_nack=True, now_ms=now)
+            return
+
+        if kind == "reliable_1k_end":
+            session = ensure_rx_session(reason="end_before_start")
+            merge_rx_meta(session)
+            session["end_received"] = True
+            session["last_update_ms"] = now
+            try_finalize_reliable(session, allow_nack=True, now_ms=now)
+            return
+
+        if kind == "reliable_1k_nack":
+            session = self.reliable_tx_sessions.get(r1k_id)
+            if session is None:
+                return
+            missing_raw = payload.get("missing")
+            if not isinstance(missing_raw, list):
+                return
+            missing_indexes: list[int] = []
+            for value in missing_raw:
+                idx = _to_int(str(value), -1)
+                if idx >= 0 and idx not in missing_indexes:
+                    missing_indexes.append(idx)
+            if not missing_indexes:
+                return
+            dst = str(session.get("dst") or "").strip()
+            shards_b64 = session.get("shards_b64")
+            if not dst or not isinstance(shards_b64, list):
+                return
+            sent_repairs = 0
+            for idx in missing_indexes:
+                if idx < 0 or idx >= len(shards_b64):
+                    continue
+                repair = make_reliable_1k_repair_message(
+                    r1k_id=r1k_id,
+                    dst=dst,
+                    index=idx,
+                    shard_b64=str(shards_b64[idx]),
+                    ttl=self._current_ttl(),
+                )
+                if not self.send_json(repair):
+                    continue
+                self._register_pending_e2e(repair)
+                sent_repairs += 1
+            if sent_repairs <= 0:
+                return
+            session["nack_count"] = int(session.get("nack_count") or 0) + 1
+            session["repair_packets"] = int(session.get("repair_packets") or 0) + sent_repairs
+            session["last_update_ms"] = now
+            session["result_deadline_ms"] = now + self.reliable_result_deadline_ms
+            self.reliable_stats.register_repair(sent_repairs)
+            self.reliable_stats.register_retry(sent_repairs)
+            self.append_log(
+                f"reliable_1k repair送信: id={r1k_id} dst={dst} repairs={sent_repairs}",
+                level="SYSTEM",
+                category="R1K",
+            )
+            self.update_stats_view()
+            return
+
+        if kind == "reliable_1k_result":
+            session = self.reliable_tx_sessions.pop(r1k_id, None)
+            if session is None:
+                return
+            status = str(payload.get("status") or "").strip().lower()
+            if not status:
+                status = "unknown"
+            dst = str(session.get("dst") or "").strip()
+            elapsed_ms = max(0, now - int(session.get("start_ms") or now))
+            retry_packets = int(session.get("retry_packets") or 0) + int(session.get("repair_packets") or 0)
+            total_packets = int(session.get("packet_count") or 0) + int(session.get("repair_packets") or 0)
+            latency_raw = payload.get("latency_ms")
+            latency_ms = _to_int(str(latency_raw), elapsed_ms)
+
+            if status == "ok":
+                self.reliable_stats.register_success(latency_ms=latency_ms)
+            else:
+                self.reliable_stats.register_failure(status)
+            self._apply_reliable_adaptation(
+                dst=dst,
+                success=(status == "ok"),
+                nack_count=int(session.get("nack_count") or 0),
+                retry_packets=retry_packets,
+                total_packets=total_packets,
+            )
+            self.append_log(
+                (
+                    f"reliable_1k result: id={r1k_id} dst={dst} status={status} "
+                    f"nacks={session.get('nack_count', 0)} retries={retry_packets} elapsed={elapsed_ms}ms"
+                ),
+                level=("SYSTEM" if status == "ok" else "WARN"),
+                category="R1K",
+            )
+            self.update_stats_view()
             return
 
     def handle_image_payload(self, payload: dict[str, Any]) -> None:
@@ -2741,8 +3362,89 @@ class LPWAApp(tk.Tk):
             category="IMAGE",
         )
 
+    def send_reliable_1k(self) -> None:
+        mode = (self.reliable_mode_var.get() or "").strip().lower()
+        if mode != "reliable_1k":
+            messagebox.showwarning("モード不一致", "Reliable送信には mode=reliable_1k を選択してください。")
+            return
+        dst = self._normalize_target(self.ping_target_var.get())
+        if dst is None:
+            messagebox.showwarning("宛先エラー", "Reliable 1KB は Broadcast 送信できません。Ping宛先を指定してください。")
+            return
+
+        ttl = self._current_ttl()
+        profile_id = self._resolve_reliable_profile_for_send(dst)
+        profile_name = RELIABLE_PROFILE_ID_TO_NAME.get(profile_id, "25+8")
+        r1k_id = uuid.uuid4().hex[:12]
+        text = self._reliable_payload_text(r1k_id, dst)
+        self.append_log(
+            f"reliable_1k send start: id={r1k_id} dst={dst} mode={mode} profile={profile_name} ttl={ttl}",
+            level="SYSTEM",
+            category="R1K",
+        )
+        try:
+            packets, meta = make_reliable_1k_messages(
+                text=text,
+                dst=dst,
+                via="wifi",
+                ttl=ttl,
+                profile_id=profile_id,
+                r1k_id=r1k_id,
+                require_ack=True,
+            )
+        except Exception as exc:
+            messagebox.showerror("Reliable送信エラー", str(exc))
+            return
+
+        now = self._now_ms()
+        session_id = str(meta.get("r1k_id") or r1k_id)
+        self.reliable_stats.register_sent(profile_name=profile_name, packet_count=len(packets))
+        self.reliable_tx_sessions[session_id] = {
+            "r1k_id": session_id,
+            "dst": dst,
+            "profile_id": int(meta.get("profile_id", profile_id)),
+            "profile_name": str(meta.get("profile_name") or profile_name),
+            "shards_b64": list(meta.get("shards_b64") or []),
+            "start_ms": now,
+            "last_update_ms": now,
+            "packet_count": len(packets),
+            "nack_count": 0,
+            "repair_packets": 0,
+            "retry_packets": 0,
+            "ping_seq": None,
+            "status": "pending",
+            "result_deadline_ms": now + self.reliable_result_deadline_ms,
+        }
+
+        for payload in packets:
+            if not self.send_json(payload):
+                self.reliable_tx_sessions.pop(session_id, None)
+                self.reliable_stats.register_failure("tx_enqueue_failed")
+                self.append_log(
+                    f"reliable_1k send failed: id={session_id} type={payload.get('type')}",
+                    level="ERROR",
+                    category="R1K",
+                )
+                self.update_stats_view()
+                return
+            if payload.get("need_ack"):
+                self._register_pending_e2e(payload)
+
+        probe_sent = self.send_ping()
+        if probe_sent:
+            self.reliable_tx_sessions[session_id]["ping_seq"] = self.ping_seq
+        self.append_log(
+            f"reliable_1k send queued: id={session_id} packets={len(packets)} probe={'ok' if probe_sent else 'ng'}",
+            level="SYSTEM",
+            category="R1K",
+        )
+        self.update_stats_view()
+
     def request_nodes(self) -> None:
         self.send_json(make_nodes_request())
+
+    def request_routes(self) -> None:
+        self.send_json(make_routes_request())
 
     def send_ping(self) -> bool:
         self.ping_seq += 1
@@ -2750,7 +3452,14 @@ class LPWAApp(tk.Tk):
         dst = self._normalize_target(self.ping_target_var.get())
         ttl = self._current_ttl()
         ping_id = uuid.uuid4().hex[:8]
-        payload = make_ping_message(seq=seq, dst=dst, ping_id=ping_id, via="wifi", ttl=ttl)
+        payload = make_ping_probe_command(
+            seq=seq,
+            dst=dst,
+            ping_id=ping_id,
+            via="wifi",
+            ttl=ttl,
+            probe_bytes=PING_PROBE_BYTES,
+        )
         if not self.send_json(payload):
             return False
         sent_ms = self._now_ms()
@@ -2760,6 +3469,7 @@ class LPWAApp(tk.Tk):
             "sent_ms": sent_ms,
             "dst": dst or BROADCAST_LABEL,
             "is_broadcast": dst is None,
+            "probe_bytes": PING_PROBE_BYTES,
             "responders": set(),
             "registered_first": False,
             "response_deadline_ms": sent_ms + PING_BROADCAST_RESPONSE_WINDOW_MS,
@@ -2810,6 +3520,14 @@ class LPWAApp(tk.Tk):
                     category="PING",
                 )
                 return
+
+        if payload.get("probe_hash_ok") is False:
+            self.append_log(
+                f"pong integrity NG: seq={seq} src={payload.get('src')} ping_id={received_ping_id}",
+                level="WARN",
+                category="PING",
+            )
+            return
 
         now_ms = self._now_ms()
         if bool(round_info.get("is_broadcast")):
@@ -2864,7 +3582,7 @@ class LPWAApp(tk.Tk):
             (
                 f"連続Ping開始: interval={interval_ms}ms, "
                 f"count={'∞' if self.continuous_remaining is None else self.continuous_remaining}, "
-                f"ttl={self._current_ttl()}"
+                f"ttl={self._current_ttl()}, probe={PING_PROBE_BYTES}B"
             ),
             level="SYSTEM",
             category="PING",
@@ -3031,7 +3749,11 @@ class LPWAApp(tk.Tk):
 
     def reset_stats(self) -> None:
         self.ping_stats.reset()
+        self.reliable_stats.reset()
         self.pending_ping_rounds.clear()
+        self.reliable_tx_sessions.clear()
+        self.reliable_rx_sessions.clear()
+        self.reliable_auto_state_by_dst.clear()
         self.quality_points.clear()
         self.quality_graph_status_var.set("品質グラフ: リセット済み")
         self.update_stats_view()
@@ -3048,6 +3770,11 @@ class LPWAApp(tk.Tk):
         self.min_var.set(f"{snapshot['min_ms']:.1f} ms")
         self.max_var.set(f"{snapshot['max_ms']:.1f} ms")
         self.p95_var.set(f"{snapshot['p95_ms']:.1f} ms")
+        reliable_snapshot = self.reliable_stats.snapshot()
+        self.reliable_restore_var.set(f"{float(reliable_snapshot['restore_rate']):.1f}%")
+        self.reliable_retry_rate_var.set(f"{float(reliable_snapshot['retry_rate']):.1f}%")
+        self.reliable_profile_used_var.set(str(reliable_snapshot["top_profile"]))
+        self.reliable_fail_var.set(str(reliable_snapshot["top_reason"]))
         self._record_quality_point(snapshot)
         self._draw_quality_graph()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Any
 
 from .protocol import ProtocolError, decode_json_line, encode_json_line
@@ -82,6 +83,24 @@ class SerialWorker:
     def _emit(self, event: dict[str, Any]) -> None:
         self._incoming_queue.put(event)
 
+    def _write_all(self, ser: "serial.Serial", encoded: bytes) -> None:
+        view = memoryview(encoded)
+        offset = 0
+        chunk_size = 64
+        while offset < len(view):
+            end = offset + chunk_size
+            if end > len(view):
+                end = len(view)
+            written = ser.write(view[offset:end])
+            if written is None:
+                written = 0
+            if written <= 0:
+                raise SerialException("serial write returned 0 bytes")
+            offset += written
+            if offset < len(view):
+                time.sleep(0.001)
+        ser.flush()
+
     def _drain_tx(self, ser: "serial.Serial") -> None:
         while True:
             try:
@@ -91,8 +110,24 @@ class SerialWorker:
 
             try:
                 encoded = encode_json_line(payload)
-                ser.write(encoded)
-                ser.flush()
+                last_error: Exception | None = None
+                sent = False
+                for attempt in range(3):
+                    try:
+                        self._write_all(ser, encoded)
+                        sent = True
+                        break
+                    except (SerialException, OSError) as exc:
+                        last_error = exc
+                        try:
+                            ser.reset_output_buffer()
+                        except Exception:
+                            pass
+                        time.sleep(0.05 * (attempt + 1))
+                if not sent:
+                    if last_error is None:
+                        raise SerialException("serial write failed")
+                    raise last_error
                 self._emit({"_event": "tx", "payload": payload})
             except (SerialException, OSError) as exc:
                 self._emit({"_event": "error", "message": f"送信失敗: {exc}"})

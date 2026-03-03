@@ -4,6 +4,8 @@
 #include <mbedtls/base64.h>
 
 #include <inttypes.h>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -12,6 +14,25 @@ namespace lpwa {
 namespace {
 constexpr uint8_t kTraceTelemetryTtl = 3;
 constexpr uint32_t kTraceTelemetryMinIntervalMs = 120;
+constexpr uint16_t kPingProbeMagic = 0x504C;  // 'LP'
+constexpr uint8_t kPingProbeVersion = 1;
+constexpr uint8_t kPingProbeKindRequest = 1;
+constexpr uint8_t kPingProbeKindPongOk = 2;
+constexpr uint8_t kPingProbeKindPongBad = 3;
+constexpr uint16_t kPingProbeBytesDefault = 1000;
+constexpr uint16_t kPingProbeBytesMax = 1000;
+
+struct PingProbeHeader {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t kind;
+  uint16_t seq;
+  uint32_t tag;
+  uint32_t txMs;
+  uint16_t payloadLen;
+  uint32_t payloadHash;
+} __attribute__((packed));
+static_assert(sizeof(PingProbeHeader) == 20, "PingProbeHeader size mismatch");
 
 bool isBroadcastTarget(const char* dst) {
   if (dst == nullptr || dst[0] == '\0') {
@@ -38,6 +59,138 @@ bool isSelfTarget(const String& selfNodeId, const char* dst) {
   return equalsIgnoreCase(selfNodeId, dst);
 }
 
+bool parseNodeIdText(const char* text, uint32_t* outNodeId) {
+  if (outNodeId != nullptr) {
+    *outNodeId = 0;
+  }
+  if (text == nullptr || text[0] == '\0') {
+    return false;
+  }
+
+  const size_t len = std::strlen(text);
+  if (len != 10 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X')) {
+    return false;
+  }
+  for (size_t i = 2; i < 10; ++i) {
+    const char ch = text[i];
+    const bool isDigit = (ch >= '0' && ch <= '9');
+    const bool isLowerHex = (ch >= 'a' && ch <= 'f');
+    const bool isUpperHex = (ch >= 'A' && ch <= 'F');
+    if (!isDigit && !isLowerHex && !isUpperHex) {
+      return false;
+    }
+  }
+
+  char* endPtr = nullptr;
+  const unsigned long parsed = std::strtoul(text + 2, &endPtr, 16);
+  if (endPtr == (text + 2) || (endPtr != nullptr && *endPtr != '\0') || parsed == 0UL) {
+    return false;
+  }
+  if (outNodeId != nullptr) {
+    *outNodeId = static_cast<uint32_t>(parsed);
+  }
+  return true;
+}
+
+bool parseHexU32(const char* text, uint32_t* outValue) {
+  if (outValue != nullptr) {
+    *outValue = 0;
+  }
+  if (text == nullptr || text[0] == '\0') {
+    return false;
+  }
+  const size_t len = std::strlen(text);
+  if (len > 8) {
+    return false;
+  }
+  for (size_t i = 0; i < len; ++i) {
+    const char ch = text[i];
+    const bool isDigit = (ch >= '0' && ch <= '9');
+    const bool isLowerHex = (ch >= 'a' && ch <= 'f');
+    const bool isUpperHex = (ch >= 'A' && ch <= 'F');
+    if (!isDigit && !isLowerHex && !isUpperHex) {
+      return false;
+    }
+  }
+  char* endPtr = nullptr;
+  const unsigned long parsed = std::strtoul(text, &endPtr, 16);
+  if (endPtr == text || (endPtr != nullptr && *endPtr != '\0')) {
+    return false;
+  }
+  if (outValue != nullptr) {
+    *outValue = static_cast<uint32_t>(parsed);
+  }
+  return true;
+}
+
+uint32_t fnv1a32(const uint8_t* data, size_t len) {
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < len; ++i) {
+    hash ^= static_cast<uint32_t>(data[i]);
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+void fillPingProbePayload(uint8_t* outBuffer, size_t len, uint32_t seed) {
+  if (outBuffer == nullptr || len == 0) {
+    return;
+  }
+  uint32_t x = seed ^ 0xA5A5A5A5UL;
+  for (size_t i = 0; i < len; ++i) {
+    x = x * 1664525UL + 1013904223UL;
+    outBuffer[i] = static_cast<uint8_t>((x >> 24) & 0xFF);
+  }
+}
+
+size_t encodePingProbePacket(uint8_t* outPacket, size_t outCapacity, const PingProbeHeader& header,
+                             const uint8_t* payload) {
+  const size_t packetLen = sizeof(PingProbeHeader) + static_cast<size_t>(header.payloadLen);
+  if (outPacket == nullptr || outCapacity < packetLen || packetLen > kMaxAppPayload) {
+    return 0;
+  }
+  if (header.payloadLen > 0 && payload == nullptr) {
+    return 0;
+  }
+  std::memcpy(outPacket, &header, sizeof(PingProbeHeader));
+  if (header.payloadLen > 0) {
+    std::memcpy(outPacket + sizeof(PingProbeHeader), payload, header.payloadLen);
+  }
+  return packetLen;
+}
+
+bool decodePingProbePacket(const uint8_t* packet, size_t packetLen, PingProbeHeader* outHeader,
+                           const uint8_t** outPayload) {
+  if (packet == nullptr || outHeader == nullptr || packetLen < sizeof(PingProbeHeader)) {
+    return false;
+  }
+  std::memcpy(outHeader, packet, sizeof(PingProbeHeader));
+  if (outHeader->magic != kPingProbeMagic || outHeader->version != kPingProbeVersion) {
+    return false;
+  }
+  if (outHeader->kind != kPingProbeKindRequest && outHeader->kind != kPingProbeKindPongOk &&
+      outHeader->kind != kPingProbeKindPongBad) {
+    return false;
+  }
+  if (outHeader->payloadLen > kPingProbeBytesMax) {
+    return false;
+  }
+  const size_t expectedLen = sizeof(PingProbeHeader) + static_cast<size_t>(outHeader->payloadLen);
+  if (packetLen != expectedLen) {
+    return false;
+  }
+  if (outPayload != nullptr) {
+    *outPayload = packet + sizeof(PingProbeHeader);
+  }
+  return true;
+}
+
+String formatHex8(uint32_t value) {
+  char buffer[9];
+  std::snprintf(buffer, sizeof(buffer), "%08" PRIx32, value);
+  return String(buffer);
+}
+
 }  // namespace
 
 SerialJsonBridge::SerialJsonBridge(EspNowMesh* mesh, BleRelay* ble) : mesh_(mesh), ble_(ble) {}
@@ -45,6 +198,7 @@ SerialJsonBridge::SerialJsonBridge(EspNowMesh* mesh, BleRelay* ble) : mesh_(mesh
 void SerialJsonBridge::begin(Stream* stream) {
   serial_ = stream;
   lineLength_ = 0;
+  droppingInputLine_ = false;
   bridgeStats_ = BridgeStats{};
   lastTraceTelemetryMs_ = 0;
 
@@ -52,11 +206,18 @@ void SerialJsonBridge::begin(Stream* stream) {
     return;
   }
 
-  StaticJsonDocument<192> doc;
+  StaticJsonDocument<256> doc;
   doc["event"] = "bridge_ready";
   doc["type"] = "bridge_ready";
   if (mesh_ != nullptr) {
     doc["node_id"] = formatNodeId(mesh_->nodeId());
+    JsonObject caps = doc.createNestedObject("caps");
+    caps["directed_unicast"] = true;
+    caps["route_stats"] = true;
+    caps["route_list"] = true;
+    caps["routing_mode"] = LPWA_ROUTING_MODE;
+    caps["reliable_1k"] = true;
+    caps["reliable_profiles"] = "0:25+8,1:25+10";
   }
   serializeJson(doc, *serial_);
   serial_->println();
@@ -70,6 +231,11 @@ void SerialJsonBridge::loop() {
         continue;
       }
       if (ch == '\n') {
+        if (droppingInputLine_) {
+          droppingInputLine_ = false;
+          lineLength_ = 0;
+          continue;
+        }
         if (lineLength_ > 0) {
           lineBuffer_[lineLength_] = '\0';
           handleLine(lineBuffer_);
@@ -78,8 +244,12 @@ void SerialJsonBridge::loop() {
         continue;
       }
 
+      if (droppingInputLine_) {
+        continue;
+      }
       if (lineLength_ >= (kLineBufferSize - 1)) {
         lineLength_ = 0;
+        droppingInputLine_ = true;
         bridgeStats_.commandErrors++;
         emitError("line_too_long", "max 4095 bytes");
         continue;
@@ -118,7 +288,9 @@ void SerialJsonBridge::handleLine(const char* line) {
   const DeserializationError err = deserializeJson(request, line);
   if (err) {
     bridgeStats_.commandErrors++;
-    emitError("json_parse_error", err.c_str());
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), "%s len=%u", err.c_str(), static_cast<unsigned>(std::strlen(line)));
+    emitError("json_parse_error", detail);
     return;
   }
 
@@ -135,9 +307,13 @@ void SerialJsonBridge::handleLine(const char* line) {
 
     if (type == "nodes_request") {
       cmd = "get_nodes";
+    } else if (type == "routes_request") {
+      cmd = "get_routes";
     } else if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
                type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
-               type == "long_text_end") {
+               type == "long_text_end" || type == "reliable_1k_start" || type == "reliable_1k_chunk" ||
+               type == "reliable_1k_end" || type == "reliable_1k_nack" || type == "reliable_1k_repair" ||
+               type == "reliable_1k_result") {
       if (via == "ble") {
         if (type != "chat") {
           bridgeStats_.commandErrors++;
@@ -176,6 +352,13 @@ void SerialJsonBridge::handleLine(const char* line) {
       envelope["src"] = selfNodeId;
       envelope["ttl"] = ttl;
       const char* dst = request["dst"] | "";
+      uint32_t dstNodeId = 0;
+      const bool hasDirectedDst = !isBroadcastTarget(dst);
+      if (hasDirectedDst && !parseNodeIdText(dst, &dstNodeId)) {
+        bridgeStats_.commandErrors++;
+        emitError("invalid_field", "dst must be 0xXXXXXXXX");
+        return;
+      }
       if (!isBroadcastTarget(dst)) {
         envelope["dst"] = dst;
       }
@@ -263,6 +446,119 @@ void SerialJsonBridge::handleLine(const char* line) {
         if (hash != nullptr && hash[0] != '\0') {
           envelope["h"] = hash;
         }
+      } else if (type == "reliable_1k_start") {
+        const String r1kId = request["r1k_id"] | "";
+        const int profileId = request["profile_id"] | -1;
+        const int dataShards = request["data_shards"] | -1;
+        const int parityShards = request["parity_shards"] | -1;
+        const int shardSize = request["shard_size"] | -1;
+        const int size = request["size"] | -1;
+        if (r1kId.isEmpty() || profileId < 0 || dataShards <= 0 || parityShards < 0 || shardSize <= 0 || size < 0) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_start", "r1k_id/profile_id/data_shards/parity_shards/shard_size/size required");
+          return;
+        }
+        envelope["type"] = "r1k_s";
+        envelope["id"] = r1kId;
+        envelope["v"] = request["version"] | 1;
+        envelope["pf"] = profileId;
+        envelope["k"] = dataShards;
+        envelope["m"] = parityShards;
+        envelope["s"] = shardSize;
+        envelope["z"] = size;
+        const char* crc = request["crc32"] | "";
+        if (crc != nullptr && crc[0] != '\0') {
+          envelope["c"] = crc;
+        }
+        const char* sha = request["sha256"] | "";
+        if (sha != nullptr && sha[0] != '\0') {
+          envelope["h"] = sha;
+        }
+      } else if (type == "reliable_1k_chunk") {
+        const String r1kId = request["r1k_id"] | "";
+        const int index = request["index"] | -1;
+        const String dataB64 = request["data_b64"] | "";
+        if (r1kId.isEmpty() || index < 0 || dataB64.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_chunk", "r1k_id/index/data_b64 required");
+          return;
+        }
+        envelope["type"] = "r1k_d";
+        envelope["id"] = r1kId;
+        envelope["i"] = index;
+        envelope["d"] = dataB64;
+      } else if (type == "reliable_1k_end") {
+        const String r1kId = request["r1k_id"] | "";
+        if (r1kId.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_end", "r1k_id required");
+          return;
+        }
+        envelope["type"] = "r1k_e";
+        envelope["id"] = r1kId;
+        if (request.containsKey("size")) {
+          envelope["z"] = request["size"] | 0;
+        }
+        if (request.containsKey("data_shards")) {
+          envelope["k"] = request["data_shards"] | 0;
+        }
+        if (request.containsKey("parity_shards")) {
+          envelope["m"] = request["parity_shards"] | 0;
+        }
+        if (request.containsKey("shard_size")) {
+          envelope["s"] = request["shard_size"] | 0;
+        }
+        const char* crc = request["crc32"] | "";
+        if (crc != nullptr && crc[0] != '\0') {
+          envelope["c"] = crc;
+        }
+        const char* sha = request["sha256"] | "";
+        if (sha != nullptr && sha[0] != '\0') {
+          envelope["h"] = sha;
+        }
+      } else if (type == "reliable_1k_nack") {
+        const String r1kId = request["r1k_id"] | "";
+        if (r1kId.isEmpty() || !request.containsKey("missing")) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_nack", "r1k_id/missing required");
+          return;
+        }
+        envelope["type"] = "r1k_n";
+        envelope["id"] = r1kId;
+        envelope["missing"] = request["missing"];
+      } else if (type == "reliable_1k_repair") {
+        const String r1kId = request["r1k_id"] | "";
+        const int index = request["index"] | -1;
+        const String dataB64 = request["data_b64"] | "";
+        if (r1kId.isEmpty() || index < 0 || dataB64.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_repair", "r1k_id/index/data_b64 required");
+          return;
+        }
+        envelope["type"] = "r1k_r";
+        envelope["id"] = r1kId;
+        envelope["i"] = index;
+        envelope["d"] = dataB64;
+      } else if (type == "reliable_1k_result") {
+        const String r1kId = request["r1k_id"] | "";
+        const String status = request["status"] | "";
+        if (r1kId.isEmpty() || status.isEmpty()) {
+          bridgeStats_.commandErrors++;
+          emitError("invalid_reliable_1k_result", "r1k_id/status required");
+          return;
+        }
+        envelope["type"] = "r1k_o";
+        envelope["id"] = r1kId;
+        envelope["status"] = status;
+        if (request.containsKey("missing")) {
+          envelope["missing"] = request["missing"];
+        }
+        if (request.containsKey("recovered")) {
+          envelope["recovered"] = request["recovered"] | 0;
+        }
+        if (request.containsKey("latency_ms")) {
+          envelope["latency_ms"] = request["latency_ms"] | 0;
+        }
       }
 
       String wireText;
@@ -274,13 +570,26 @@ void SerialJsonBridge::handleLine(const char* line) {
       }
 
       uint32_t messageId = 0;
-      const bool ok = (mesh_ != nullptr) && mesh_->sendText(wireText.c_str(), ttl, &messageId);
+      bool ok = false;
+      if (mesh_ != nullptr) {
+        if (hasDirectedDst) {
+          ok = mesh_->sendTextDirected(wireText.c_str(), dstNodeId, ttl, &messageId);
+        } else {
+          ok = mesh_->sendText(wireText.c_str(), ttl, &messageId);
+        }
+      }
 
       if (ok) {
         if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
             type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
-            type == "long_text_end") {
+            type == "long_text_end" || type == "reliable_1k_start" || type == "reliable_1k_chunk" ||
+            type == "reliable_1k_end" || type == "reliable_1k_nack" || type == "reliable_1k_repair" ||
+            type == "reliable_1k_result") {
           bridgeStats_.sentText++;
+          if (type == "reliable_1k_start" || type == "reliable_1k_chunk" || type == "reliable_1k_end" ||
+              type == "reliable_1k_nack" || type == "reliable_1k_repair" || type == "reliable_1k_result") {
+            bridgeStats_.sentReliable++;
+          }
         }
       }
       emitAck(type.c_str(), ok, via.c_str(), messageId);
@@ -302,11 +611,25 @@ void SerialJsonBridge::handleLine(const char* line) {
 
     const uint8_t ttl = request["ttl"] | kDefaultTtl;
     String via = request["via"] | "wifi";
+    const char* dst = request["dst"] | "";
+    uint32_t dstNodeId = 0;
+    const bool hasDirectedDst = !isBroadcastTarget(dst);
+    if (hasDirectedDst && !parseNodeIdText(dst, &dstNodeId)) {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "dst must be 0xXXXXXXXX");
+      return;
+    }
 
     uint32_t messageId = 0;
     bool ok = false;
     if (via == "wifi") {
-      ok = (mesh_ != nullptr) && mesh_->sendText(text, ttl, &messageId);
+      if (mesh_ != nullptr) {
+        if (hasDirectedDst) {
+          ok = mesh_->sendTextDirected(text, dstNodeId, ttl, &messageId);
+        } else {
+          ok = mesh_->sendText(text, ttl, &messageId);
+        }
+      }
     } else if (via == "ble") {
       if (std::strlen(text) > kBleRelayTextMax) {
         bridgeStats_.commandErrors++;
@@ -352,11 +675,100 @@ void SerialJsonBridge::handleLine(const char* line) {
 
     const uint8_t ttl = request["ttl"] | kDefaultTtl;
     uint32_t messageId = 0;
-    const bool ok = (mesh_ != nullptr) && mesh_->sendBinary(decoded, decodedLen, ttl, &messageId);
+    const char* dst = request["dst"] | "";
+    uint32_t dstNodeId = 0;
+    const bool hasDirectedDst = !isBroadcastTarget(dst);
+    if (hasDirectedDst && !parseNodeIdText(dst, &dstNodeId)) {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "dst must be 0xXXXXXXXX");
+      return;
+    }
+    bool ok = false;
+    if (mesh_ != nullptr) {
+      if (hasDirectedDst) {
+        ok = mesh_->sendBinaryDirected(decoded, decodedLen, dstNodeId, ttl, &messageId);
+      } else {
+        ok = mesh_->sendBinary(decoded, decodedLen, ttl, &messageId);
+      }
+    }
     if (ok) {
       bridgeStats_.sentBinary++;
     }
     emitAck("send_binary", ok, "wifi", messageId);
+    return;
+  }
+
+  if (cmd == "ping_probe") {
+    String via = request["via"] | "wifi";
+    if (via != "wifi") {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "ping_probe supports wifi only");
+      return;
+    }
+
+    uint8_t ttl = request["ttl"] | kDefaultTtl;
+    if (ttl == 0) {
+      ttl = 1;
+    }
+    const char* dst = request["dst"] | "";
+    uint32_t dstNodeId = 0;
+    const bool hasDirectedDst = !isBroadcastTarget(dst);
+    if (hasDirectedDst && !parseNodeIdText(dst, &dstNodeId)) {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "dst must be 0xXXXXXXXX");
+      return;
+    }
+
+    uint16_t probeBytes = request["probe_bytes"] | kPingProbeBytesDefault;
+    if (probeBytes == 0 || probeBytes > kPingProbeBytesMax) {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "probe_bytes must be 1..1000");
+      return;
+    }
+
+    const uint16_t seq = static_cast<uint16_t>(request["seq"] | 0);
+    uint32_t tag = 0;
+    const char* pingIdText = request["ping_id"] | "";
+    if (!parseHexU32(pingIdText, &tag)) {
+      tag = (static_cast<uint32_t>(millis()) << 8) ^ static_cast<uint32_t>(seq);
+    }
+    const uint32_t txMs = request["ts_ms"] | millis();
+
+    uint8_t probePayload[kPingProbeBytesMax];
+    fillPingProbePayload(probePayload, probeBytes, tag ^ (static_cast<uint32_t>(seq) << 16) ^ txMs);
+    const uint32_t probeHash = fnv1a32(probePayload, probeBytes);
+
+    PingProbeHeader header{};
+    header.magic = kPingProbeMagic;
+    header.version = kPingProbeVersion;
+    header.kind = kPingProbeKindRequest;
+    header.seq = seq;
+    header.tag = tag;
+    header.txMs = txMs;
+    header.payloadLen = probeBytes;
+    header.payloadHash = probeHash;
+
+    uint8_t packet[sizeof(PingProbeHeader) + kPingProbeBytesMax];
+    const size_t packetLen = encodePingProbePacket(packet, sizeof(packet), header, probePayload);
+    if (packetLen == 0) {
+      bridgeStats_.commandErrors++;
+      emitError("internal_error", "ping_probe_packet_encode_failed");
+      return;
+    }
+
+    uint32_t messageId = 0;
+    bool ok = false;
+    if (mesh_ != nullptr) {
+      if (hasDirectedDst) {
+        ok = mesh_->sendBinaryDirected(packet, packetLen, dstNodeId, ttl, &messageId);
+      } else {
+        ok = mesh_->sendBinary(packet, packetLen, ttl, &messageId);
+      }
+    }
+    if (ok) {
+      bridgeStats_.sentBinary++;
+    }
+    emitAck("ping_probe", ok, "wifi", messageId);
     return;
   }
 
@@ -370,6 +782,8 @@ void SerialJsonBridge::handleLine(const char* line) {
     bridgeObj["errors"] = bridgeStats_.commandErrors;
     bridgeObj["sent_text"] = bridgeStats_.sentText;
     bridgeObj["sent_binary"] = bridgeStats_.sentBinary;
+    bridgeObj["sent_reliable"] = bridgeStats_.sentReliable;
+    bridgeObj["rx_reliable"] = bridgeStats_.rxReliable;
 
     MeshStats meshStats{};
     if (mesh_ != nullptr) {
@@ -391,6 +805,14 @@ void SerialJsonBridge::handleLine(const char* line) {
     meshObj["reassembly_timeouts"] = meshStats.reassemblyTimeouts;
     meshObj["nodeinfo_sent"] = meshStats.nodeInfoSent;
     meshObj["nodeinfo_received"] = meshStats.nodeInfoReceived;
+    meshObj["route_lookup_hit"] = meshStats.routeLookupHit;
+    meshObj["route_lookup_miss"] = meshStats.routeLookupMiss;
+    meshObj["route_learned"] = meshStats.routeLearned;
+    meshObj["route_expired"] = meshStats.routeExpired;
+    meshObj["routed_unicast_attempts"] = meshStats.routedUnicastAttempts;
+    meshObj["routed_unicast_success"] = meshStats.routedUnicastSuccess;
+    meshObj["routed_unicast_fail"] = meshStats.routedUnicastFail;
+    meshObj["routed_fallback_flood"] = meshStats.routedFallbackFlood;
 
     BleRelayStats bleStats{};
     if (ble_ != nullptr) {
@@ -431,6 +853,47 @@ void SerialJsonBridge::handleLine(const char* line) {
         node["remote_rx_frames"] = records[i].remoteRxFrames;
         node["remote_tx_frames"] = records[i].remoteTxFrames;
       }
+    }
+
+    serializeJson(out, *serial_);
+    serial_->println();
+    return;
+  }
+
+  if (cmd == "get_routes") {
+    DynamicJsonDocument out(8192);
+    out["event"] = "routes";
+    out["type"] = "route_list";
+
+    JsonArray routes = out.createNestedArray("routes");
+    if (mesh_ != nullptr) {
+      RouteRecord records[kMaxRouteEntries];
+      const size_t count = mesh_->copyRouteRecords(records, kMaxRouteEntries);
+      const uint32_t nowMs = millis();
+      size_t exported = 0;
+      for (size_t i = 0; i < count; ++i) {
+        JsonObject route = routes.createNestedObject();
+        if (route.isNull()) {
+          break;
+        }
+        route["dst_node_id"] = formatNodeId(records[i].dstNodeId);
+        if (records[i].nextHopNodeId != 0) {
+          route["next_hop_node_id"] = formatNodeId(records[i].nextHopNodeId);
+        }
+        if (records[i].hasNextHopMac) {
+          route["next_hop_mac"] = formatMac(records[i].nextHopMac);
+        }
+        route["hops"] = records[i].hops;
+        route["metric_q8"] = records[i].metricQ8;
+        route["learned_ms"] = records[i].learnedMs;
+        route["age_ms"] = nowMs - records[i].learnedMs;
+        exported++;
+      }
+      out["count"] = exported;
+      out["total"] = count;
+    } else {
+      out["count"] = 0;
+      out["total"] = 0;
     }
 
     serializeJson(out, *serial_);
@@ -554,7 +1017,12 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
 
         String response;
         serializeJson(ack, response);
-        mesh_->sendText(response.c_str(), appDoc["ttl"] | kDefaultTtl, nullptr);
+        const uint8_t ttl = appDoc["ttl"] | kDefaultTtl;
+        uint32_t dstNodeId = 0;
+        if (!parseNodeIdText(src, &dstNodeId)) {
+          return;
+        }
+        mesh_->sendTextDirected(response.c_str(), dstNodeId, ttl, nullptr);
       };
 
       const auto emitTraceTelemetry = [&]() {
@@ -564,7 +1032,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (std::strcmp(appType, "delivery_ack") == 0) {
           return;
         }
-        if (std::strcmp(appType, "image_chunk") == 0 || std::strcmp(appType, "long_text_chunk") == 0) {
+        if (std::strcmp(appType, "image_chunk") == 0 || std::strcmp(appType, "long_text_chunk") == 0 ||
+            std::strcmp(appType, "r1k_d") == 0 || std::strcmp(appType, "r1k_r") == 0 ||
+            std::strcmp(appType, "reliable_1k_chunk") == 0 || std::strcmp(appType, "reliable_1k_repair") == 0) {
           // 高頻度チャンクはトレース配信を抑制し、テレメトリ過負荷を避ける。
           return;
         }
@@ -633,6 +1103,16 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
           observed["text_id"] = appDoc["text_id"] | "";
         } else if (appDoc.containsKey("id")) {
           observed["text_id"] = appDoc["id"] | "";
+        }
+        if (appDoc.containsKey("r1k_id")) {
+          observed["r1k_id"] = appDoc["r1k_id"] | "";
+        } else if (appDoc.containsKey("id")) {
+          observed["r1k_id"] = appDoc["id"] | "";
+        }
+        if (appDoc.containsKey("profile_id")) {
+          observed["profile_id"] = appDoc["profile_id"] | 0;
+        } else if (appDoc.containsKey("pf")) {
+          observed["profile_id"] = appDoc["pf"] | 0;
         }
         if (appDoc.containsKey("image_id")) {
           observed["image_id"] = appDoc["image_id"] | "";
@@ -742,7 +1222,12 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
 
             String response;
             serializeJson(pong, response);
-            mesh_->sendText(response.c_str(), appDoc["ttl"] | kDefaultTtl, nullptr);
+            const uint8_t ttl = appDoc["ttl"] | kDefaultTtl;
+            uint32_t dstNodeId = 0;
+            if (!parseNodeIdText(src, &dstNodeId)) {
+              return;
+            }
+            mesh_->sendTextDirected(response.c_str(), dstNodeId, ttl, nullptr);
           }
         }
         return;
@@ -752,7 +1237,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!accepted) {
           return;
         }
-        StaticJsonDocument<256> out;
+        StaticJsonDocument<384> out;
         out["event"] = "pong";
         out["type"] = "pong";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
@@ -761,6 +1246,15 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["ping_id"] = appDoc["ping_id"] | "";
         out["msg_id"] = message.messageId;
         out["latency_ms"] = appDoc["latency_ms"] | 0;
+        if (appDoc.containsKey("probe_bytes")) {
+          out["probe_bytes"] = appDoc["probe_bytes"] | 0;
+        }
+        if (appDoc.containsKey("probe_hash_ok")) {
+          out["probe_hash_ok"] = appDoc["probe_hash_ok"] | false;
+        }
+        if (appDoc.containsKey("probe_hash")) {
+          out["probe_hash"] = appDoc["probe_hash"] | "";
+        }
         out["hops"] = message.hops;
         out["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
@@ -803,6 +1297,184 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         serializeJson(out, *serial_);
         serial_->println();
         maybeSendDeliveryAck("chat");
+        return;
+      }
+
+      const bool isR1kStart =
+          (std::strcmp(appType, "reliable_1k_start") == 0) || (std::strcmp(appType, "r1k_s") == 0);
+      const bool isR1kChunk =
+          (std::strcmp(appType, "reliable_1k_chunk") == 0) || (std::strcmp(appType, "r1k_d") == 0);
+      const bool isR1kEnd = (std::strcmp(appType, "reliable_1k_end") == 0) || (std::strcmp(appType, "r1k_e") == 0);
+      const bool isR1kNack =
+          (std::strcmp(appType, "reliable_1k_nack") == 0) || (std::strcmp(appType, "r1k_n") == 0);
+      const bool isR1kRepair =
+          (std::strcmp(appType, "reliable_1k_repair") == 0) || (std::strcmp(appType, "r1k_r") == 0);
+      const bool isR1kResult =
+          (std::strcmp(appType, "reliable_1k_result") == 0) || (std::strcmp(appType, "r1k_o") == 0);
+      if (isR1kStart || isR1kChunk || isR1kEnd || isR1kNack || isR1kRepair || isR1kResult) {
+        if (!accepted) {
+          return;
+        }
+
+        bool validPayload = true;
+        DynamicJsonDocument out(1800);
+        out["event"] = "mesh_rx";
+        if (isR1kStart) {
+          out["type"] = "reliable_1k_start";
+        } else if (isR1kChunk) {
+          out["type"] = "reliable_1k_chunk";
+        } else if (isR1kEnd) {
+          out["type"] = "reliable_1k_end";
+        } else if (isR1kNack) {
+          out["type"] = "reliable_1k_nack";
+        } else if (isR1kRepair) {
+          out["type"] = "reliable_1k_repair";
+        } else {
+          out["type"] = "reliable_1k_result";
+        }
+        out["via"] = "wifi";
+        out["src"] = appDoc["src"] | formatNodeId(message.originId);
+        out["dst"] = appDoc["dst"] | "";
+        out["msg_id"] = message.messageId;
+        out["hops"] = message.hops;
+        out["rssi"] = rxRssi;
+        if (!viaMac.isEmpty()) {
+          out["via_mac"] = viaMac;
+        }
+        if (!viaNodeId.isEmpty()) {
+          out["via_node"] = viaNodeId;
+        }
+        if (appDoc.containsKey("e2e_id")) {
+          out["e2e_id"] = appDoc["e2e_id"] | "";
+        }
+        if (appDoc.containsKey("retry_no")) {
+          out["retry_no"] = appDoc["retry_no"] | 0;
+        }
+
+        String r1kId = appDoc["r1k_id"] | "";
+        if (r1kId.isEmpty()) {
+          r1kId = appDoc["id"] | "";
+        }
+        if (r1kId.isEmpty()) {
+          validPayload = false;
+        }
+        out["r1k_id"] = r1kId;
+
+        if (isR1kStart) {
+          const int profileId = appDoc.containsKey("profile_id") ? (appDoc["profile_id"] | -1) : (appDoc["pf"] | -1);
+          const int dataShards = appDoc.containsKey("data_shards") ? (appDoc["data_shards"] | -1) : (appDoc["k"] | -1);
+          const int parityShards =
+              appDoc.containsKey("parity_shards") ? (appDoc["parity_shards"] | -1) : (appDoc["m"] | -1);
+          const int shardSize = appDoc.containsKey("shard_size") ? (appDoc["shard_size"] | -1) : (appDoc["s"] | -1);
+          const int size = appDoc.containsKey("size") ? (appDoc["size"] | -1) : (appDoc["z"] | -1);
+          if (profileId < 0 || dataShards <= 0 || parityShards < 0 || shardSize <= 0 || size < 0) {
+            validPayload = false;
+          }
+          out["version"] = appDoc["version"] | (appDoc["v"] | 1);
+          out["profile_id"] = profileId;
+          out["data_shards"] = dataShards;
+          out["parity_shards"] = parityShards;
+          out["shard_size"] = shardSize;
+          out["size"] = size;
+          String crc = appDoc["crc32"] | "";
+          if (crc.isEmpty()) {
+            crc = appDoc["c"] | "";
+          }
+          if (!crc.isEmpty()) {
+            out["crc32"] = crc;
+          }
+          String sha = appDoc["sha256"] | "";
+          if (sha.isEmpty()) {
+            sha = appDoc["h"] | "";
+          }
+          if (!sha.isEmpty()) {
+            out["sha256"] = sha;
+          }
+        } else if (isR1kChunk || isR1kRepair) {
+          const int index = appDoc.containsKey("index") ? (appDoc["index"] | -1) : (appDoc["i"] | -1);
+          String chunkData = appDoc["data_b64"] | "";
+          if (chunkData.isEmpty()) {
+            chunkData = appDoc["d"] | "";
+          }
+          if (index < 0 || chunkData.isEmpty()) {
+            validPayload = false;
+          }
+          out["index"] = index;
+          out["data_b64"] = chunkData;
+        } else if (isR1kEnd) {
+          const int size = appDoc.containsKey("size") ? (appDoc["size"] | -1) : (appDoc["z"] | -1);
+          const int dataShards = appDoc.containsKey("data_shards") ? (appDoc["data_shards"] | -1) : (appDoc["k"] | -1);
+          const int parityShards =
+              appDoc.containsKey("parity_shards") ? (appDoc["parity_shards"] | -1) : (appDoc["m"] | -1);
+          const int shardSize = appDoc.containsKey("shard_size") ? (appDoc["shard_size"] | -1) : (appDoc["s"] | -1);
+          if (size >= 0) {
+            out["size"] = size;
+          }
+          if (dataShards > 0) {
+            out["data_shards"] = dataShards;
+          }
+          if (parityShards >= 0) {
+            out["parity_shards"] = parityShards;
+          }
+          if (shardSize > 0) {
+            out["shard_size"] = shardSize;
+          }
+          String crc = appDoc["crc32"] | "";
+          if (crc.isEmpty()) {
+            crc = appDoc["c"] | "";
+          }
+          if (!crc.isEmpty()) {
+            out["crc32"] = crc;
+          }
+          String sha = appDoc["sha256"] | "";
+          if (sha.isEmpty()) {
+            sha = appDoc["h"] | "";
+          }
+          if (!sha.isEmpty()) {
+            out["sha256"] = sha;
+          }
+        } else if (isR1kNack) {
+          if (!appDoc.containsKey("missing")) {
+            validPayload = false;
+          } else {
+            out["missing"] = appDoc["missing"];
+          }
+        } else if (isR1kResult) {
+          String status = appDoc["status"] | "";
+          if (status.isEmpty()) {
+            validPayload = false;
+          }
+          out["status"] = status;
+          if (appDoc.containsKey("missing")) {
+            out["missing"] = appDoc["missing"];
+          }
+          if (appDoc.containsKey("recovered")) {
+            out["recovered"] = appDoc["recovered"] | 0;
+          }
+          if (appDoc.containsKey("latency_ms")) {
+            out["latency_ms"] = appDoc["latency_ms"] | 0;
+          }
+        }
+
+        if (!validPayload) {
+          return;
+        }
+        serializeJson(out, *serial_);
+        serial_->println();
+        bridgeStats_.rxReliable++;
+        if (isR1kStart) {
+          maybeSendDeliveryAck("reliable_1k_start");
+        } else if (isR1kChunk) {
+          maybeSendDeliveryAck("reliable_1k_chunk");
+        } else if (isR1kEnd) {
+          maybeSendDeliveryAck("reliable_1k_end");
+        } else if (isR1kNack) {
+          maybeSendDeliveryAck("reliable_1k_nack");
+        } else if (isR1kRepair) {
+          maybeSendDeliveryAck("reliable_1k_repair");
+        } else {
+          maybeSendDeliveryAck("reliable_1k_result");
+        }
         return;
       }
 
@@ -979,6 +1651,60 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
     serializeJson(out, *serial_);
     serial_->println();
     return;
+  }
+
+  PingProbeHeader probe{};
+  const uint8_t* probePayload = nullptr;
+  if (decodePingProbePacket(message.data, message.length, &probe, &probePayload)) {
+    if (probe.kind == kPingProbeKindRequest) {
+      const uint32_t gotHash = fnv1a32(probePayload, probe.payloadLen);
+      const bool hashOk = (gotHash == probe.payloadHash);
+      if (mesh_ != nullptr && message.originId != 0 && message.originId != mesh_->nodeId()) {
+        StaticJsonDocument<320> pong;
+        pong["app"] = "lpwa";
+        pong["type"] = "pong";
+        pong["src"] = selfNodeId;
+        pong["dst"] = formatNodeId(message.originId);
+        pong["seq"] = probe.seq;
+        pong["ping_id"] = formatHex8(probe.tag);
+        pong["latency_ms"] = static_cast<uint32_t>(millis() - probe.txMs);
+        pong["probe_bytes"] = probe.payloadLen;
+        pong["probe_hash_ok"] = hashOk;
+        pong["probe_hash"] = formatHex8(gotHash);
+
+        String response;
+        serializeJson(pong, response);
+        mesh_->sendTextDirected(response.c_str(), message.originId, kDefaultTtl, nullptr);
+      }
+      return;
+    }
+
+    if (probe.kind == kPingProbeKindPongOk || probe.kind == kPingProbeKindPongBad) {
+      StaticJsonDocument<384> out;
+      out["event"] = "pong";
+      out["type"] = "pong";
+      out["via"] = "wifi";
+      out["src"] = formatNodeId(message.originId);
+      out["dst"] = selfNodeId;
+      out["seq"] = probe.seq;
+      out["ping_id"] = formatHex8(probe.tag);
+      out["msg_id"] = message.messageId;
+      out["latency_ms"] = static_cast<uint32_t>(millis() - probe.txMs);
+      out["probe_bytes"] = kPingProbeBytesDefault;
+      out["probe_hash_ok"] = (probe.kind == kPingProbeKindPongOk);
+      out["probe_hash"] = formatHex8(probe.payloadHash);
+      out["hops"] = message.hops;
+      out["rssi"] = rxRssi;
+      if (!viaMac.isEmpty()) {
+        out["via_mac"] = viaMac;
+      }
+      if (!viaNodeId.isEmpty()) {
+        out["via_node"] = viaNodeId;
+      }
+      serializeJson(out, *serial_);
+      serial_->println();
+      return;
+    }
   }
 
   DynamicJsonDocument doc(2400);

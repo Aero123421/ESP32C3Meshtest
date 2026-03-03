@@ -13,6 +13,19 @@
   - PC-B <-> PC-C: text / long_text(1000文字級) / image
   - PC-A <-> PC-C: text / long_text(1000文字級) / image
 
+## 2.1 Phase定義（1〜4）
+
+| Phase | 目的 | 実装要素 | 完了判定 |
+|---|---|---|---|
+| Phase1 | P2P成立 | chat/ping基本疎通 | 2台で双方向chat/ping成功 |
+| Phase2 | 経路最適化 | route学習 + next-hop転送 + fallback flood | `route_lookup_hit/(hit+miss) >= 70%` |
+| Phase3 | 1KB高信頼 | `reliable_1k_start/chunk/end` + NACK/repair | 1KB復元成功 + `delivery_ack` 成立 |
+| Phase4 | 自動適応/運用 | 宛先別profile自動調整 + Reliable統計 | 復元率/再送率がKPI範囲で安定 |
+
+補足:
+- Phase3/4の詳細基準は `docs/reliable_1k_test_design.md` を優先する。
+- `tools/mesh_smoke_test.py` は `Directed reliable_1k (FEC)` を含む回帰を実施する。
+
 ## 3. 体制と固定情報
 - すべてのノードは同一ファームを使用する。
 - 各セッションで以下を固定して記録する:
@@ -36,6 +49,7 @@
 - LongText E2E PDR（1000文字級、宛先指定）: `>= 95%`
 - Directed delivery_ack 成功率（text / image packet）: `>= 98%`
 - 再送発生率（retry_no > 0）: `<= 15%`（初期目安）
+- 経路学習有効率（Phase2）: `route_lookup_hit / (hit+miss) >= 70%`（安定区間の目安）
 - Image転送成功率（64KB〜256KB）: `>= 95%`
 - Ping RTT: `p95 <= 1500ms`（10ノード試験時）
 - ノード再起動後の復帰時間: `<= 30s`
@@ -57,8 +71,10 @@
 | U05 | PC間image転送 | 分割再構成の成立性 | 破損なしで成功率KPI内 |
 | U06 | 中継品質 | マルチホップ性能確認 | hop数・遅延・損失を記録し閾値内 |
 | U07 | delivery_ack/再送 | 宛先指定通信の信頼性確認 | `delivery_ack` 成功率と再送率がKPI内 |
+| U07b | Phase2経路検証 | 次ホップ転送の有効性確認 | `get_stats` の `route_lookup_hit` が増加し、`routed_fallback_flood` が抑制される |
 | U08 | 再起動復帰 | 運用回復性確認 | 再参加と通信再開が30秒以内 |
 | U09 | 長時間安定性 | 連続運転耐性 | 2時間で重大異常なし |
+| U10 | reliable_1k | 1KB級E2E信頼性（3〜10台）評価 | `docs/reliable_1k_test_design.md` の受け入れ基準を満たす |
 
 ## 7. 実施時の注意
 - 1セッション内ではファーム差分を混在させない。
@@ -79,3 +95,6 @@
 - 最終KPI（本番運用値）の確定
 - 画像サイズ別の許容遅延の確定
 - 10ノード実測に基づく `delivery_ack` 成功率/再送率しきい値の再基準化
+
+## 10. reliable_1k 詳細設計
+- 1KB級の段階試験（3〜10台）、環境別評価指標、受け入れ基準、`mesh_smoke_test.py` 拡張案は `docs/reliable_1k_test_design.md` を参照する。

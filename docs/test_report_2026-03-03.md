@@ -47,11 +47,54 @@
   - `wifi chat broadcast` 成功
   - `Directed Wi-Fi chat + delivery_ack` 成功
   - `Directed long text (1045 bytes, 33 chunks) + delivery_ack` 成功
-  - `Directed ping` 成功
+  - `Directed ping_probe (1KB)` 成功
   - `ALL TESTS PASSED`
 - `python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 12 --ack-retries 2 --skip-ble` : 失敗を確認
   - `Directed long text` の chunk/end で `delivery_ack` タイムアウトが発生しやすい
   - 再送パラメータを強化 (`ack-timeout=4`, `ack-retries=6`) すると安定化
+
+### 3.5 GUI連続Pingログ解析（`C:\Users\nanoc\Downloads\2.log`）
+- ログ範囲: 23:44:27〜23:53:58
+- 集計:
+  - TX Ping: 562
+  - ACK(送信受理): 562
+  - RX Pong: 330
+  - pending prune warn: 232
+  - PDR (RX_PONG / TX_PING): 58.72%
+- 分単位PDR:
+  - 23:45: 100.0% (59/59)
+  - 23:46: 100.0% (59/59)
+  - 23:47: 96.6% (57/59)
+  - 23:48: 32.2% (19/59)
+  - 23:49: 3.4% (2/58)
+  - 23:50: 8.5% (5/59)
+  - 23:51: 5.1% (3/59)
+  - 23:52: 88.1% (52/59)
+  - 23:53: 100.0% (58/58)
+- 所見:
+  - 23:48〜23:51に明確な通信劣化区間があり、その後回復している。
+  - 送信受理(ACK)は100%のため、ボトルネックは無線到達/復路経路側にある可能性が高い。
+  - フェーズ2の経路学習・次ホップ転送で、劣化区間での復旧性改善を継続評価する。
+
+### 3.6 フェーズ2反映後の再スモーク（2026-03-03）
+- 実行:
+  - `py -3 tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 4 --ack-retries 6 --skip-ble`
+- 結果: 成功（`ALL TESTS PASSED`）
+- 確認できた項目:
+  - 3ノード認識 (`node_list count=3`)
+  - Wi-Fi broadcast chat 成功
+  - Directed Wi-Fi chat + `delivery_ack` 成功（retry=0）
+  - Directed long text（1045 bytes / 33 chunks）+ `delivery_ack` 成功
+  - Directed `ping_probe (1KB)` / `pong` 成功
+
+### 3.7 ping_probe切り替え後の再書き込み確認（2026-03-03）
+- 事象:
+  - 旧FWが残っている個体では `{"type":"error","code":"unknown_cmd","detail":"ping_probe"}` が返る
+- 対応:
+  - `tools/flash_all.ps1 -Ports COM6,COM7,COM8` を実行して3台とも再書き込み
+- 再試験:
+  - `py -3 tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 50 --ack-timeout 4 --ack-retries 6 --skip-ble`
+  - `Directed ping_probe (1KB)` を含めて `ALL TESTS PASSED`
 
 ## 4. 既知事項
 - BLE広告リレーは組み合わせ依存で成功/失敗が分かれる
@@ -63,5 +106,6 @@
 
 ## 5. 改善優先度（次）
 1. BLE広告リレーの受信率改善（送信間隔、スキャン条件、電波環境ログを含む）
-2. BLE経路のACK/再送設計（Wi-Fi実装と同等の運用要件を定義）
-3. GUIからの組み合わせ別試験をワンクリックで実施できる統合テスター追加
+2. フェーズ2経路最適化の継続検証（`route_list` / `route_*` statsを使ったA/B比較）
+3. BLE経路のACK/再送設計（Wi-Fi実装と同等の運用要件を定義）
+4. GUIからの組み合わせ別試験をワンクリックで実施できる統合テスター追加

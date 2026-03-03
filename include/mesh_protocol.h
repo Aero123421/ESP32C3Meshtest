@@ -20,6 +20,10 @@ namespace lpwa {
 #define LPWA_ALLOW_WIFI_LR_WITH_BLE 0
 #endif
 
+#ifndef LPWA_ROUTING_MODE
+#define LPWA_ROUTING_MODE 2
+#endif
+
 #ifndef LPWA_MESH_TX_POWER_QDBM
 #define LPWA_MESH_TX_POWER_QDBM 84
 #endif
@@ -49,6 +53,12 @@ constexpr uint32_t kNodeInfoPeriodMs = 15000;
 constexpr uint16_t kNodeInfoInitialJitterMinMs = 800;
 constexpr uint16_t kNodeInfoInitialJitterMaxMs = 4200;
 constexpr uint16_t kNodeInfoJitterMaxMs = 1800;
+constexpr uint32_t kRouteExpireMs = 45000;
+constexpr uint32_t kNeighborExpireMs = 60000;
+constexpr uint16_t kRouteHysteresisQ8 = 48;  // 0.1875
+constexpr uint8_t kMetricWeightHopQ8 = 32;   // 0.125
+constexpr uint8_t kMetricWeightEtxQ8 = 128;  // 0.5
+constexpr uint8_t kMetricWeightRssiQ8 = 8;   // 0.03125
 constexpr uint32_t kDuplicateWindowMs = 30000;
 constexpr uint32_t kReassemblyTimeoutMs = 22000;
 #if LPWA_ENABLE_BLE_RELAY
@@ -70,12 +80,15 @@ constexpr uint8_t kSendRawNoMemBackoffMaxMs = 8;
 constexpr uint8_t kRxProcessBudgetPerLoop = 40;
 
 constexpr size_t kMaxKnownNodes = 32;
+constexpr size_t kMaxNeighborNodes = 32;
+constexpr size_t kMaxRouteEntries = 48;
 constexpr size_t kInboundMessageQueueDepth = 32;
 constexpr size_t kRxQueueDepth = 128;
 
 enum class FrameType : uint8_t {
   Fragment = 1,
   NodeInfo = 2,
+  RoutedFragment = 3,
 };
 
 enum class AppPayloadType : uint8_t {
@@ -103,6 +116,10 @@ struct FragmentMeta {
   uint16_t chunkLen;
 };
 
+struct RoutedFragmentMeta {
+  uint32_t dstNodeId;
+};
+
 struct NodeInfoPayload {
   uint32_t nodeId;
   uint32_t uptimeSec;
@@ -116,6 +133,7 @@ struct NodeInfoPayload {
 
 static_assert(sizeof(MeshFrameHeader) == 14, "MeshFrameHeader size mismatch");
 static_assert(sizeof(FragmentMeta) == 8, "FragmentMeta size mismatch");
+static_assert(sizeof(RoutedFragmentMeta) == 4, "RoutedFragmentMeta size mismatch");
 static_assert(sizeof(NodeInfoPayload) == 28, "NodeInfoPayload size mismatch");
 static_assert(kMeshChannel >= 1 && kMeshChannel <= 14, "LPWA_MESH_CHANNEL must be 1..14");
 static_assert(kMeshTxPowerQuarterDbm >= 8 && kMeshTxPowerQuarterDbm <= 84,

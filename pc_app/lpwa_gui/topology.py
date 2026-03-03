@@ -34,9 +34,23 @@ def _normalize_type(payload: dict[str, Any]) -> str:
         return "long_text_chunk"
     if kind in {"lt_e", "long_text_end"}:
         return "long_text_end"
+    if kind in {"r1k_s", "reliable_1k_start"}:
+        return "reliable_1k_start"
+    if kind in {"r1k_d", "reliable_1k_chunk"}:
+        return "reliable_1k_chunk"
+    if kind in {"r1k_e", "reliable_1k_end"}:
+        return "reliable_1k_end"
+    if kind in {"r1k_n", "reliable_1k_nack"}:
+        return "reliable_1k_nack"
+    if kind in {"r1k_r", "reliable_1k_repair"}:
+        return "reliable_1k_repair"
+    if kind in {"r1k_o", "reliable_1k_result"}:
+        return "reliable_1k_result"
     if kind.startswith("image"):
         return kind
     if kind.startswith("long_text"):
+        return kind
+    if kind.startswith("reliable_1k"):
         return kind
     if not kind:
         return "unknown"

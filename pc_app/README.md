@@ -20,6 +20,7 @@
 - 画像ファイル送信（`image_start` / `image_chunk` / `image_end`）
 - 受信画像の再構成保存（欠損chunk/サイズ不一致/ハッシュ不一致は保存しない）
 - Ping単発送信 / 連続テスト
+- Ping単発送信 / 連続テストは `ping_probe`（既定1KB）を使用
 - Broadcast Pingの複数応答を1ラウンドとして扱い、遅延Pongを誤警告しにくい集計
 - PDR / 遅延統計（sent, received, lost, pdr, avg, min, max, p95）
 - 試験タブ下部に通信品質グラフ（PDR / Avg / P95 / Loss）をリアルタイム表示
@@ -104,11 +105,13 @@ python self_check.py
 
 ```json
 {"type":"nodes_request","src":"pc","ts_ms":1710000000000}
+{"type":"routes_request","src":"pc","ts_ms":1710000000000}
+{"cmd":"ping_probe","type":"ping","src":"pc","via":"wifi","dst":"0x00A1B2C3","seq":12,"ping_id":"a1b2c3d4","probe_bytes":1000,"ts_ms":1710000000100}
 {"type":"chat","src":"pc","via":"wifi","dst":"0x00A1B2C3","text":"hello","need_ack":true,"e2e_id":"chat-abc","ts_ms":1710000000001}
-{"type":"ping","src":"pc","dst":"node-2","seq":12,"ping_id":"a1b2c3d4","ts_ms":1710000000100}
-{"type":"image_start","src":"pc","dst":"node-2","image_id":"...","name":"photo.jpg","size":12345,"chunks":18,"sha256":"...","ts_ms":1710000000200}
-{"type":"image_chunk","src":"pc","dst":"node-2","image_id":"...","index":0,"data_b64":"...","ts_ms":1710000000201}
-{"type":"image_end","src":"pc","dst":"node-2","image_id":"...","ts_ms":1710000000300}
+{"type":"ping","src":"pc","dst":"0x00A1B2C3","seq":12,"ping_id":"a1b2c3d4","ts_ms":1710000000100}
+{"type":"image_start","src":"pc","dst":"0x00A1B2C3","image_id":"...","name":"photo.jpg","size":12345,"chunks":18,"sha256":"...","ts_ms":1710000000200}
+{"type":"image_chunk","src":"pc","dst":"0x00A1B2C3","image_id":"...","index":0,"data_b64":"...","ts_ms":1710000000201}
+{"type":"image_end","src":"pc","dst":"0x00A1B2C3","image_id":"...","ts_ms":1710000000300}
 {"type":"long_text_start","src":"pc","dst":"0x00A1B2C3","text_id":"...","encoding":"utf-8","size":1024,"chunks":6,"sha256":"...","need_ack":true,"e2e_id":"...:s","ts_ms":1710000000400}
 {"type":"long_text_chunk","src":"pc","dst":"0x00A1B2C3","text_id":"...","index":0,"data_b64":"...","need_ack":true,"e2e_id":"...:c:0","ts_ms":1710000000401}
 {"type":"long_text_end","src":"pc","dst":"0x00A1B2C3","text_id":"...","need_ack":true,"e2e_id":"...:e","ts_ms":1710000000402}
@@ -118,6 +121,7 @@ python self_check.py
 
 ```json
 {"event":"nodes","type":"node_list","nodes":[{"node_id":"0x00A1B2C3","rssi":-67}]}
+{"event":"routes","type":"route_list","count":2,"total":2,"routes":[{"dst_node_id":"0x00A1B2C3","next_hop_node_id":"0x00F01CEE","hops":2,"metric_q8":912}]}
 {"event":"mesh_rx","type":"chat","via":"wifi","src":"0x00A1B2C3","text":"hi from node","hops":1}
 {"event":"pong","type":"pong","src":"0x00A1B2C3","seq":12,"latency_ms":34.7}
 {"event":"ack","type":"ack","cmd":"chat","ok":true,"via":"wifi","msg_id":1234}
@@ -126,6 +130,7 @@ python self_check.py
 ```
 
 注意:
+- Directed宛先 `dst` は `0xXXXXXXXX` 形式のみ受け付けます（不正形式は `invalid_field`）。
 - BLE経路は広告メッシュのため短文用途です（実装上の文字数上限あり）。
 - 画像送信は `wifi` 前提です。
 - 長文テキストは既定で小さめチャンク（32 bytes）に分割し、宛先指定時は `delivery_ack` 再送を使って到達率を優先します。

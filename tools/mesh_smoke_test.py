@@ -10,9 +10,24 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import serial
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PC_APP_DIR = PROJECT_ROOT / "pc_app"
+import sys
+
+if str(PC_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(PC_APP_DIR))
+
+from lpwa_gui.protocol import (
+    RELIABLE_1K_BYTES,
+    decode_reliable_1k_from_shards,
+    make_reliable_1k_messages,
+)
 
 
 @dataclass
@@ -61,7 +76,21 @@ def send_json(state: PortState, payload: dict[str, Any]) -> None:
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            state.ser.write(wire)
+            view = memoryview(wire)
+            offset = 0
+            chunk_size = 64
+            while offset < len(view):
+                end = offset + chunk_size
+                if end > len(view):
+                    end = len(view)
+                written = state.ser.write(view[offset:end])
+                if written is None:
+                    written = 0
+                if written <= 0:
+                    raise serial.SerialTimeoutException("serial write returned 0 bytes")
+                offset += int(written)
+                if offset < len(view):
+                    time.sleep(0.001)
             state.ser.flush()
             return
         except Exception as exc:
@@ -205,7 +234,11 @@ def main() -> int:
     parser.add_argument("--ack-timeout", type=float, default=4.0, help="timeout for directed delivery_ack")
     parser.add_argument("--ack-retries", type=int, default=6, help="retries for directed delivery_ack")
     parser.add_argument("--skip-ble", action="store_true", help="skip BLE short chat check")
+    parser.add_argument("--skip-r1k", action="store_true", help="skip reliable_1k FEC check")
     parser.add_argument("--min-node-count", type=int, default=0, help="expected node_list minimum count (0=port count)")
+    parser.add_argument("--r1k-profile", type=int, default=0, help="reliable_1k profile id (default: 0=25+8)")
+    parser.add_argument("--r1k-max-retry-rate", type=float, default=-1.0, help="fail if reliable retry rate exceeds this value")
+    parser.add_argument("--r1k-max-latency-ms", type=int, default=0, help="fail if reliable pong latency exceeds this value (0=disabled)")
     args = parser.parse_args()
     if len(args.ports) < 3:
         parser.error("--ports は最低3台必要です")
@@ -215,6 +248,12 @@ def main() -> int:
         parser.error("--ack-timeout は 0 より大きい値を指定してください")
     if args.ack_retries < 0:
         parser.error("--ack-retries は 0 以上を指定してください")
+    if args.r1k_profile < 0:
+        parser.error("--r1k-profile は 0 以上を指定してください")
+    if args.r1k_max_retry_rate >= 0 and args.r1k_max_retry_rate > 1.0:
+        parser.error("--r1k-max-retry-rate は 0.0..1.0 (または -1 で無効) を指定してください")
+    if args.r1k_max_latency_ms < 0:
+        parser.error("--r1k-max-latency-ms は 0 以上を指定してください")
 
     states: list[PortState] = []
     readers: list[threading.Thread] = []
@@ -380,7 +419,7 @@ def main() -> int:
             return 1
 
         print("== Directed long text (chunk) + delivery_ack ==")
-        long_text = "LTXT-" + ("0123456789abcdef" * 65)
+        long_text = ("R1K-LTXT-" + ("0123456789abcdef" * 80))[:RELIABLE_1K_BYTES]
         long_raw = long_text.encode("utf-8")
         text_id = f"ltxt-{uuid.uuid4().hex[:8]}"
         chunk_size = 32
@@ -421,6 +460,7 @@ def main() -> int:
                 print(e)
             return 1
 
+        chunk_retry_total = 0
         for idx, offset in enumerate(range(0, len(long_raw), chunk_size)):
             chunk = long_raw[offset : offset + chunk_size]
             chunk_payload = {
@@ -458,6 +498,7 @@ def main() -> int:
                 return 1
             if retry_chunk > 0:
                 print(f"INFO: long_text_chunk retry index={idx} retry={retry_chunk}")
+            chunk_retry_total += max(0, int(retry_chunk))
 
         end_payload = {
             "type": "long_text_end",
@@ -529,18 +570,20 @@ def main() -> int:
             f"start_retry={retry_start} end_retry={retry_end}"
         )
 
-        print("== Directed ping ==")
+        print("== Directed ping_probe (1KB) ==")
         seq = 1
         ping_id = uuid.uuid4().hex[:8]
         start_idx = len(event_history)
         send_json(
             tx,
             {
+                "cmd": "ping_probe",
                 "type": "ping",
                 "via": "wifi",
                 "dst": ping_target.node_id,
                 "seq": seq,
                 "ping_id": ping_id,
+                "probe_bytes": 1000,
                 "ts_ms": now_ms(),
                 "src": "pc",
             },
@@ -555,13 +598,138 @@ def main() -> int:
                 and to_int(ev.get("seq", -1), -1) == seq
                 and str(ev.get("ping_id") or "") == ping_id
                 and str(ev.get("src") or "").strip() == str(ping_target.node_id)
+                and to_int(ev.get("probe_bytes", -1), -1) == RELIABLE_1K_BYTES
+                and bool(ev.get("probe_hash_ok"))
                 for ev in events[start_idx:]
             ),
         )
         if not ok_ping:
             print("NG: pong timeout")
             return 1
-        print("OK: pong received")
+        pong_event = next(
+            (
+                ev
+                for ev in reversed(event_history[start_idx:])
+                if ev.get("_port") == tx.port
+                and ev.get("type") == "pong"
+                and to_int(ev.get("seq", -1), -1) == seq
+                and str(ev.get("ping_id") or "") == ping_id
+                and str(ev.get("src") or "").strip() == str(ping_target.node_id)
+            ),
+            None,
+        )
+        ping_latency_ms = to_int((pong_event or {}).get("latency_ms", -1), -1)
+        if args.r1k_max_latency_ms > 0 and (ping_latency_ms < 0 or ping_latency_ms > args.r1k_max_latency_ms):
+            print(f"NG: reliable_1k latency too high latency_ms={ping_latency_ms} limit={args.r1k_max_latency_ms}")
+            return 1
+        packet_count = total_chunks + 2
+        retry_total = max(0, int(retry_start)) + chunk_retry_total + max(0, int(retry_end))
+        retry_rate = (float(retry_total) / float(packet_count)) if packet_count > 0 else 0.0
+        if args.r1k_max_retry_rate >= 0 and retry_rate > args.r1k_max_retry_rate:
+            print(
+                f"NG: reliable_1k retry_rate too high retry_rate={retry_rate:.3f} "
+                f"limit={args.r1k_max_retry_rate:.3f}"
+            )
+            return 1
+        print(f"OK: pong received latency={ping_latency_ms}ms retry_rate={retry_rate:.3f}")
+
+        if args.skip_r1k:
+            print("SKIP: Directed reliable_1k (FEC)")
+        else:
+            print("== Directed reliable_1k (FEC) ==")
+            reliable_text = ("R1K-FEC-" + ("0123456789abcdef" * 80))[:RELIABLE_1K_BYTES]
+            r1k_packets, r1k_meta = make_reliable_1k_messages(
+                text=reliable_text,
+                dst=directed_target.node_id,
+                ttl=max(1, min(255, 10)),
+                profile_id=int(args.r1k_profile),
+                require_ack=True,
+                interleave=True,
+            )
+            r1k_id = str(r1k_meta.get("r1k_id") or "")
+            if not r1k_id:
+                print("NG: reliable_1k missing session id")
+                return 1
+            r1k_retry_total = 0
+            for packet in r1k_packets:
+                packet_type = str(packet.get("type") or "")
+                expected_idx = to_int(packet.get("index", -1), -1)
+                ok_packet, retry_packet = send_with_delivery_retry(
+                    tx=tx,
+                    dst=directed_target,
+                    states=states,
+                    history=event_history,
+                    payload=packet,
+                    ack_timeout=args.ack_timeout,
+                    ack_retries=args.ack_retries,
+                    rx_match=lambda ev, expected_type=packet_type, expected_index=expected_idx: (
+                        ev.get("_port") == directed_target.port
+                        and str(ev.get("type") or "") == expected_type
+                        and str(ev.get("r1k_id") or "") == r1k_id
+                        and (
+                            expected_index < 0
+                            or to_int(ev.get("index", -1), -1) == expected_index
+                        )
+                    ),
+                )
+                if not ok_packet:
+                    print(f"NG: reliable_1k delivery_ack timeout type={packet_type} index={expected_idx}")
+                    for e in event_history[-25:]:
+                        print(e)
+                    return 1
+                r1k_retry_total += max(0, int(retry_packet))
+
+            shard_map_b64: dict[int, str] = {}
+            for ev in event_history:
+                if ev.get("_port") != directed_target.port:
+                    continue
+                typ = str(ev.get("type") or "")
+                if typ not in {"reliable_1k_chunk", "reliable_1k_repair"}:
+                    continue
+                if str(ev.get("r1k_id") or "") != r1k_id:
+                    continue
+                idx = to_int(ev.get("index", -1), -1)
+                data_b64 = ev.get("data_b64")
+                if idx < 0 or not isinstance(data_b64, str) or not data_b64:
+                    continue
+                shard_map_b64[idx] = data_b64
+
+            decoded = decode_reliable_1k_from_shards(
+                shard_map_b64=shard_map_b64,
+                profile_id=int(r1k_meta.get("profile_id") or 0),
+                original_size=int(r1k_meta.get("size") or 0),
+            )
+            if decoded is None:
+                print(
+                    f"NG: reliable_1k decode failed received_shards={len(shard_map_b64)} "
+                    f"required={int(r1k_meta.get('data_shards') or 0)}"
+                )
+                return 1
+            try:
+                decoded_text = decoded.decode("utf-8")
+            except UnicodeDecodeError:
+                print("NG: reliable_1k decode utf-8 failed")
+                return 1
+            if decoded_text != reliable_text:
+                print("NG: reliable_1k payload mismatch")
+                return 1
+            total_packet_count = len(r1k_packets)
+            r1k_retry_rate = (
+                float(r1k_retry_total) / float(total_packet_count)
+                if total_packet_count > 0
+                else 0.0
+            )
+            if args.r1k_max_retry_rate >= 0 and r1k_retry_rate > args.r1k_max_retry_rate:
+                print(
+                    f"NG: reliable_1k retry_rate too high retry_rate={r1k_retry_rate:.3f} "
+                    f"limit={args.r1k_max_retry_rate:.3f}"
+                )
+                return 1
+            print(
+                f"OK: reliable_1k delivered profile={r1k_meta.get('profile_name')} "
+                f"shards={len(shard_map_b64)}/{int(r1k_meta.get('total_shards') or 0)} "
+                f"retry_rate={r1k_retry_rate:.3f}"
+            )
 
         if args.skip_ble:
             print("SKIP: BLE short chat")

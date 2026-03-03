@@ -20,6 +20,14 @@ struct MeshStats {
   uint32_t reassemblyTimeouts = 0;
   uint32_t nodeInfoSent = 0;
   uint32_t nodeInfoReceived = 0;
+  uint32_t routeLookupHit = 0;
+  uint32_t routeLookupMiss = 0;
+  uint32_t routeLearned = 0;
+  uint32_t routeExpired = 0;
+  uint32_t routedUnicastAttempts = 0;
+  uint32_t routedUnicastSuccess = 0;
+  uint32_t routedUnicastFail = 0;
+  uint32_t routedFallbackFlood = 0;
 };
 
 struct NodeRecord {
@@ -32,6 +40,16 @@ struct NodeRecord {
   uint32_t freeHeap = 0;
   uint32_t remoteRxFrames = 0;
   uint32_t remoteTxFrames = 0;
+};
+
+struct RouteRecord {
+  uint32_t dstNodeId = 0;
+  uint32_t nextHopNodeId = 0;
+  uint32_t learnedMs = 0;
+  uint8_t hops = 0;
+  bool hasNextHopMac = false;
+  uint8_t nextHopMac[6]{};
+  uint16_t metricQ8 = 0;
 };
 
 }  // namespace lpwa

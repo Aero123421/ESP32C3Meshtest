@@ -9,7 +9,7 @@
   - 2.4GHz帯のみ使用
   - ノードは電池駆動またはUSB給電
   - 将来的なノード増加を想定
-  - 現行実装は `ESP-NOW flood + TTL + 重複排除 + 分割再構成` をデータ平面として採用
+  - 現行実装は `ESP-NOW Hybrid Mesh`（`next-hop unicast + flood fallback + TTL + 重複排除 + 分割再構成`）を採用
   - BLEは広告ベースの軽量テキスト中継（短文のみ）を採用
 
 ## 2. 設計方針
@@ -89,6 +89,42 @@
     - `LPWA_ENABLE_WIFI_LR`（0/1）
     - `LPWA_MESH_CHANNEL`（1..14）
     - `LPWA_MESH_TX_POWER_QDBM`（8..84）
+    - `LPWA_ROUTING_MODE`（0=floodのみ / 1=origin directed / 2=origin+relay directed）
+
+## 6.2 Phase2: 経路学習と次ホップ転送
+- Directed送信時は `RoutedFragment` を使用し、宛先ノードIDをフレームメタに付与する。
+- 各ノードは受信フレームから `origin -> next_hop` を学習し、経路表を保持する。
+- ルーティング指標は `hop + ETX + RSSI` の重み付き合成とし、ヒステリシスで経路フラップを抑制する。
+- 中継時の動作:
+  - ルート有り: 次ホップへ unicast 転送
+  - ルート無し/失敗: flood fallback
+- 安全策:
+  - 期限切れ経路の自動削除
+  - フラグメント整合チェック（`frag_count/index/chunk_len/total_len`）
+  - hopカウントとメトリック計算の飽和処理（オーバーフロー回避）
+
+補足:
+- JSONプロトコルの `dst` は `0xXXXXXXXX` 形式のみを有効とする。
+- 不正な `dst` は bridge が `invalid_field` を返し、暗黙Broadcastへはフォールバックしない。
+
+## 6.3 Phase3: 1KB高信頼転送（`reliable_1k`）
+- `reliable_1k_start/chunk/end` をWi-Fi directedで送信し、`delivery_ack` でE2E配達を確認する。
+- 受信側は `data_shards + parity_shards` のFECシャードから復元し、欠損時は `reliable_1k_nack` で不足indexを返す。
+- 送信側は `reliable_1k_repair` で不足シャードのみ再送し、復元完了時に `reliable_1k_result` を返してセッションを閉じる。
+- 互換運用:
+  - wire上は短縮型 (`r1k_s/r1k_d/r1k_e/r1k_n/r1k_r/r1k_o`) を利用
+  - PC/JSONイベントは正規型 (`reliable_1k_*`) として統一表示
+
+## 6.4 Phase4: 自動適応と観測
+- PC GUIは宛先ごとに `25+8` / `25+10` のprofileを自動調整する。
+  - 失敗/NACK増加/高再送率: 冗長を強化
+  - 連続安定時: 冗長を段階的に緩和
+- 統計は `ReliableStats` で一元集計する。
+  - 復元率
+  - 再送率
+  - 失敗理由トップ
+  - 使用profile
+- `mesh_trace` / `mesh_observed` で複数PCから同じ通信観測を共有し、トポロジと通信フローを同期表示する。
 
 ## 7. Wi-Fi/BLEメッシュの使い分け設計
 - Wi-Fiメッシュを優先する場面:

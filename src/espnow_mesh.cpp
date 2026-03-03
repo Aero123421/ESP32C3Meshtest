@@ -5,6 +5,7 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 
+#include <cstdlib>
 #include <cstring>
 
 namespace lpwa {
@@ -37,6 +38,8 @@ EspNowMesh* EspNowMesh::instance_ = nullptr;
 
 EspNowMesh::EspNowMesh() {
   std::memset(nodes_, 0, sizeof(nodes_));
+  std::memset(neighbors_, 0, sizeof(neighbors_));
+  std::memset(routes_, 0, sizeof(routes_));
   std::memset(inboundQueue_, 0, sizeof(inboundQueue_));
 }
 
@@ -60,6 +63,8 @@ bool EspNowMesh::begin() {
   duplicateFilter_.clear();
   parseRejectFilter_.clear();
   nodeCount_ = 0;
+  std::memset(neighbors_, 0, sizeof(neighbors_));
+  std::memset(routes_, 0, sizeof(routes_));
   inboundHead_ = 0;
   inboundTail_ = 0;
   inboundCount_ = 0;
@@ -189,6 +194,23 @@ bool EspNowMesh::sendBinary(const uint8_t* payload, size_t len, uint8_t ttl, uin
   return sendPayload(AppPayloadType::Binary, payload, len, ttl, outMessageId);
 }
 
+bool EspNowMesh::sendTextDirected(const char* text, uint32_t dstNodeId, uint8_t ttl, uint32_t* outMessageId) {
+  if (text == nullptr) {
+    return false;
+  }
+  const size_t len = std::strlen(text);
+  return sendPayloadDirected(AppPayloadType::Text, reinterpret_cast<const uint8_t*>(text), len, dstNodeId,
+                             ttl, outMessageId);
+}
+
+bool EspNowMesh::sendBinaryDirected(const uint8_t* payload, size_t len, uint32_t dstNodeId, uint8_t ttl,
+                                    uint32_t* outMessageId) {
+  if (len > 0 && payload == nullptr) {
+    return false;
+  }
+  return sendPayloadDirected(AppPayloadType::Binary, payload, len, dstNodeId, ttl, outMessageId);
+}
+
 bool EspNowMesh::popReceivedMessage(ReassembledMessage* outMessage) {
   if (outMessage == nullptr || inboundCount_ == 0) {
     return false;
@@ -218,6 +240,37 @@ size_t EspNowMesh::copyNodeRecords(NodeRecord* outRecords, size_t maxRecords) co
   return count;
 }
 
+size_t EspNowMesh::copyRouteRecords(RouteRecord* outRecords, size_t maxRecords) const {
+  if (outRecords == nullptr || maxRecords == 0) {
+    return 0;
+  }
+  size_t count = 0;
+  const uint32_t nowMs = millis();
+  for (size_t i = 0; i < kMaxRouteEntries && count < maxRecords; ++i) {
+    const RouteEntry& route = routes_[i];
+    if (!route.used || route.dstNodeId == 0) {
+      continue;
+    }
+    const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
+    if (std::memcmp(route.nextHopMac, zeroMac, 6) == 0) {
+      continue;
+    }
+    if ((nowMs - route.learnedMs) > kRouteExpireMs) {
+      continue;
+    }
+    RouteRecord rec{};
+    rec.dstNodeId = route.dstNodeId;
+    rec.nextHopNodeId = route.nextHopNodeId;
+    rec.learnedMs = route.learnedMs;
+    rec.hops = route.hops;
+    rec.metricQ8 = route.metricQ8;
+    rec.hasNextHopMac = true;
+    std::memcpy(rec.nextHopMac, route.nextHopMac, sizeof(rec.nextHopMac));
+    outRecords[count++] = rec;
+  }
+  return count;
+}
+
 bool EspNowMesh::resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) const {
   if (outNodeId != nullptr) {
     *outNodeId = 0;
@@ -241,9 +294,8 @@ bool EspNowMesh::resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) con
 }
 
 void EspNowMesh::onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
-  (void)mac_addr;
   if (instance_ != nullptr) {
-    instance_->onSend(status);
+    instance_->onSend(mac_addr, status);
   }
 }
 
@@ -272,15 +324,51 @@ void EspNowMesh::onRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int 
 }
 #endif
 
-void EspNowMesh::onSend(esp_now_send_status_t status) {
+void EspNowMesh::onSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
   if (status == ESP_NOW_SEND_SUCCESS) {
     stats_.txSuccess++;
   } else {
     stats_.txFailed++;
   }
+  if (mac_addr == nullptr || std::memcmp(mac_addr, kBroadcastMac, 6) == 0) {
+    return;
+  }
+  NeighborEntry* neighbor = upsertNeighbor(mac_addr);
+  if (neighbor == nullptr) {
+    return;
+  }
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    if (neighbor->txOk < 0xFFFF) {
+      neighbor->txOk++;
+    }
+  } else {
+    if (neighbor->txFail < 0xFFFF) {
+      neighbor->txFail++;
+    }
+  }
+  const uint32_t total = static_cast<uint32_t>(neighbor->txOk) + static_cast<uint32_t>(neighbor->txFail);
+  if (total > 0) {
+    const uint16_t instantEtxQ8 = static_cast<uint16_t>((static_cast<uint32_t>(neighbor->txFail) * 256U) / total);
+    const int32_t blended = static_cast<int32_t>(neighbor->etxQ8) * 7 + static_cast<int32_t>(instantEtxQ8);
+    neighbor->etxQ8 = static_cast<uint16_t>((blended + 4) / 8);
+  }
 }
 
 void EspNowMesh::onRecv(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len) {
+  if (mac_addr != nullptr) {
+    (void)ensurePeerForMac(mac_addr);
+    NeighborEntry* neighbor = upsertNeighbor(mac_addr);
+    if (neighbor != nullptr) {
+      neighbor->lastSeenMs = millis();
+      const int16_t sampleQ8 = static_cast<int16_t>(static_cast<int16_t>(rssi) << 8);
+      if (neighbor->rssiEwmaQ8 == 0) {
+        neighbor->rssiEwmaQ8 = sampleQ8;
+      } else {
+        neighbor->rssiEwmaQ8 =
+            static_cast<int16_t>((static_cast<int32_t>(neighbor->rssiEwmaQ8) * 7 + sampleQ8 + 4) / 8);
+      }
+    }
+  }
   if (!enqueueRx(mac_addr, rssi, data, len)) {
     stats_.rxQueueDropped++;
   }
@@ -328,6 +416,9 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
     return;
   }
 
+  const uint32_t nowMs = millis();
+  pruneRoutingTables(nowMs);
+
   DuplicateKey dedupKey{};
   dedupKey.originId = header.originId;
   dedupKey.messageId = header.messageId;
@@ -341,9 +432,16 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
     FragmentMeta fragmentMeta{};
     std::memcpy(&fragmentMeta, body, sizeof(fragmentMeta));
     dedupKey.fragmentIndex = fragmentMeta.fragIndex;
+  } else if (header.type == static_cast<uint8_t>(FrameType::RoutedFragment)) {
+    if (bodyLen < (sizeof(RoutedFragmentMeta) + sizeof(FragmentMeta))) {
+      stats_.rxParseErrors++;
+      return;
+    }
+    FragmentMeta fragmentMeta{};
+    std::memcpy(&fragmentMeta, body + sizeof(RoutedFragmentMeta), sizeof(fragmentMeta));
+    dedupKey.fragmentIndex = fragmentMeta.fragIndex;
   }
 
-  const uint32_t nowMs = millis();
   if (duplicateFilter_.seen(dedupKey, nowMs, kDuplicateWindowMs)) {
     stats_.droppedDuplicates++;
     return;
@@ -360,8 +458,14 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   }
 
   bool parsedAndAccepted = false;
+  bool routedFrame = false;
+  RoutedFragmentMeta routedMeta{};
   if (header.type == static_cast<uint8_t>(FrameType::Fragment)) {
     parsedAndAccepted = handleFragmentFrame(header, body, bodyLen, item.rssi, item.senderMac, nowMs);
+  } else if (header.type == static_cast<uint8_t>(FrameType::RoutedFragment)) {
+    routedFrame = true;
+    parsedAndAccepted =
+        handleRoutedFragmentFrame(header, body, bodyLen, item.rssi, item.senderMac, nowMs, &routedMeta);
   } else if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
     parsedAndAccepted = handleNodeInfoFrame(header, body, bodyLen, item.rssi, nowMs);
   } else {
@@ -374,39 +478,81 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
     return;
   }
   duplicateFilter_.remember(dedupKey, nowMs);
+  learnRouteFromFrame(header.originId, item.senderMac, header.hops, item.rssi, nowMs);
 
-  if (header.ttl > 1) {
-    uint8_t forwardBuffer[kEspNowMaxPayload];
-    if (item.len <= sizeof(forwardBuffer)) {
-      std::memcpy(forwardBuffer, item.data, item.len);
-      MeshFrameHeader* forwardHeader = reinterpret_cast<MeshFrameHeader*>(forwardBuffer);
-      forwardHeader->ttl = static_cast<uint8_t>(forwardHeader->ttl - 1);
-      forwardHeader->hops = static_cast<uint8_t>(forwardHeader->hops + 1);
-      uint8_t attempts = 1;
-      if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
-        attempts = kForwardSendAttemptsNodeInfo;
-      } else {
-        attempts = kForwardSendAttemptsFragment;
-      }
-      if (attempts == 0) {
-        attempts = 1;
-      }
-      bool forwarded = false;
+  const bool terminalRoutedToSelf = routedFrame && routedMeta.dstNodeId == nodeId_;
+  if (header.ttl <= 1) {
+    if (!terminalRoutedToSelf) {
+      stats_.droppedTtl++;
+    }
+    return;
+  }
+
+  if (terminalRoutedToSelf) {
+    return;
+  }
+
+  if (item.len > kEspNowMaxPayload) {
+    return;
+  }
+
+  uint8_t forwardBuffer[kEspNowMaxPayload];
+  std::memcpy(forwardBuffer, item.data, item.len);
+  MeshFrameHeader* forwardHeader = reinterpret_cast<MeshFrameHeader*>(forwardBuffer);
+  forwardHeader->ttl = static_cast<uint8_t>(forwardHeader->ttl - 1);
+  if (forwardHeader->hops < 0xFF) {
+    forwardHeader->hops = static_cast<uint8_t>(forwardHeader->hops + 1);
+  }
+
+  uint8_t attempts = 1;
+  if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
+    attempts = kForwardSendAttemptsNodeInfo;
+  } else {
+    attempts = kForwardSendAttemptsFragment;
+  }
+  if (attempts == 0) {
+    attempts = 1;
+  }
+
+  bool forwarded = false;
+  if (routedFrame && routedMeta.dstNodeId != 0 && routedMeta.dstNodeId != nodeId_ && LPWA_ROUTING_MODE >= 2) {
+    RouteEntry route{};
+    if (selectRoute(routedMeta.dstNodeId, &route)) {
+      stats_.routeLookupHit++;
       for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
-        if (sendRaw(forwardBuffer, item.len)) {
+        stats_.routedUnicastAttempts++;
+        if (sendRawUnicast(route.nextHopMac, forwardBuffer, item.len)) {
+          stats_.routedUnicastSuccess++;
           forwarded = true;
           break;
         }
+        stats_.routedUnicastFail++;
         if ((attempt + 1) < attempts) {
           delayRandomRange(kForwardJitterMinMs, kForwardJitterMaxMs);
         }
       }
-      if (forwarded) {
-        stats_.forwardedFrames++;
+    } else {
+      stats_.routeLookupMiss++;
+    }
+    if (!forwarded) {
+      stats_.routedFallbackFlood++;
+    }
+  }
+
+  if (!forwarded && !(routedFrame && routedMeta.dstNodeId == nodeId_)) {
+    for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+      if (sendRawBroadcast(forwardBuffer, item.len)) {
+        forwarded = true;
+        break;
+      }
+      if ((attempt + 1) < attempts) {
+        delayRandomRange(kForwardJitterMinMs, kForwardJitterMaxMs);
       }
     }
-  } else {
-    stats_.droppedTtl++;
+  }
+
+  if (forwarded) {
+    stats_.forwardedFrames++;
   }
 }
 
@@ -424,7 +570,8 @@ bool EspNowMesh::parseHeader(const uint8_t* data, size_t len, MeshFrameHeader* o
     return false;
   }
   if (outHeader->type != static_cast<uint8_t>(FrameType::Fragment) &&
-      outHeader->type != static_cast<uint8_t>(FrameType::NodeInfo)) {
+      outHeader->type != static_cast<uint8_t>(FrameType::NodeInfo) &&
+      outHeader->type != static_cast<uint8_t>(FrameType::RoutedFragment)) {
     return false;
   }
 
@@ -470,6 +617,45 @@ bool EspNowMesh::handleFragmentFrame(const MeshFrameHeader& header, const uint8_
     stats_.rxQueueDropped++;
   }
   return true;
+}
+
+bool EspNowMesh::handleRoutedFragmentFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
+                                           int8_t rssi, const uint8_t* senderMac, uint32_t nowMs,
+                                           RoutedFragmentMeta* outRouteMeta) {
+  if (body == nullptr || bodyLen < (sizeof(RoutedFragmentMeta) + sizeof(FragmentMeta))) {
+    stats_.rxParseErrors++;
+    return false;
+  }
+
+  RoutedFragmentMeta routeMeta{};
+  std::memcpy(&routeMeta, body, sizeof(routeMeta));
+  if (outRouteMeta != nullptr) {
+    *outRouteMeta = routeMeta;
+  }
+
+  FragmentMeta fragmentMeta{};
+  std::memcpy(&fragmentMeta, body + sizeof(RoutedFragmentMeta), sizeof(fragmentMeta));
+  if (fragmentMeta.fragCount == 0 || fragmentMeta.fragIndex >= fragmentMeta.fragCount) {
+    stats_.rxParseErrors++;
+    return false;
+  }
+  const size_t expectedBodyLen =
+      sizeof(RoutedFragmentMeta) + sizeof(FragmentMeta) + static_cast<size_t>(fragmentMeta.chunkLen);
+  if (expectedBodyLen != bodyLen) {
+    stats_.rxParseErrors++;
+    return false;
+  }
+  if (fragmentMeta.totalLen > kMaxAppPayload) {
+    stats_.rxParseErrors++;
+    return false;
+  }
+
+  if (routeMeta.dstNodeId != 0 && routeMeta.dstNodeId != nodeId_) {
+    // relay-only path
+    return true;
+  }
+  return handleFragmentFrame(header, body + sizeof(RoutedFragmentMeta),
+                             bodyLen - sizeof(RoutedFragmentMeta), rssi, senderMac, nowMs);
 }
 
 bool EspNowMesh::handleNodeInfoFrame(const MeshFrameHeader& header, const uint8_t* body, size_t bodyLen,
@@ -586,7 +772,128 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
 
     bool sentAny = false;
     for (uint8_t attempt = 0; attempt < kOriginFrameRepeatCount; ++attempt) {
-      if (sendRaw(frame, frameLen)) {
+      if (sendRawBroadcast(frame, frameLen)) {
+        sentAny = true;
+      }
+      if ((attempt + 1) < kOriginFrameRepeatCount) {
+        delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
+      }
+    }
+    if (!sentAny) {
+      return false;
+    }
+    if ((index + 1) < fragmentCount) {
+      delayRandomRange(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
+    }
+  }
+
+  if (outMessageId != nullptr) {
+    *outMessageId = messageId;
+  }
+  return true;
+}
+
+bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* payload, size_t len,
+                                     uint32_t dstNodeId, uint8_t ttl, uint32_t* outMessageId) {
+  if (dstNodeId == 0 || dstNodeId == nodeId_) {
+    return sendPayload(payloadType, payload, len, ttl, outMessageId);
+  }
+  if (LPWA_ROUTING_MODE <= 0) {
+    return sendPayload(payloadType, payload, len, ttl, outMessageId);
+  }
+  if (len > kMaxAppPayload) {
+    return false;
+  }
+  if (len > 0 && payload == nullptr) {
+    return false;
+  }
+  if (ttl == 0) {
+    ttl = 1;
+  }
+
+  const uint8_t fragmentCount = Fragmenter::CalculateFragmentCount(len);
+  if (fragmentCount == 0) {
+    return false;
+  }
+
+  const uint32_t messageId = nextMessageId();
+  for (uint8_t index = 0; index < fragmentCount; ++index) {
+    const uint8_t* chunkPtr = nullptr;
+    uint16_t chunkLen = 0;
+    if (!Fragmenter::GetFragmentSlice(payload, len, index, &chunkPtr, &chunkLen)) {
+      return false;
+    }
+
+    MeshFrameHeader header{};
+    header.magic = kMeshMagic;
+    header.version = kMeshVersion;
+    header.type = static_cast<uint8_t>(FrameType::RoutedFragment);
+    header.originId = nodeId_;
+    header.messageId = messageId;
+    header.ttl = ttl;
+    header.hops = 0;
+
+    RoutedFragmentMeta routeMeta{};
+    routeMeta.dstNodeId = dstNodeId;
+
+    FragmentMeta fragmentMeta{};
+    fragmentMeta.appType = static_cast<uint8_t>(payloadType);
+    fragmentMeta.fragIndex = index;
+    fragmentMeta.fragCount = fragmentCount;
+    fragmentMeta.totalLen = static_cast<uint16_t>(len);
+    fragmentMeta.chunkLen = chunkLen;
+
+    const size_t frameLen = sizeof(MeshFrameHeader) + sizeof(RoutedFragmentMeta) + sizeof(FragmentMeta) + chunkLen;
+    if (frameLen > kEspNowMaxPayload) {
+      return false;
+    }
+
+    uint8_t frame[kEspNowMaxPayload];
+    uint8_t* ptr = frame;
+    std::memcpy(ptr, &header, sizeof(header));
+    ptr += sizeof(header);
+    std::memcpy(ptr, &routeMeta, sizeof(routeMeta));
+    ptr += sizeof(routeMeta);
+    std::memcpy(ptr, &fragmentMeta, sizeof(fragmentMeta));
+    ptr += sizeof(fragmentMeta);
+    if (chunkLen > 0) {
+      std::memcpy(ptr, chunkPtr, chunkLen);
+    }
+
+    DuplicateKey localFrameKey{};
+    localFrameKey.originId = nodeId_;
+    localFrameKey.messageId = messageId;
+    localFrameKey.frameType = static_cast<uint8_t>(FrameType::RoutedFragment);
+    localFrameKey.fragmentIndex = index;
+    duplicateFilter_.seenAndRemember(localFrameKey, millis(), kDuplicateWindowMs);
+
+    bool sentAny = false;
+    RouteEntry route{};
+    const bool hasRoute = selectRoute(dstNodeId, &route);
+    if (hasRoute) {
+      stats_.routeLookupHit++;
+    } else {
+      stats_.routeLookupMiss++;
+    }
+
+    for (uint8_t attempt = 0; attempt < kOriginFrameRepeatCount; ++attempt) {
+      bool sentThis = false;
+      if (hasRoute) {
+        stats_.routedUnicastAttempts++;
+        if (sendRawUnicast(route.nextHopMac, frame, frameLen)) {
+          stats_.routedUnicastSuccess++;
+          sentThis = true;
+        } else {
+          stats_.routedUnicastFail++;
+        }
+      }
+      if (!sentThis) {
+        if (attempt == 0) {
+          stats_.routedFallbackFlood++;
+        }
+        sentThis = sendRawBroadcast(frame, frameLen);
+      }
+      if (sentThis) {
         sentAny = true;
       }
       if ((attempt + 1) < kOriginFrameRepeatCount) {
@@ -659,14 +966,31 @@ bool EspNowMesh::sendNodeInfo(uint8_t ttl) {
   localFrameKey.fragmentIndex = 0xFF;
   duplicateFilter_.seenAndRemember(localFrameKey, millis(), kDuplicateWindowMs);
 
-  if (!sendRaw(frame, frameLen)) {
+  if (!sendRawBroadcast(frame, frameLen)) {
     return false;
   }
   stats_.nodeInfoSent++;
   return true;
 }
 
-bool EspNowMesh::sendRaw(const uint8_t* data, size_t len) {
+bool EspNowMesh::sendRawBroadcast(const uint8_t* data, size_t len) {
+  return sendRawTo(kBroadcastMac, data, len);
+}
+
+bool EspNowMesh::sendRawUnicast(const uint8_t* mac, const uint8_t* data, size_t len) {
+  if (mac == nullptr) {
+    return false;
+  }
+  if (!ensurePeerForMac(mac)) {
+    return false;
+  }
+  return sendRawTo(mac, data, len);
+}
+
+bool EspNowMesh::sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len) {
+  if (mac == nullptr) {
+    return false;
+  }
   if (data == nullptr || len == 0 || len > kEspNowMaxPayload) {
     return false;
   }
@@ -675,7 +999,7 @@ bool EspNowMesh::sendRaw(const uint8_t* data, size_t len) {
   const uint8_t maxAttempts = static_cast<uint8_t>(kSendRawNoMemRetries + 1U);
   esp_err_t result = ESP_FAIL;
   for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
-    result = esp_now_send(kBroadcastMac, data, len);
+    result = esp_now_send(mac, data, len);
     if (result == ESP_OK) {
       return true;
     }
@@ -690,6 +1014,285 @@ bool EspNowMesh::sendRaw(const uint8_t* data, size_t len) {
   }
   stats_.txFailed++;
   return false;
+}
+
+bool EspNowMesh::ensurePeerForMac(const uint8_t* mac) {
+  if (mac == nullptr) {
+    return false;
+  }
+  if (std::memcmp(mac, kBroadcastMac, 6) == 0) {
+    return true;
+  }
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+  esp_now_peer_info_t peerInfo{};
+  std::memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = kMeshChannel;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  const esp_err_t add = esp_now_add_peer(&peerInfo);
+  return add == ESP_OK || add == ESP_ERR_ESPNOW_EXIST;
+}
+
+void EspNowMesh::pruneRoutingTables(uint32_t nowMs) {
+  for (size_t i = 0; i < kMaxNeighborNodes; ++i) {
+    NeighborEntry& n = neighbors_[i];
+    if (!n.used) {
+      continue;
+    }
+    if ((nowMs - n.lastSeenMs) > kNeighborExpireMs) {
+      n = NeighborEntry{};
+    }
+  }
+  for (size_t i = 0; i < kMaxRouteEntries; ++i) {
+    RouteEntry& r = routes_[i];
+    if (!r.used) {
+      continue;
+    }
+    if ((nowMs - r.learnedMs) > kRouteExpireMs) {
+      r = RouteEntry{};
+      stats_.routeExpired++;
+    }
+  }
+}
+
+void EspNowMesh::learnRouteFromFrame(uint32_t originId, const uint8_t* senderMac, uint8_t hops, int8_t rssi,
+                                     uint32_t nowMs) {
+  if (originId == 0 || originId == nodeId_ || senderMac == nullptr) {
+    return;
+  }
+
+  NeighborEntry* neighbor = upsertNeighbor(senderMac);
+  if (neighbor == nullptr) {
+    return;
+  }
+  neighbor->lastSeenMs = nowMs;
+  const int16_t sampleQ8 = static_cast<int16_t>(static_cast<int16_t>(rssi) << 8);
+  if (neighbor->rssiEwmaQ8 == 0) {
+    neighbor->rssiEwmaQ8 = sampleQ8;
+  } else {
+    neighbor->rssiEwmaQ8 =
+        static_cast<int16_t>((static_cast<int32_t>(neighbor->rssiEwmaQ8) * 7 + sampleQ8 + 4) / 8);
+  }
+
+  const uint8_t routeHops = (hops >= 0xFE) ? 0xFF : static_cast<uint8_t>(hops + 1);
+  const uint16_t metricQ8 = computeRouteMetricQ8(neighbor, routeHops, rssi);
+  RouteEntry* route = upsertRoute(originId);
+  if (route == nullptr) {
+    return;
+  }
+
+  const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
+  const bool empty =
+      !route->used || route->dstNodeId == 0 || std::memcmp(route->nextHopMac, zeroMac, 6) == 0;
+  bool better = empty;
+  if (!better) {
+    if ((nowMs - route->learnedMs) > kRouteExpireMs) {
+      better = true;
+    } else if (std::memcmp(route->nextHopMac, senderMac, 6) == 0) {
+      better = true;
+    } else {
+      const uint32_t old = route->metricQ8;
+      const uint32_t now = metricQ8;
+      better = (now + kRouteHysteresisQ8) < old;
+    }
+  }
+  if (!better) {
+    return;
+  }
+
+  uint32_t nextHopNodeId = 0;
+  (void)resolveNodeIdByMac(senderMac, &nextHopNodeId);
+
+  const bool changed =
+      empty || std::memcmp(route->nextHopMac, senderMac, 6) != 0 || route->hops != routeHops ||
+      route->metricQ8 != metricQ8 || route->nextHopNodeId != nextHopNodeId;
+
+  route->used = true;
+  route->dstNodeId = originId;
+  std::memcpy(route->nextHopMac, senderMac, 6);
+  route->learnedMs = nowMs;
+  route->hops = routeHops;
+  route->metricQ8 = metricQ8;
+  route->nextHopNodeId = nextHopNodeId;
+  if (changed) {
+    stats_.routeLearned++;
+  }
+}
+
+bool EspNowMesh::selectRoute(uint32_t dstNodeId, RouteEntry* outRoute) {
+  if (outRoute != nullptr) {
+    *outRoute = RouteEntry{};
+  }
+  if (dstNodeId == 0 || dstNodeId == nodeId_) {
+    return false;
+  }
+  RouteEntry* route = findRoute(dstNodeId);
+  if (route == nullptr || !route->used) {
+    return false;
+  }
+  const uint32_t nowMs = millis();
+  if ((nowMs - route->learnedMs) > kRouteExpireMs) {
+    route->used = false;
+    route->dstNodeId = 0;
+    stats_.routeExpired++;
+    return false;
+  }
+  const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
+  if (std::memcmp(route->nextHopMac, zeroMac, 6) == 0) {
+    route->used = false;
+    route->dstNodeId = 0;
+    return false;
+  }
+  if (outRoute != nullptr) {
+    *outRoute = *route;
+  }
+  return true;
+}
+
+bool EspNowMesh::lookupNodeMac(uint32_t nodeId, uint8_t* outMac) const {
+  if (outMac != nullptr) {
+    std::memset(outMac, 0, 6);
+  }
+  if (nodeId == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < nodeCount_; ++i) {
+    if (nodes_[i].nodeId != nodeId || !nodes_[i].hasMac) {
+      continue;
+    }
+    if (outMac != nullptr) {
+      std::memcpy(outMac, nodes_[i].staMac, 6);
+    }
+    return true;
+  }
+  return false;
+}
+
+EspNowMesh::NeighborEntry* EspNowMesh::findNeighbor(const uint8_t* mac) {
+  if (mac == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < kMaxNeighborNodes; ++i) {
+    if (!neighbors_[i].used) {
+      continue;
+    }
+    if (std::memcmp(neighbors_[i].mac, mac, 6) == 0) {
+      return &neighbors_[i];
+    }
+  }
+  return nullptr;
+}
+
+EspNowMesh::NeighborEntry* EspNowMesh::upsertNeighbor(const uint8_t* mac) {
+  if (mac == nullptr) {
+    return nullptr;
+  }
+  NeighborEntry* existing = findNeighbor(mac);
+  if (existing != nullptr) {
+    return existing;
+  }
+  size_t target = kMaxNeighborNodes;
+  uint32_t oldest = 0;
+  const uint32_t nowMs = millis();
+  for (size_t i = 0; i < kMaxNeighborNodes; ++i) {
+    if (!neighbors_[i].used) {
+      target = i;
+      break;
+    }
+    const uint32_t age = nowMs - neighbors_[i].lastSeenMs;
+    if (target == kMaxNeighborNodes || age > oldest) {
+      oldest = age;
+      target = i;
+    }
+  }
+  if (target >= kMaxNeighborNodes) {
+    return nullptr;
+  }
+  neighbors_[target] = NeighborEntry{};
+  neighbors_[target].used = true;
+  neighbors_[target].lastSeenMs = nowMs;
+  neighbors_[target].etxQ8 = 256;
+  std::memcpy(neighbors_[target].mac, mac, 6);
+  return &neighbors_[target];
+}
+
+EspNowMesh::RouteEntry* EspNowMesh::findRoute(uint32_t dstNodeId) {
+  for (size_t i = 0; i < kMaxRouteEntries; ++i) {
+    if (!routes_[i].used) {
+      continue;
+    }
+    if (routes_[i].dstNodeId == dstNodeId) {
+      return &routes_[i];
+    }
+  }
+  return nullptr;
+}
+
+EspNowMesh::RouteEntry* EspNowMesh::upsertRoute(uint32_t dstNodeId) {
+  if (dstNodeId == 0 || dstNodeId == nodeId_) {
+    return nullptr;
+  }
+  RouteEntry* existing = findRoute(dstNodeId);
+  if (existing != nullptr) {
+    return existing;
+  }
+
+  size_t target = kMaxRouteEntries;
+  uint32_t oldest = 0;
+  const uint32_t nowMs = millis();
+  for (size_t i = 0; i < kMaxRouteEntries; ++i) {
+    if (!routes_[i].used) {
+      target = i;
+      break;
+    }
+    const uint32_t age = nowMs - routes_[i].learnedMs;
+    if (target == kMaxRouteEntries || age > oldest) {
+      oldest = age;
+      target = i;
+    }
+  }
+  if (target >= kMaxRouteEntries) {
+    return nullptr;
+  }
+  routes_[target] = RouteEntry{};
+  routes_[target].used = true;
+  routes_[target].dstNodeId = dstNodeId;
+  routes_[target].learnedMs = nowMs;
+  return &routes_[target];
+}
+
+uint16_t EspNowMesh::computeRouteMetricQ8(const NeighborEntry* neighbor, uint8_t hops, int8_t rssi) const {
+  const uint16_t etxQ8 = (neighbor != nullptr) ? neighbor->etxQ8 : static_cast<uint16_t>(256);
+  const uint32_t hopTerm = static_cast<uint32_t>(hops) * static_cast<uint32_t>(kMetricWeightHopQ8) * 8U;
+  const uint32_t etxTerm = (static_cast<uint32_t>(etxQ8) * static_cast<uint32_t>(kMetricWeightEtxQ8)) / 16U;
+  const int16_t rssiAbs = static_cast<int16_t>(-rssi);
+  const uint32_t rssiTerm =
+      (static_cast<uint32_t>((rssiAbs > 0) ? rssiAbs : 0) * static_cast<uint32_t>(kMetricWeightRssiQ8)) / 2U;
+  const uint32_t total = hopTerm + etxTerm + rssiTerm;
+  if (total > 0xFFFFU) {
+    return 0xFFFFU;
+  }
+  return static_cast<uint16_t>(total);
+}
+
+bool EspNowMesh::parseNodeIdString(const char* nodeIdText, uint32_t* outNodeId) {
+  if (outNodeId != nullptr) {
+    *outNodeId = 0;
+  }
+  if (nodeIdText == nullptr || nodeIdText[0] == '\0') {
+    return false;
+  }
+  char* endPtr = nullptr;
+  const unsigned long parsed = std::strtoul(nodeIdText, &endPtr, 0);
+  if (endPtr == nodeIdText || (endPtr != nullptr && *endPtr != '\0') || parsed == 0UL) {
+    return false;
+  }
+  if (outNodeId != nullptr) {
+    *outNodeId = static_cast<uint32_t>(parsed);
+  }
+  return true;
 }
 
 bool EspNowMesh::queueInbound(const ReassembledMessage& message) {
