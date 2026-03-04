@@ -45,7 +45,7 @@ class SerialWorker:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tx_dropped = 0
-        self._tx_batch_per_tick = 4
+        self._tx_batch_per_tick = 2
         self._worker_id = f"sw-{time.time_ns()}-{id(self)}"
 
     @property

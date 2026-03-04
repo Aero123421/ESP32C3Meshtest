@@ -61,6 +61,8 @@ LOG_TAGS = ("INFO", "WARN", "ERROR", "TX", "RX", "SYSTEM")
 LOG_PREVIEW_MAX = 220
 E2E_ACK_TIMEOUT_MS = 2200
 E2E_ACK_MAX_RETRIES = 4
+E2E_RETRY_JITTER_MS = 260
+E2E_MAX_RETRY_SENDS_PER_TICK = 6
 E2E_RX_DEDUP_WINDOW_MS = 60000
 LONG_TEXT_RX_DEDUP_WINDOW_MS = 120000
 LONG_TEXT_AUTO_SPLIT_BYTES = 700
@@ -1325,9 +1327,13 @@ class LPWAApp(tk.Tk):
 
         now = self._now_ms()
         stats_dirty = False
+        retry_sent_this_tick = 0
         for e2e_id, entry in list(self.pending_e2e.items()):
             last_send_ms = int(entry.get("last_send_ms") or 0)
-            if (now - last_send_ms) < E2E_ACK_TIMEOUT_MS:
+            jitter_ms = abs(hash(e2e_id)) % E2E_RETRY_JITTER_MS if E2E_RETRY_JITTER_MS > 0 else 0
+            if (now - last_send_ms) < (E2E_ACK_TIMEOUT_MS + jitter_ms):
+                continue
+            if retry_sent_this_tick >= E2E_MAX_RETRY_SENDS_PER_TICK:
                 continue
 
             attempt = int(entry.get("attempt") or 0)
@@ -1360,6 +1366,7 @@ class LPWAApp(tk.Tk):
                     level="WARN",
                     category="E2E",
                 )
+                retry_sent_this_tick += 1
                 continue
             entry["payload"] = payload
             entry["attempt"] = attempt
@@ -1380,6 +1387,7 @@ class LPWAApp(tk.Tk):
                 level="WARN",
                 category="E2E",
             )
+            retry_sent_this_tick += 1
         if stats_dirty:
             self.update_stats_view()
 
@@ -3747,6 +3755,26 @@ class LPWAApp(tk.Tk):
         if mode != "reliable_1k":
             messagebox.showwarning("モード不一致", "Reliable送信には mode=reliable_1k を選択してください。")
             return
+        if self.continuous_after_id is not None:
+            messagebox.showwarning("実行中", "連続Ping実行中は Reliable 送信できません。先に停止してください。")
+            return
+        now_guard = self._now_ms()
+        active_sessions = [
+            r1k_id
+            for r1k_id, session in self.reliable_tx_sessions.items()
+            if int(session.get("result_deadline_ms") or 0) > now_guard
+        ]
+        if active_sessions:
+            messagebox.showwarning(
+                "送信中",
+                f"Reliable 送信は1セッションずつ実行してください。未完了: {len(active_sessions)}件",
+            )
+            self.append_log(
+                f"reliable_1k send blocked: pending_sessions={len(active_sessions)}",
+                level="WARN",
+                category="R1K",
+            )
+            return
         try:
             dst = self._normalize_target(self.ping_target_var.get(), context="Reliable宛先", show_error=True)
         except ValueError:
@@ -3807,6 +3835,8 @@ class LPWAApp(tk.Tk):
                 max_q = max(1, int(worker.tx_queue_max))
                 if int(worker.tx_queue_size) >= int(max_q * 0.80):
                     time.sleep(0.003)
+                if int(worker.tx_queue_size) >= int(max_q * 0.50):
+                    time.sleep(0.006)
             if not self.send_json(payload):
                 self.reliable_tx_sessions.pop(session_id, None)
                 self.reliable_stats.register_failure("tx_enqueue_failed")
@@ -3819,8 +3849,22 @@ class LPWAApp(tk.Tk):
                 return
             if payload.get("need_ack"):
                 self._register_pending_e2e(payload)
+            # 送信バーストを避けて FW 側の JSON parse 崩れを防ぐ。
+            time.sleep(0.004)
 
-        probe_sent = self.send_ping()
+        probe_sent = False
+        if worker is not None and worker.is_running:
+            max_q = max(1, int(worker.tx_queue_max))
+            if int(worker.tx_queue_size) < int(max_q * 0.25) and len(self.pending_e2e) <= 8:
+                probe_sent = self.send_ping()
+            else:
+                self.append_log(
+                    "reliable_1k: queue/pending高負荷のため probe をスキップ",
+                    level="WARN",
+                    category="R1K",
+                )
+        else:
+            probe_sent = self.send_ping()
         if probe_sent:
             self.reliable_tx_sessions[session_id]["ping_seq"] = self.ping_seq
         self.append_log(
