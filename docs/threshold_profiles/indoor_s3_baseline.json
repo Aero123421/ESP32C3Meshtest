@@ -1,0 +1,12 @@
+{
+  "min_success_rate": 0.5,
+  "max_latency_ms": 2500,
+  "max_latency_p95_ms": 2200,
+  "max_retry_rate": 0.6,
+  "max_rx_queue_drop_ratio": 0.05,
+  "max_consecutive_failures": 2,
+  "min_probe_hash_ok_rate": 0.5,
+  "min_route_hit_rate": 0.0,
+  "max_route_fallback_ratio": 1.0,
+  "require_min_hops": 0
+}

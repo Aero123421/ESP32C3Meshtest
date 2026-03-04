@@ -7,7 +7,9 @@ param(
 
     [string]$ProjectDir = "",
 
-    [string]$LogDir = ""
+    [string]$LogDir = "",
+
+    [string]$SessionDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,10 +57,18 @@ if (-not $pioCmd -and -not $pythonCmd) {
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not [string]::IsNullOrWhiteSpace($SessionDir)) {
+    New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null
+    if ([string]::IsNullOrWhiteSpace($LogDir)) {
+        $LogDir = Join-Path $SessionDir "monitor"
+    }
+}
 if ([string]::IsNullOrWhiteSpace($LogDir)) {
     $LogDir = Join-Path $ProjectDir ("test_logs\monitor_" + $timestamp)
 }
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$manifestFile = if (-not [string]::IsNullOrWhiteSpace($SessionDir)) { Join-Path $SessionDir "monitor_manifest.json" } else { Join-Path $LogDir "monitor_manifest.json" }
+$manifestItems = @()
 
 for ($i = 0; $i -lt $Ports.Count; $i++) {
     $port = $Ports[$i]
@@ -96,7 +106,25 @@ Write-Host 'Log file: $safeLogFile' -ForegroundColor DarkGray
         throw ("Failed to start monitor process for {0}. ExitCode={1}" -f $port, $proc.ExitCode)
     }
 
+    $manifestItems += [ordered]@{
+        node = $node
+        port = $port
+        baud = $Baud
+        log_file = $logFile
+        process_id = $proc.Id
+        started_at = (Get-Date).ToString("o")
+    }
     Write-Host ("Monitor started: {0} ({1}) -> {2}" -f $node, $port, $logFile) -ForegroundColor Green
 }
 
 Write-Host ("Started monitors for {0} ports. Log root: {1}" -f $Ports.Count, $LogDir) -ForegroundColor Cyan
+$manifestPayload = [ordered]@{
+    generated_at = (Get-Date).ToString("o")
+    project_dir = $ProjectDir
+    log_dir = $LogDir
+    session_dir = $SessionDir
+    ports = @($Ports)
+    items = $manifestItems
+}
+$manifestPayload | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestFile -Encoding UTF8
+Write-Host ("Monitor manifest: {0}" -f $manifestFile) -ForegroundColor Cyan

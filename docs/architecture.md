@@ -74,9 +74,10 @@
 ## 6.1 長距離向け既定プロファイル（現行実装）
 - ノードごとの個別設定なしで同一ファームを配布して使用する前提
 - ESP-NOW初期化時に以下を自動適用:
-  - `esp_wifi_set_max_tx_power(84)`（21dBm相当、法規/実装制限に依存）
-  - `esp_wifi_set_ps(WIFI_PS_NONE)`（Wi-Fi省電力OFFで応答遅延を抑制）
-  - `esp_wifi_set_protocol(...11b/11g/11n + LR)`（長距離寄りの既定）
+  - `esp_wifi_set_max_tx_power(72)`（18dBm相当、法規/実装制限に依存）
+  - `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`（BLE共存時の安定運用）
+  - `esp_wifi_set_protocol(...11b/11g/11n)`（既定）
+  - `long_range` は build flag 条件を満たす場合のみ有効化可
   - 送信フレームのオリジン側リピート送信（既定4回, robust mode）
   - オリジン再送間隔と中継転送間隔のランダムジッタ（衝突確率低減）
   - NodeInfo周期の延長（10s→15s）で常時オーバーヘッド抑制
@@ -85,12 +86,17 @@
   - `esp_now_send` の `NO_MEM` 時に短いバックオフ再試行
   - `trace_obs` は `TTL=3` + 最短送信間隔（120ms）でテレメトリ過負荷を抑制
   - `adaptiveAttemptBudget` によりRXキュー水位を見て再送回数を自動調整
+  - 送信待機は cooperative delay（待機中にRX処理を継続）で輻輳時の詰まりを緩和
 - 補足:
   - 必要に応じて `platformio.ini` の build flag で切替可能
     - `LPWA_ENABLE_WIFI_LR`（0/1）
+    - `LPWA_ALLOW_WIFI_LR_WITH_BLE`（0/1）
     - `LPWA_MESH_CHANNEL`（1..14）
     - `LPWA_MESH_TX_POWER_QDBM`（8..84）
     - `LPWA_ROUTING_MODE`（0=floodのみ / 1=origin directed / 2=origin+relay directed）
+  - 実行中に `set_radio_profile`（balanced/long_range/coexist）で切替可能
+  - ただし `LPWA_ALLOW_WIFI_LR_WITH_BLE=0` かつ BLE relay有効ビルドでは `long_range` は `unsupported_profile` となる
+  - `set_nodeinfo_cfg` で NodeInfo の `ttl/period_ms` を調整可能
 
 ## 6.2 Phase2: 経路学習と次ホップ転送
 - Directed送信時は `RoutedFragment` を使用し、宛先ノードIDをフレームメタに付与する。
@@ -99,6 +105,7 @@
 - 中継時の動作:
   - ルート有り: 次ホップへ unicast 転送
   - ルート無し/失敗: 同一attempt内で即座に flood fallback
+- 経路表は `primary + backup` の2経路を保持し、primary失効時はbackupへ昇格する。
 - 安全策:
   - 期限切れ経路の自動削除
   - ルート失効は `sendRawUnicast()` 戻り値では判定しない（MAC送信コールバック由来での誤失効を回避）
@@ -127,6 +134,15 @@
   - 失敗理由トップ
   - 使用profile
 - `mesh_trace` / `mesh_observed` で複数PCから同じ通信観測を共有し、トポロジと通信フローを同期表示する。
+
+## 6.5 Phase5: 回帰と失敗解析
+- `prepare_test_session.ps1` が `session.json` を生成し、再現条件を固定化する。
+- `flash_all.ps1` は `flash_result.json` に `firmware_sha256` を保存する。
+- `run_mesh_regression.ps1 -StartMonitor` 指定時に `monitor_all.ps1` が起動され、`monitor_manifest.json` を生成して Node/COM/log 対応を記録する。
+- `mesh_smoke_test.py` は `session-dir/run-id/scenario` と拡張thresholdをサポートする。
+- `mesh_smoke_test.py` は `--require-delivery-ack` 指定で delivery_ack欠落を失敗扱いにする。
+- `run_mesh_regression.ps1` は既定で `--require-delivery-ack` を付与し、回帰では逆方向ACK経路も検証する。
+- `run_mesh_regression.ps1` は smoke失敗時もフォールバックsummaryを生成し、`triage_mesh_failure.py` で失敗コードを自動分類する。
 
 ## 7. Wi-Fi/BLEメッシュの使い分け設計
 - Wi-Fiメッシュを優先する場面:

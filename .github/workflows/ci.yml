@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  python-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyserial pytest
+      - name: Syntax check
+        run: |
+          python -m py_compile tools/mesh_smoke_test.py tools/triage_mesh_failure.py pc_app/app.py pc_app/lpwa_gui/stats.py
+      - name: Run tests
+        run: |
+          python -m pytest -q tests

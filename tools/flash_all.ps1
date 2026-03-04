@@ -7,7 +7,9 @@ param(
 
     [string]$ProjectDir = "",
 
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+
+    [string]$SessionDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +50,12 @@ if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
     $ProjectDir = (Resolve-Path (Join-Path $scriptRoot "..")).Path
 }
 
+if ([string]::IsNullOrWhiteSpace($SessionDir)) {
+    $SessionDir = Join-Path $ProjectDir ("test_logs\flash_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+}
+New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null
+$flashResultFile = Join-Path $SessionDir "flash_result.json"
+
 $pioCmd = Get-Command pio -ErrorAction SilentlyContinue
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pioCmd -and -not $pythonCmd) {
@@ -67,13 +75,34 @@ function Invoke-Pio {
     }
 }
 
+function Get-PioVersion {
+    if ($pioCmd) {
+        return (& pio --version 2>$null | Select-Object -First 1)
+    }
+    return (& python -m platformio --version 2>$null | Select-Object -First 1)
+}
+
 Push-Location $ProjectDir
 try {
+    $runStarted = Get-Date
+    $pioVersion = Get-PioVersion
+    $firmwareSha256 = ""
+    $portResults = @()
+
     if (-not $SkipBuild) {
         Write-Host "== Build start ($Environment) ==" -ForegroundColor Cyan
         Invoke-Pio -Args @("run", "-e", $Environment)
         if ($LASTEXITCODE -ne 0) {
             throw "Build failed."
+        }
+    }
+
+    $firmwarePath = Join-Path $ProjectDir (".pio\build\{0}\firmware.bin" -f $Environment)
+    if (Test-Path $firmwarePath) {
+        try {
+            $firmwareSha256 = (Get-FileHash -Path $firmwarePath -Algorithm SHA256).Hash
+        } catch {
+            $firmwareSha256 = ""
         }
     }
 
@@ -86,11 +115,36 @@ try {
         if ($LASTEXITCODE -ne 0) {
             $failed += $port
             Write-Host ("NG: {0}" -f $port) -ForegroundColor Red
+            $portResults += [ordered]@{
+                port = $port
+                ok = $false
+                exit_code = $LASTEXITCODE
+            }
         }
         else {
             Write-Host ("OK: {0}" -f $port) -ForegroundColor Green
+            $portResults += [ordered]@{
+                port = $port
+                ok = $true
+                exit_code = 0
+            }
         }
     }
+
+    $summaryPayload = [ordered]@{
+        started_at = $runStarted.ToString("o")
+        ended_at = (Get-Date).ToString("o")
+        project_dir = $ProjectDir
+        environment = $Environment
+        ports = @($Ports)
+        skip_build = [bool]$SkipBuild
+        pio_version = [string]$pioVersion
+        firmware_path = $firmwarePath
+        firmware_sha256 = $firmwareSha256
+        results = $portResults
+    }
+    $summaryPayload | ConvertTo-Json -Depth 8 | Set-Content -Path $flashResultFile -Encoding UTF8
+    Write-Host ("Flash result written: {0}" -f $flashResultFile) -ForegroundColor Cyan
 
     if ($failed.Count -gt 0) {
         throw ("Upload failed ports: " + ($failed -join ", "))

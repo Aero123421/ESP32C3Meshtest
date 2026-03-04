@@ -37,7 +37,7 @@ class ReassemblyManager {
   void PruneExpired(uint32_t nowMs, uint32_t timeoutMs, uint32_t* droppedCount);
 
  private:
-  static constexpr size_t kSlotCount = 16;
+  static constexpr size_t kSlotCount = 24;
 
   struct Slot {
     bool active = false;

@@ -21,6 +21,12 @@ namespace lpwa {
 
 class EspNowMesh {
  public:
+  enum class RadioProfile : uint8_t {
+    Balanced = 0,
+    LongRange = 1,
+    Coexist = 2,
+  };
+
   EspNowMesh();
   ~EspNowMesh() = default;
 
@@ -40,6 +46,9 @@ class EspNowMesh {
   size_t copyRouteRecords(RouteRecord* outRecords, size_t maxRecords) const;
   bool resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) const;
   uint32_t nodeId() const { return nodeId_; }
+  bool setRadioProfile(RadioProfile profile);
+  RadioProfile radioProfile() const { return radioProfile_; }
+  void setNodeInfoConfig(uint8_t ttl, uint32_t periodMs);
 
  private:
   struct RxQueueItem {
@@ -47,6 +56,12 @@ class EspNowMesh {
     int8_t rssi;
     uint16_t len;
     uint8_t data[kEspNowMaxPayload];
+  };
+
+  struct TxResultItem {
+    bool hasMac = false;
+    uint8_t mac[6]{};
+    bool success = false;
   };
 
   struct NeighborEntry {
@@ -68,6 +83,11 @@ class EspNowMesh {
     uint8_t hops = 0;
     uint16_t metricQ8 = 0;
     uint32_t learnedMs = 0;
+    uint8_t backupNextHopMac[6]{};
+    uint32_t backupNextHopNodeId = 0;
+    uint8_t backupHops = 0;
+    uint16_t backupMetricQ8 = 0;
+    uint32_t backupLearnedMs = 0;
   };
 
   static EspNowMesh* instance_;
@@ -82,6 +102,8 @@ class EspNowMesh {
   void onRecv(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len);
 
   bool enqueueRx(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len);
+  bool enqueueTxResult(const uint8_t* mac_addr, bool success);
+  void processTxResultQueue();
   void processRxQueue();
   void processFrame(const RxQueueItem& item);
 
@@ -104,9 +126,17 @@ class EspNowMesh {
   bool sendRawBroadcast(const uint8_t* data, size_t len);
   bool sendRawUnicast(const uint8_t* mac, const uint8_t* data, size_t len);
   bool sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len);
+  bool applyRadioProfile(RadioProfile profile);
+  static bool parseRadioProfileText(const char* text, RadioProfile* outProfile);
   uint8_t clampTtl(uint8_t ttl) const;
   uint8_t adaptiveAttemptBudget(uint8_t baseAttempts) const;
+  uint32_t clampNodeInfoPeriodMs(uint32_t periodMs) const;
   bool ensurePeerForMac(const uint8_t* mac);
+  bool isZeroMac(const uint8_t* mac) const;
+  bool isRouteLegValid(const uint8_t* nextHopMac, uint32_t learnedMs, uint32_t nowMs) const;
+  void promoteBackup(RouteEntry* route, uint32_t nowMs);
+  void cooperativeDelay(uint16_t minMs, uint16_t maxMs);
+  void updateNeighborTxEtx(NeighborEntry* neighbor, bool success);
   void pruneRoutingTables(uint32_t nowMs);
   void learnRouteFromFrame(uint32_t originId, const uint8_t* senderMac, uint8_t hops, int8_t rssi,
                            uint32_t nowMs);
@@ -125,6 +155,7 @@ class EspNowMesh {
   NodeRecord* findNode(uint32_t nodeId);
 
   QueueHandle_t rxQueue_ = nullptr;
+  QueueHandle_t txResultQueue_ = nullptr;
   DuplicateFilter duplicateFilter_;
   DuplicateFilter parseRejectFilter_;
   ReassemblyManager reassembly_;
@@ -145,6 +176,10 @@ class EspNowMesh {
   uint8_t staMac_[6]{};
   uint32_t nextMessageId_ = 1;
   uint32_t nextNodeInfoDueMs_ = 0;
+  bool inCooperativeDelay_ = false;
+  RadioProfile radioProfile_ = kWifiLongRangeDefault ? RadioProfile::LongRange : RadioProfile::Balanced;
+  uint8_t nodeInfoTtl_ = kDefaultNodeInfoTtl;
+  uint32_t nodeInfoPeriodMs_ = kNodeInfoPeriodMs;
 };
 
 }  // namespace lpwa

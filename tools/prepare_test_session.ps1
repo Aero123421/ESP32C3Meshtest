@@ -5,7 +5,15 @@ param(
 
     [string]$LogRoot = "",
 
-    [string]$Operator = $env:USERNAME
+    [string]$Operator = $env:USERNAME,
+
+    [string]$Scenario = "indoor_baseline",
+
+    [string]$Channel = "1",
+
+    [string]$Antenna = "default",
+
+    [string]$PlatformIoEnv = "seeed_xiao_esp32c3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +59,13 @@ $sessionDir = Join-Path $LogRoot $timestamp
 
 New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
 
+$gitSha = ""
+try {
+    $gitSha = (git -C (Join-Path $PSScriptRoot "..") rev-parse --short HEAD 2>$null).Trim()
+} catch {
+    $gitSha = ""
+}
+
 $sessionFile = Join-Path $sessionDir "session.md"
 $portLines = @()
 for ($i = 0; $i -lt $Ports.Count; $i++) {
@@ -88,9 +103,37 @@ $portBlock
 
 Set-Content -Path $sessionFile -Value $template -Encoding UTF8
 
+$sessionJsonFile = Join-Path $sessionDir "session.json"
+$sessionId = Split-Path -Leaf $sessionDir
+$sessionPayload = [ordered]@{
+    session_id = $sessionId
+    created_at = (Get-Date).ToString("o")
+    operator = $Operator
+    scenario = $Scenario
+    channel = $Channel
+    antenna = $Antenna
+    platformio_env = $PlatformIoEnv
+    git_sha = $gitSha
+    ports = @($Ports)
+    node_alias = @(
+        for ($i = 0; $i -lt $Ports.Count; $i++) {
+            [ordered]@{
+                alias = "Node$($i + 1)"
+                port = $Ports[$i]
+            }
+        }
+    )
+    command_lines = [ordered]@{
+        flash_all = ".\tools\flash_all.ps1 -Ports $($Ports -join ',') -Environment $PlatformIoEnv -SessionDir $sessionDir"
+        monitor_all = ".\tools\monitor_all.ps1 -Ports $($Ports -join ',') -SessionDir $sessionDir -Baud 115200"
+    }
+}
+$sessionPayload | ConvertTo-Json -Depth 8 | Set-Content -Path $sessionJsonFile -Encoding UTF8
+
 Write-Host ("Session folder created: {0}" -f $sessionDir) -ForegroundColor Green
 Write-Host ("Record template: {0}" -f $sessionFile) -ForegroundColor Green
+Write-Host ("Session metadata: {0}" -f $sessionJsonFile) -ForegroundColor Green
 Write-Host ""
 Write-Host "Recommended next commands:" -ForegroundColor Cyan
-Write-Host ("  .\tools\flash_all.ps1 -Ports {0}" -f ($Ports -join ",")) -ForegroundColor Yellow
-Write-Host ("  .\tools\monitor_all.ps1 -Ports {0} -LogDir {1}" -f ($Ports -join ","), $sessionDir) -ForegroundColor Yellow
+Write-Host ("  .\tools\flash_all.ps1 -Ports {0} -Environment {1} -SessionDir {2}" -f ($Ports -join ","), $PlatformIoEnv, $sessionDir) -ForegroundColor Yellow
+Write-Host ("  .\tools\monitor_all.ps1 -Ports {0} -SessionDir {1}" -f ($Ports -join ","), $sessionDir) -ForegroundColor Yellow

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import csv
 from collections import deque
 import hashlib
 import json
 import math
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -71,6 +73,7 @@ TOPOLOGY_DEFAULT_WINDOW_SEC = 30
 TOPOLOGY_FLOW_EVENT_LIMIT = 240
 QUALITY_GRAPH_MAX_POINTS = 240
 QUALITY_GRAPH_MIN_REDRAW_INTERVAL_MS = 200
+QUALITY_GRAPH_DUPLICATE_WINDOW_MS = 300
 MAX_WORKER_EVENTS_PER_TICK = 120
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
 PING_PENDING_MAX_AGE_MS = 20000
@@ -81,6 +84,7 @@ RELIABLE_PROFILE_CHOICES = ("auto", "25+8", "25+10")
 RELIABLE_PROFILE_NAME_TO_ID = {"25+8": 0, "25+10": 1}
 RELIABLE_PROFILE_ID_TO_NAME = {value: key for key, value in RELIABLE_PROFILE_NAME_TO_ID.items()}
 TOPOLOGY_VIEW_CHOICES = ("tree", "flow", "both")
+NODE_ID_PATTERN = re.compile(r"^0x[0-9A-Fa-f]{8}$")
 TOPOLOGY_KIND_CHOICES = (
     "all",
     "chat",
@@ -179,6 +183,7 @@ class LPWAApp(tk.Tk):
         self.continuous_interval_max_ms = 4000
         self.continuous_interval_last_log_ms = 0
         self.log_lines: list[str] = []
+        self.event_records: list[dict[str, Any]] = []
         self.max_log_lines = 3000
         self.image_rx_sessions: dict[str, dict[str, Any]] = {}
         self.long_text_rx_sessions: dict[str, dict[str, Any]] = {}
@@ -195,6 +200,8 @@ class LPWAApp(tk.Tk):
         self.flash_thread: threading.Thread | None = None
         self.project_root = Path(__file__).resolve().parents[1]
         self.local_node_id: str | None = None
+        self.last_node_list_rx_ms = 0
+        self.nodes_request_retry_after_id: str | None = None
         self.topology_tracker = TopologyTracker(max_events=20000)
         self.topology_dirty = False
         self._last_worker_backlog_log_ms = 0
@@ -239,13 +246,18 @@ class LPWAApp(tk.Tk):
         self.reliable_profile_used_var = tk.StringVar(value="n/a")
         self.reliable_fail_var = tk.StringVar(value="none")
         self.quality_graph_status_var = tk.StringVar(value="品質グラフ: 待機中")
+        self.quality_target_var = tk.StringVar(value="all")
         self.quality_points: deque[dict[str, float | int]] = deque(maxlen=QUALITY_GRAPH_MAX_POINTS)
         self._quality_last_draw_ms = 0
+        self._quality_last_signature: tuple[int, int, int, int, int] | None = None
+        self._quality_target_active = "all"
         self.quality_graph_canvas: tk.Canvas | None = None
+        self.quality_target_combo: ttk.Combobox | None = None
         self.interval_entry: ttk.Entry | None = None
         self.count_entry: ttk.Entry | None = None
         self.ttl_entry: ttk.Entry | None = None
         self.reliable_mode_combo: ttk.Combobox | None = None
+        self.flash_port_vars: dict[str, tk.BooleanVar] = {}
 
         self._build_ui_tabbed()
         self.reliable_mode_var.trace_add("write", self._on_reliable_mode_changed)
@@ -710,11 +722,14 @@ class LPWAApp(tk.Tk):
         ttk.Button(ping_frame, text="Ping送信(1KB)", command=self.send_ping).grid(row=0, column=2, padx=4, pady=4)
 
         ttk.Label(ping_frame, text="間隔(ms)").grid(row=1, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.interval_var, width=12).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        self.interval_entry = ttk.Entry(ping_frame, textvariable=self.interval_var, width=12)
+        self.interval_entry.grid(row=1, column=1, padx=4, pady=4, sticky="w")
         ttk.Label(ping_frame, text="回数(0=無限)").grid(row=2, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.count_var, width=12).grid(row=2, column=1, padx=4, pady=4, sticky="w")
+        self.count_entry = ttk.Entry(ping_frame, textvariable=self.count_var, width=12)
+        self.count_entry.grid(row=2, column=1, padx=4, pady=4, sticky="w")
         ttk.Label(ping_frame, text="TTL").grid(row=3, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.ttl_var, width=12).grid(row=3, column=1, padx=4, pady=4, sticky="w")
+        self.ttl_entry = ttk.Entry(ping_frame, textvariable=self.ttl_var, width=12)
+        self.ttl_entry.grid(row=3, column=1, padx=4, pady=4, sticky="w")
         self.start_test_btn = ttk.Button(ping_frame, text="連続開始", command=self.start_continuous_ping)
         self.start_test_btn.grid(row=1, column=2, padx=4, pady=4)
         self.stop_test_btn = ttk.Button(ping_frame, text="停止", command=self.stop_continuous_ping, state=tk.DISABLED)
@@ -801,7 +816,7 @@ class LPWAApp(tk.Tk):
 
         quality_head = ttk.Frame(quality_frame)
         quality_head.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
-        quality_head.columnconfigure(6, weight=1)
+        quality_head.columnconfigure(8, weight=1)
         ttk.Label(quality_head, text="PDR", foreground="#22c55e").grid(row=0, column=0, padx=(0, 8), sticky="w")
         ttk.Label(quality_head, text="Avg(ms)", foreground="#38bdf8").grid(row=0, column=1, padx=(0, 8), sticky="w")
         ttk.Label(quality_head, text="P95(ms)", foreground="#f59e0b").grid(row=0, column=2, padx=(0, 8), sticky="w")
@@ -809,7 +824,17 @@ class LPWAApp(tk.Tk):
         ttk.Label(quality_head, text="上段: PDR(0-100%) / 下段: 遅延ms・Loss", foreground="#4b5563").grid(
             row=0, column=4, padx=(0, 8), sticky="w"
         )
-        ttk.Label(quality_head, textvariable=self.quality_graph_status_var).grid(row=0, column=6, sticky="e")
+        ttk.Label(quality_head, text="対象").grid(row=0, column=5, padx=(8, 2), sticky="e")
+        self.quality_target_combo = ttk.Combobox(
+            quality_head,
+            textvariable=self.quality_target_var,
+            values=("all",),
+            width=14,
+            state="readonly",
+        )
+        self.quality_target_combo.grid(row=0, column=6, padx=(0, 6), sticky="e")
+        self.quality_target_combo.bind("<<ComboboxSelected>>", lambda _: self.update_stats_view())
+        ttk.Label(quality_head, textvariable=self.quality_graph_status_var).grid(row=0, column=8, sticky="e")
 
         self.quality_graph_canvas = tk.Canvas(
             quality_frame,
@@ -950,6 +975,31 @@ class LPWAApp(tk.Tk):
         self.topology_flow_tree.configure(yscrollcommand=flow_scroll.set)
         self.topology_detail_tabs.add(flow_tab, text="通信フロー")
 
+        route_tab = ttk.Frame(self.topology_detail_tabs)
+        route_tab.columnconfigure(0, weight=1)
+        route_tab.rowconfigure(0, weight=1)
+        self.topology_route_tree = ttk.Treeview(
+            route_tab,
+            columns=("dst", "next", "rank", "hops", "metric", "age"),
+            show="headings",
+            height=9,
+        )
+        for key, title, width in (
+            ("dst", "Dst", 120),
+            ("next", "NextHop", 120),
+            ("rank", "Rank", 62),
+            ("hops", "Hops", 62),
+            ("metric", "Metric", 86),
+            ("age", "Age", 86),
+        ):
+            self.topology_route_tree.heading(key, text=title)
+            self.topology_route_tree.column(key, width=width, anchor="w")
+        self.topology_route_tree.grid(row=0, column=0, sticky="nsew")
+        route_scroll = ttk.Scrollbar(route_tab, orient=tk.VERTICAL, command=self.topology_route_tree.yview)
+        route_scroll.grid(row=0, column=1, sticky="ns")
+        self.topology_route_tree.configure(yscrollcommand=route_scroll.set)
+        self.topology_detail_tabs.add(route_tab, text="経路")
+
     def _build_log_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -977,7 +1027,7 @@ class LPWAApp(tk.Tk):
 
         flash_frame = ttk.LabelFrame(parent, text="Build / 書き込み")
         flash_frame.grid(row=0, column=0, sticky="ew")
-        flash_frame.columnconfigure(6, weight=1)
+        flash_frame.columnconfigure(8, weight=1)
 
         ttk.Label(flash_frame, text="FW Env").grid(row=0, column=0, padx=4, pady=6, sticky="w")
         ttk.Entry(flash_frame, textvariable=self.pio_env_var, width=24).grid(row=0, column=1, padx=4, pady=6, sticky="w")
@@ -986,14 +1036,22 @@ class LPWAApp(tk.Tk):
         self.build_fw_button.grid(row=0, column=2, padx=4, pady=6)
         self.flash_selected_button = ttk.Button(flash_frame, text="書込(選択COM)", command=self.start_flash_selected_port)
         self.flash_selected_button.grid(row=0, column=3, padx=4, pady=6)
-        self.flash_all_button = ttk.Button(flash_frame, text="書込(全COM)", command=self.start_flash_all_ports)
+        self.flash_all_button = ttk.Button(flash_frame, text="書込(複数選択)", command=self.start_flash_all_ports)
         self.flash_all_button.grid(row=0, column=4, padx=4, pady=6)
+        ttk.Button(flash_frame, text="COM再取得", command=self.refresh_flash_port_selector).grid(row=0, column=5, padx=4, pady=6)
 
-        ttk.Label(flash_frame, text="Flash状態").grid(row=0, column=5, padx=4, pady=6, sticky="e")
-        ttk.Label(flash_frame, textvariable=self.flash_status_var).grid(row=0, column=6, padx=4, pady=6, sticky="w")
+        ttk.Label(flash_frame, text="Flash状態").grid(row=0, column=6, padx=4, pady=6, sticky="e")
+        ttk.Label(flash_frame, textvariable=self.flash_status_var).grid(row=0, column=8, padx=4, pady=6, sticky="w")
+
+        selector = ttk.LabelFrame(parent, text="複数書込の対象ポート")
+        selector.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        selector.columnconfigure(0, weight=1)
+        self.flash_ports_frame = ttk.Frame(selector)
+        self.flash_ports_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+        self.refresh_flash_port_selector()
 
         guide = ttk.LabelFrame(parent, text="使い方")
-        guide.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        guide.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         guide.columnconfigure(0, weight=1)
         ttk.Label(
             guide,
@@ -1001,7 +1059,7 @@ class LPWAApp(tk.Tk):
             text=(
                 "1. 上部の接続エリアで COM と Baud を選択\n"
                 "2. Build でビルド確認\n"
-                "3. 単体書込みは 書込(選択COM)、複数台は 書込(全COM)\n"
+                "3. 複数書込みは対象COMをチェックして 書込(複数選択)\n"
                 "4. 通信確認は 通信/試験/トポロジ タブで実施"
             ),
             foreground="#4b5563",
@@ -1012,10 +1070,22 @@ class LPWAApp(tk.Tk):
         if level_tag not in LOG_TAGS:
             level_tag = "INFO"
         cat = category.upper().strip() or "APP"
-        stamped = f"[{datetime.now().strftime('%H:%M:%S')}][{level_tag}][{cat}] {text}"
+        now_dt = datetime.now()
+        stamped = f"[{now_dt.strftime('%H:%M:%S')}][{level_tag}][{cat}] {text}"
         self.log_lines.append(stamped)
+        self.event_records.append(
+            {
+                "ts_iso": now_dt.isoformat(timespec="milliseconds"),
+                "ts_ms": self._now_ms(),
+                "level": level_tag,
+                "category": cat,
+                "message": str(text),
+            }
+        )
         if len(self.log_lines) > self.max_log_lines:
             self.log_lines = self.log_lines[-self.max_log_lines :]
+        if len(self.event_records) > self.max_log_lines:
+            self.event_records = self.event_records[-self.max_log_lines :]
 
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, stamped + "\n", (level_tag,))
@@ -1034,13 +1104,24 @@ class LPWAApp(tk.Tk):
         drop_count = line_count - self.max_log_lines
         self.log_text.delete("1.0", f"{drop_count + 1}.0")
 
-    def _normalize_target(self, raw_value: str | None) -> str | None:
+    def _normalize_target(
+        self,
+        raw_value: str | None,
+        *,
+        context: str = "宛先",
+        show_error: bool = False,
+    ) -> str | None:
         value = (raw_value or "").strip()
         if not value:
             return None
         if value.lower() in {"*", "all", "broadcast", BROADCAST_LABEL.lower()}:
             return None
-        return value
+        if not NODE_ID_PATTERN.match(value):
+            message = f"{context}は 0xXXXXXXXX 形式で指定してください。"
+            if show_error:
+                messagebox.showwarning("宛先エラー", message)
+            raise ValueError(message)
+        return f"0x{value[2:].upper()}"
 
     def _target_label(self, target: str | None) -> str:
         return target if target else BROADCAST_LABEL
@@ -1267,6 +1348,9 @@ class LPWAApp(tk.Tk):
             payload["retry_no"] = attempt
             payload["ts_ms"] = now
             if not worker.send(payload):
+                # 送信キュー飽和時も retry 回数を進め、無限待ちを防ぐ。
+                entry["payload"] = payload
+                entry["attempt"] = attempt
                 entry["last_send_ms"] = now
                 self.append_log(
                     (
@@ -1486,12 +1570,6 @@ class LPWAApp(tk.Tk):
             if local and node_id == local:
                 continue
             return node_id
-        if local:
-            return local
-        for node in nodes:
-            node_id = str(node.node_id).strip()
-            if node_id:
-                return node_id
         return None
 
     def _sync_reliable_controls(self) -> None:
@@ -1521,20 +1599,30 @@ class LPWAApp(tk.Tk):
         if self._is_hardened_mode_enabled() and target is None:
             messagebox.showwarning("宛先エラー", f"{operation} は mode=reliable_1k で宛先指定が必須です。")
             return False
+        local = (self.local_node_id or "").strip().lower()
+        if target and local and target.strip().lower() == local:
+            messagebox.showwarning("宛先エラー", f"{operation} の宛先が自ノードになっています。別ノードを選択してください。")
+            return False
         return True
 
     def refresh_destination_choices(self) -> None:
         allow_broadcast = not self._is_hardened_mode_enabled()
         choices: list[str] = [BROADCAST_LABEL] if allow_broadcast else []
         for node in self.registry.snapshot():
-            if node.node_id not in choices:
-                choices.append(node.node_id)
+            node_id = str(node.node_id).strip()
+            if not NODE_ID_PATTERN.match(node_id):
+                continue
+            node_id = f"0x{node_id[2:].upper()}"
+            if node_id not in choices:
+                choices.append(node_id)
 
         fallback_directed = self._preferred_directed_target()
         if fallback_directed and fallback_directed not in choices:
             choices.append(fallback_directed)
         for var in (self.chat_target_var, self.image_target_var, self.ping_target_var):
             current = var.get().strip()
+            if current and current != BROADCAST_LABEL and not NODE_ID_PATTERN.match(current):
+                current = ""
             if current and current not in choices and (allow_broadcast or current != BROADCAST_LABEL):
                 choices.append(current)
             if not allow_broadcast and (not current or current == BROADCAST_LABEL):
@@ -1548,6 +1636,24 @@ class LPWAApp(tk.Tk):
         self.chat_target_combo["values"] = choices
         self.image_target_combo["values"] = choices
         self.ping_target_combo["values"] = choices
+        self.refresh_quality_target_choices()
+
+    def refresh_quality_target_choices(self) -> None:
+        combo = self.quality_target_combo
+        if combo is None:
+            return
+        values = ["all"]
+        for node in self.registry.snapshot():
+            node_id = str(node.node_id).strip()
+            if not NODE_ID_PATTERN.match(node_id):
+                continue
+            node_id = f"0x{node_id[2:].upper()}"
+            if node_id not in values:
+                values.append(node_id)
+        combo["values"] = values
+        current = (self.quality_target_var.get() or "").strip()
+        if not current or current not in values:
+            self.quality_target_var.set("all")
 
     def _payload_type(self, payload: dict[str, Any]) -> str:
         return str(payload.get("type") or payload.get("event") or "payload").strip().lower()
@@ -1808,6 +1914,7 @@ class LPWAApp(tk.Tk):
                 self._draw_topology_canvas(snapshot)
                 self._refresh_topology_table(snapshot)
                 self._refresh_topology_flow_table(snapshot)
+                self._refresh_topology_route_table(snapshot)
                 self_label = self.local_node_id if self.local_node_id else "未取得"
                 mode = str(self.topology_view_var.get() or "tree").strip().lower() or "tree"
                 self.topology_status_var.set(
@@ -1977,6 +2084,9 @@ class LPWAApp(tk.Tk):
             return
 
         focus_node = self._pick_focus_node(snapshot, nodes)
+        selected_node = self._selected_node_id()
+        if selected_node and selected_node not in nodes:
+            selected_node = None
         use_tree_layout = mode in {"tree", "both"} and len(snapshot.relay_links) > 0
         if use_tree_layout:
             positions = self._compute_tree_positions(
@@ -2093,6 +2203,9 @@ class LPWAApp(tk.Tk):
                 recent = (now_ms - edge.last_seen_ms) <= 1500
                 palette = TOPOLOGY_EDGE_COLORS.get(edge.kind, TOPOLOGY_EDGE_COLORS["unknown"])
                 color = palette[0] if recent else palette[1]
+                if selected_node and selected_node not in {edge.src, edge.dst}:
+                    color = "#334155"
+                    width_px = max(1, width_px - 1)
                 canvas.create_line(
                     x1,
                     y1,
@@ -2113,6 +2226,47 @@ class LPWAApp(tk.Tk):
                     font=("Consolas", 9),
                 )
 
+        # route_list から学習済み経路のヒント線を重ねる（local node -> dst）
+        if self.local_node_id and mode in {"tree", "both"}:
+            for route in (self.latest_routes or [])[:120]:
+                if not isinstance(route, dict):
+                    continue
+                dst = str(route.get("dst_node_id") or "").strip()
+                next_hop = str(route.get("next_hop_node_id") or "").strip()
+                if not dst or not next_hop:
+                    continue
+                if self.local_node_id not in positions or next_hop not in positions or dst not in positions:
+                    continue
+                x1, y1 = positions[self.local_node_id]
+                x2, y2 = positions[next_hop]
+                x3, y3 = positions[dst]
+                rank = _to_int(route.get("rank"), 0)
+                color = "#f59e0b" if rank <= 0 else "#a16207"
+                if selected_node and selected_node not in {self.local_node_id, next_hop, dst}:
+                    color = "#374151"
+                canvas.create_line(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    fill=color,
+                    width=1,
+                    dash=(4, 4),
+                    arrow=tk.LAST,
+                    arrowshape=(9, 10, 4),
+                )
+                canvas.create_line(
+                    x2,
+                    y2,
+                    x3,
+                    y3,
+                    fill=color,
+                    width=1,
+                    dash=(2, 4),
+                    arrow=tk.LAST,
+                    arrowshape=(9, 10, 4),
+                )
+
         for node_id, (x, y) in positions.items():
             is_broadcast = node_id == BROADCAST_NODE
             fill = "#334155"
@@ -2129,6 +2283,8 @@ class LPWAApp(tk.Tk):
                 node_radius = 18
                 canvas.create_oval(x - 23, y - 23, x + 23, y + 23, outline="#99f6e4", width=2)
                 role_text = "SELF" if (self.local_node_id and node_id == self.local_node_id) else ""
+            if selected_node and node_id == selected_node:
+                canvas.create_oval(x - 26, y - 26, x + 26, y + 26, outline="#f59e0b", width=2)
             canvas.create_oval(
                 x - node_radius,
                 y - node_radius,
@@ -2217,12 +2373,75 @@ class LPWAApp(tk.Tk):
                 ),
             )
 
+    def _refresh_topology_route_table(self, snapshot: TopologySnapshot) -> None:
+        tree = getattr(self, "topology_route_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        routes = self.latest_routes if isinstance(self.latest_routes, list) else []
+        for route in routes[:240]:
+            if not isinstance(route, dict):
+                continue
+            dst = str(route.get("dst_node_id") or route.get("dst") or "").strip()
+            next_hop = str(route.get("next_hop_node_id") or route.get("next_hop") or "").strip()
+            if not dst:
+                continue
+            rank_value = route.get("rank", 0)
+            rank = "backup" if _to_int(str(rank_value), 0) > 0 else "primary"
+            hops = _to_int(route.get("hops"), 0)
+            metric = _to_int(route.get("metric_q8"), 0)
+            age_ms = _to_int(route.get("age_ms"), max(0, snapshot.generated_ms - _to_int(route.get("learned_ms"), 0)))
+            dst_label = self._short_node_id(dst)
+            next_label = self._short_node_id(next_hop) if next_hop else "-"
+            if self.local_node_id:
+                if dst == self.local_node_id:
+                    dst_label = f"★ {dst_label}"
+                if next_hop == self.local_node_id:
+                    next_label = f"★ {next_label}"
+            tree.insert(
+                "",
+                tk.END,
+                values=(dst_label, next_label, rank, hops, metric, f"{max(0, age_ms)}ms"),
+            )
+
     def refresh_ports(self) -> None:
         ports = list_serial_ports()
         self.port_combo["values"] = ports
         if ports and (self.port_var.get() not in ports):
             self.port_var.set(ports[0])
+        self.refresh_flash_port_selector()
         self.append_log(f"COM一覧更新: {ports if ports else 'なし'}", level="SYSTEM", category="COM")
+
+    def refresh_flash_port_selector(self) -> None:
+        frame = getattr(self, "flash_ports_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        ports = list_serial_ports()
+        self.flash_port_vars = {}
+        if not ports:
+            ttk.Label(frame, text="利用可能なCOMポートが見つかりません。", foreground="#6b7280").grid(
+                row=0, column=0, sticky="w"
+            )
+            return
+        for idx, port in enumerate(ports):
+            var = tk.BooleanVar(value=True)
+            self.flash_port_vars[port] = var
+            ttk.Checkbutton(frame, text=port, variable=var).grid(
+                row=idx // 6,
+                column=idx % 6,
+                sticky="w",
+                padx=(0, 10),
+                pady=2,
+            )
+
+    def _selected_flash_ports(self) -> list[str]:
+        if not self.flash_port_vars:
+            return list_serial_ports()
+        selected = [port for port, var in self.flash_port_vars.items() if bool(var.get())]
+        return sorted(selected)
 
     def _set_flash_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -2272,9 +2491,15 @@ class LPWAApp(tk.Tk):
         self._start_flash_job(mode="upload", ports=[port])
 
     def start_flash_all_ports(self) -> None:
-        ports = list_serial_ports()
+        ports = self._selected_flash_ports()
         if not ports:
-            messagebox.showwarning("ポートなし", "書き込み対象のCOMポートが見つかりません。")
+            messagebox.showwarning("ポート未選択", "書き込み対象のCOMポートを1つ以上選択してください。")
+            return
+        should_start = messagebox.askyesno(
+            "複数ポート書き込み",
+            f"以下の{len(ports)}ポートへ書き込みします。\n{', '.join(ports)}\n\n開始しますか？",
+        )
+        if not should_start:
             return
         self._start_flash_job(mode="upload", ports=ports)
 
@@ -2573,6 +2798,22 @@ class LPWAApp(tk.Tk):
         if message_type in {"node_list", "nodes"}:
             nodes = payload.get("nodes") or payload.get("items")
             if isinstance(nodes, list):
+                self.last_node_list_rx_ms = self._now_ms()
+                if self.nodes_request_retry_after_id is not None:
+                    try:
+                        self.after_cancel(self.nodes_request_retry_after_id)
+                    except Exception:
+                        pass
+                    self.nodes_request_retry_after_id = None
+                count = _to_int(str(payload.get("count", len(nodes))), len(nodes))
+                total = _to_int(str(payload.get("total", count)), count)
+                truncated = bool(payload.get("truncated"))
+                if truncated or (total > count):
+                    self.append_log(
+                        f"node_list truncated: count={count} total={total} (再要求推奨)",
+                        level="WARN",
+                        category="TOPO",
+                    )
                 self.registry.update_from_list(nodes)
                 self.topology_tracker.update_node_records(nodes)
                 if not self.local_node_id:
@@ -2592,6 +2833,7 @@ class LPWAApp(tk.Tk):
             else:
                 self.latest_routes = []
             self.topology_status_var.set(f"経路情報: {len(self.latest_routes)}")
+            self._mark_topology_dirty()
             return
 
         skip_node_refresh = message_type in {
@@ -3379,7 +3621,10 @@ class LPWAApp(tk.Tk):
         text = self.chat_input_var.get().strip()
         if not text:
             return
-        dst = self._normalize_target(self.chat_target_var.get())
+        try:
+            dst = self._normalize_target(self.chat_target_var.get(), context="チャット宛先", show_error=True)
+        except ValueError:
+            return
         via = self.chat_via_var.get().strip() or "wifi"
         if via == "wifi" and not self._ensure_directed_target(dst, operation="チャット送信"):
             return
@@ -3450,7 +3695,10 @@ class LPWAApp(tk.Tk):
             messagebox.showerror("ファイルなし", f"ファイルが存在しません: {path}")
             return
 
-        dst = self._normalize_target(self.image_target_var.get())
+        try:
+            dst = self._normalize_target(self.image_target_var.get(), context="画像宛先", show_error=True)
+        except ValueError:
+            return
         if not self._ensure_directed_target(dst, operation="画像送信"):
             return
         ttl = self._current_ttl()
@@ -3499,9 +3747,14 @@ class LPWAApp(tk.Tk):
         if mode != "reliable_1k":
             messagebox.showwarning("モード不一致", "Reliable送信には mode=reliable_1k を選択してください。")
             return
-        dst = self._normalize_target(self.ping_target_var.get())
+        try:
+            dst = self._normalize_target(self.ping_target_var.get(), context="Reliable宛先", show_error=True)
+        except ValueError:
+            return
         if dst is None:
             messagebox.showwarning("宛先エラー", "Reliable 1KB は Broadcast 送信できません。Ping宛先を指定してください。")
+            return
+        if not self._ensure_directed_target(dst, operation="Reliable 1KB送信"):
             return
 
         ttl = self._current_ttl()
@@ -3579,6 +3832,23 @@ class LPWAApp(tk.Tk):
 
     def request_nodes(self) -> None:
         self.send_json(make_nodes_request())
+        sent_at_ms = self._now_ms()
+        retry_delay_ms = 1200
+
+        def _retry_once() -> None:
+            self.nodes_request_retry_after_id = None
+            if self.last_node_list_rx_ms >= sent_at_ms:
+                return
+            self.append_log("node_list応答待ちタイムアウト。再要求します。", level="WARN", category="TOPO")
+            self.send_json(make_nodes_request())
+
+        if self.nodes_request_retry_after_id is not None:
+            try:
+                self.after_cancel(self.nodes_request_retry_after_id)
+            except Exception:
+                pass
+            self.nodes_request_retry_after_id = None
+        self.nodes_request_retry_after_id = self.after(retry_delay_ms, _retry_once)
 
     def request_routes(self) -> None:
         self.send_json(make_routes_request())
@@ -3598,7 +3868,7 @@ class LPWAApp(tk.Tk):
         if not self.send_json(payload):
             return False
         sent_ms = self._now_ms()
-        self.ping_stats.register_sent(seq, sent_ts_ms=sent_ms)
+        self.ping_stats.register_sent(seq, sent_ts_ms=sent_ms, dst=(dst or "all"))
         self.pending_ping_rounds[seq] = {
             "ping_id": ping_id,
             "sent_ms": sent_ms,
@@ -3613,7 +3883,10 @@ class LPWAApp(tk.Tk):
         return True
 
     def send_ping(self) -> bool:
-        dst = self._normalize_target(self.ping_target_var.get())
+        try:
+            dst = self._normalize_target(self.ping_target_var.get(), context="Ping宛先", show_error=True)
+        except ValueError:
+            return False
         if not self._ensure_directed_target(dst, operation="Ping送信(1KB)"):
             return False
         ttl = self._current_ttl()
@@ -3681,6 +3954,18 @@ class LPWAApp(tk.Tk):
 
         src_raw = payload.get("src") or payload.get("from")
         src = str(src_raw).strip() if isinstance(src_raw, str) else ""
+        if src and not bool(round_info.get("is_broadcast")):
+            expected_dst = str(round_info.get("dst") or "").strip().lower()
+            if expected_dst and src.lower() != expected_dst:
+                self.append_log(
+                    (
+                        f"pong ignored: seq={seq} src mismatch expected={round_info.get('dst')} "
+                        f"got={src} ping_id={received_ping_id}"
+                    ),
+                    level="WARN",
+                    category="PING",
+                )
+                return
         responders = round_info.get("responders")
         if not isinstance(responders, set):
             responders = set()
@@ -3693,7 +3978,12 @@ class LPWAApp(tk.Tk):
         sent_ms = int(round_info.get("sent_ms") or self._now_ms())
         measured: float | None = None
         if not bool(round_info.get("registered_first")):
-            measured = self.ping_stats.register_received(seq, recv_ts_ms=now_ms, latency_ms=None)
+            measured = self.ping_stats.register_received(
+                seq,
+                recv_ts_ms=now_ms,
+                latency_ms=None,
+                dst=str(round_info.get("dst") or "all"),
+            )
             round_info["registered_first"] = True
         else:
             measured = float(max(0, now_ms - sent_ms))
@@ -3716,7 +4006,10 @@ class LPWAApp(tk.Tk):
         if self.continuous_after_id is not None:
             return
         interval_ms = self._clamp_continuous_interval_ms(_to_int(self.interval_var.get(), 1000), apply_to_ui=True)
-        dst = self._normalize_target(self.ping_target_var.get())
+        try:
+            dst = self._normalize_target(self.ping_target_var.get(), context="連続Ping宛先", show_error=True)
+        except ValueError:
+            return
         if not self._ensure_directed_target(dst, operation="連続Ping"):
             return
         ttl = self._current_ttl()
@@ -3753,6 +4046,7 @@ class LPWAApp(tk.Tk):
         target_combo_state = "readonly" if enabled else tk.DISABLED
         entry_state = tk.NORMAL if enabled else tk.DISABLED
         mode_combo_state = "readonly" if enabled else tk.DISABLED
+        profile_combo = getattr(self, "reliable_profile_combo", None)
         if self.ping_target_combo is not None:
             self.ping_target_combo.configure(state=target_combo_state)
         if self.interval_entry is not None:
@@ -3763,6 +4057,8 @@ class LPWAApp(tk.Tk):
             self.ttl_entry.configure(state=entry_state)
         if self.reliable_mode_combo is not None:
             self.reliable_mode_combo.configure(state=mode_combo_state)
+        if profile_combo is not None:
+            profile_combo.configure(state=("readonly" if enabled and not self.reliable_auto_var.get() else tk.DISABLED))
 
     def _next_continuous_interval_ms(self, base_interval_ms: int) -> int:
         base_interval = self._clamp_continuous_interval_ms(base_interval_ms, apply_to_ui=False)
@@ -3836,8 +4132,21 @@ class LPWAApp(tk.Tk):
         self._sync_reliable_controls()
 
     def _record_quality_point(self, snapshot: dict[str, float | int]) -> None:
+        signature = (
+            int(snapshot["sent"]),
+            int(snapshot["received"]),
+            int(snapshot["lost"]),
+            int(round(float(snapshot["avg_ms"]) * 10.0)),
+            int(round(float(snapshot["p95_ms"]) * 10.0)),
+        )
+        now = self._now_ms()
+        if self._quality_last_signature == signature and self.quality_points:
+            last_ts = int(self.quality_points[-1].get("ts_ms", 0))
+            if (now - last_ts) < QUALITY_GRAPH_DUPLICATE_WINDOW_MS:
+                return
+        self._quality_last_signature = signature
         point = {
-            "ts_ms": self._now_ms(),
+            "ts_ms": now,
             "pdr": float(snapshot["pdr"]),
             "avg_ms": float(snapshot["avg_ms"]),
             "p95_ms": float(snapshot["p95_ms"]),
@@ -3846,9 +4155,10 @@ class LPWAApp(tk.Tk):
             "received": int(snapshot["received"]),
         }
         self.quality_points.append(point)
+        target = (self.quality_target_var.get() or "all").strip() or "all"
         self.quality_graph_status_var.set(
             (
-                f"最新 sent={point['sent']} recv={point['received']} "
+                f"最新[{target}] sent={point['sent']} recv={point['received']} "
                 f"pdr={point['pdr']:.1f}% avg={point['avg_ms']:.1f}ms p95={point['p95_ms']:.1f}ms loss={point['lost']}"
             )
         )
@@ -3904,11 +4214,13 @@ class LPWAApp(tk.Tk):
         bottom_h = max(1.0, bottom_y1 - bottom_y0)
         lat_max = max(20.0, max(float(p["p95_ms"]) for p in points) * 1.15)
         loss_max = max(1, max(int(p["lost"]) for p in points))
+        ts_min = int(points[0]["ts_ms"])
+        ts_max = int(points[-1]["ts_ms"])
+        ts_span = max(1, ts_max - ts_min)
 
         def x_at(idx: int) -> float:
-            if count <= 1:
-                return x0 + (plot_w / 2.0)
-            return x0 + (plot_w * float(idx) / float(count - 1))
+            ts = int(points[idx]["ts_ms"])
+            return x0 + (plot_w * float(ts - ts_min) / float(ts_span))
 
         def pdr_y(value: float) -> float:
             clipped = min(100.0, max(0.0, value))
@@ -3934,6 +4246,14 @@ class LPWAApp(tk.Tk):
             canvas.create_text(x0 - 6, y, anchor="e", text=lat_label, fill="#64748b", font=("Consolas", 8))
             loss_label = f"{int(round(loss_max * ratio))}"
             canvas.create_text(x1 + 6, y, anchor="w", text=loss_label, fill="#64748b", font=("Consolas", 8))
+
+        x_ticks = [0.0, 0.5, 1.0]
+        for ratio in x_ticks:
+            x = x0 + (plot_w * ratio)
+            canvas.create_line(x, bottom_y1, x, bottom_y1 + 4, fill="#475569", width=1)
+            tick_ts = ts_min + int(ts_span * ratio)
+            tick_label = datetime.fromtimestamp(tick_ts / 1000.0).strftime("%H:%M:%S")
+            canvas.create_text(x, bottom_y1 + 10, anchor="n", text=tick_label, fill="#64748b", font=("Consolas", 8))
 
         pdr_coords: list[float] = []
         avg_coords: list[float] = []
@@ -3981,13 +4301,19 @@ class LPWAApp(tk.Tk):
         self.reliable_rx_sessions.clear()
         self.reliable_auto_state_by_dst.clear()
         self.quality_points.clear()
+        self._quality_last_signature = None
         self.quality_graph_status_var.set("品質グラフ: リセット済み")
         self.update_stats_view()
         self._draw_quality_graph(force=True)
         self.append_log("統計情報をリセットしました。", level="SYSTEM", category="PING")
 
     def update_stats_view(self) -> None:
-        snapshot = self.ping_stats.snapshot()
+        target = (self.quality_target_var.get() or "all").strip() or "all"
+        if target != self._quality_target_active:
+            self._quality_target_active = target
+            self.quality_points.clear()
+            self._quality_last_signature = None
+        snapshot = self.ping_stats.snapshot(target=target)
         self.sent_var.set(str(snapshot["sent"]))
         self.received_var.set(str(snapshot["received"]))
         self.lost_var.set(str(snapshot["lost"]))
@@ -4016,13 +4342,38 @@ class LPWAApp(tk.Tk):
         if not path:
             return
         try:
-            Path(path).write_text("\n".join(self.log_lines) + "\n", encoding="utf-8")
-            self.append_log(f"ログ保存完了: {path}", level="SYSTEM", category="LOG")
+            target = Path(path)
+            target.write_text("\n".join(self.log_lines) + "\n", encoding="utf-8")
+            base = target.with_suffix("")
+            jsonl_path = base.with_suffix(".jsonl")
+            csv_path = base.with_suffix(".csv")
+            with jsonl_path.open("w", encoding="utf-8") as jf:
+                for record in self.event_records:
+                    jf.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            with csv_path.open("w", encoding="utf-8", newline="") as cf:
+                writer = csv.DictWriter(cf, fieldnames=["ts_iso", "ts_ms", "level", "category", "message"])
+                writer.writeheader()
+                for record in self.event_records:
+                    writer.writerow(
+                        {
+                            "ts_iso": record.get("ts_iso", ""),
+                            "ts_ms": record.get("ts_ms", 0),
+                            "level": record.get("level", ""),
+                            "category": record.get("category", ""),
+                            "message": record.get("message", ""),
+                        }
+                    )
+            self.append_log(
+                f"ログ保存完了: text={target.name} jsonl={jsonl_path.name} csv={csv_path.name}",
+                level="SYSTEM",
+                category="LOG",
+            )
         except OSError as exc:
             messagebox.showerror("保存失敗", str(exc))
 
     def clear_logs(self) -> None:
         self.log_lines.clear()
+        self.event_records.clear()
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)

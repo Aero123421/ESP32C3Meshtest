@@ -17,11 +17,12 @@
 
 ### 3.1 追加項目
 - モード切替:
-  - `通常`（現行相当）
-  - `高信頼(reliable_1k)`（再送強化 + 冗長送信）
-- 冗長率:
-  - `0.00〜1.00`（0.05刻み）
-  - 意味: `0.00=冗長送信なし`、`1.00=最大冗長`
+  - `normal`
+  - `reliable_1k`
+- profile:
+  - `auto`（宛先別に `25+8` / `25+10` を自動調整）
+  - `25+8`（固定）
+  - `25+10`（固定）
 - 統計表示:
   - `復元率(%)`
   - `再送率(%)`
@@ -35,12 +36,12 @@
 - `ログ`タブに `失敗理由ヒートマップ（件数）` と `再送率トレンド` を追加。
 
 ### 3.3 モード動作
-- 通常:
-  - 現行ロジック維持（後方互換）。
-- 高信頼:
-  - `delivery_ack timeout` と `max retry` を冗長率連動で拡張。
-  - `long_text_chunk` を冗長率に応じて追加送信（同一 `e2e_id` 系列で管理）。
-  - `ping_probe` は1ラウンド内で複数送信を許可し、最良/中央値を統計化。
+- `normal`:
+  - 既存挙動（chat / long_text / ping / image）を維持。
+- `reliable_1k`:
+  - Broadcast宛先を禁止し、Directed宛先必須。
+  - `reliable_1k_start/chunk/end + nack/repair/result` を使用。
+  - `auto` 有効時は宛先ごとの成功率/再送率/NACK傾向で `25+8` / `25+10` を自動調整。
 
 ## 4. ping_probe と long_text の関係（必須2）
 - `ping_probe`:
@@ -57,10 +58,10 @@
 ## 5. ログ/可視化設計（必須3）
 
 ### 5.1 追加ログ
-- GUI保存ログ（既存 `.log`）に加えて JSONL を追加:
-  - `test_logs/<session>/gui_reliable_1k_events.jsonl`
+- GUI保存ログ（`.log`）に加えて JSONL を出力:
+  - `save_logs()` で選択した保存先の同名 `.jsonl`
 - 1イベント1行で最低限以下を保持:
-  - `ts_ms`, `mode`, `redundancy_ratio`, `scenario_id`
+  - `ts_ms`, `mode`, `profile`, `scenario_id`
   - `type` (`ping_probe`/`long_text`/`delivery_ack`)
   - `e2e_id`, `retry_no`, `result`
   - `fail_reason`（失敗時のみ）
@@ -95,14 +96,18 @@
    `.\tools\monitor_all.ps1 -Ports COMx,COMy,... -LogDir .\test_logs\<session>`
 4. GUI準備/起動  
    `cd .\pc_app`  
-   `.\setup_and_run_gui.bat --profile reliable_1k --session-dir ..\test_logs\<session>`
-5. GUIで `高信頼(reliable_1k)` + 冗長率設定し、Directed 宛先で試験実行
-6. 終了時に `gui_reliable_1k_events.jsonl` と `session.md` へ結果を転記
+   `.\setup_and_run_gui.bat`
+5. GUIで `mode=reliable_1k` と profile（`auto`/`25+8`/`25+10`）を設定し、Directed 宛先で試験実行
+6. 終了時に GUI保存ログ（`.log/.jsonl/.csv`）と `session.md` へ結果を転記
+
+注記:
+- `setup_and_run_gui.bat` は現行実装で `--setup-only` のみ対応。
+- `--profile` / `--session-dir` は本ドキュメント上の拡張提案であり、未実装。
 
 ## 7. ファイル単位の変更案
 
 ### pc_app/app.py
-- `試験`タブへ `reliable_1k 設定` UIを追加（モード/冗長率/統計）。
+- `試験`タブへ `reliable_1k 設定` UIを追加（モード/profile/統計）。
 - `handle_delivery_ack` / `handle_long_text_payload` / `handle_pong` で構造化メトリクスを更新。
 - 既存 `save_logs()` とは別に `save_reliable_events_jsonl()` を追加。
 - 起動時に `LPWA_GUI_PROFILE` / `LPWA_TEST_SESSION_DIR` を読んで初期値反映。
@@ -113,18 +118,18 @@
   - `snapshot()` でGUI表示用辞書を返す。
 
 ### pc_app/lpwa_gui/protocol.py
-- 冗長送信用ヘルパーを追加（例: `make_reliable_long_text_messages(..., redundancy_ratio)`）。
+- 冗長送信用ヘルパーを追加（例: `make_reliable_1k_messages(..., profile_id)`）。
 - 既存 `make_ping_probe_command` は維持し、ラウンドID/試験IDを任意付与できる拡張を検討。
 
 ### pc_app/self_check.py
 - `ReliableStats` の計算検証を追加。
-- `redundancy_ratio` 指定時の long_text 送信生成数を検証。
+- profile指定時の reliable_1k 送信生成数を検証。
 - 失敗理由コードの正規化テストを追加。
 
 ### pc_app/README.md
 - `reliable_1k` モードの説明を追加。
-- GUI操作手順（通常/高信頼、冗長率、統計の見方）を追記。
-- ログ出力（`.log` + `jsonl`）と解析例を追記。
+- GUI操作手順（通常/高信頼、profile、統計の見方）を追記。
+- ログ出力（`.log` + `.jsonl` + `.csv`）と解析例を追記。
 
 ### pc_app/setup_and_run_gui.bat
 - 新オプション追加:
@@ -141,7 +146,7 @@
 - 追記不要でも運用可能だが、任意で `-SessionId` を追加しGUIログと命名規約を統一。
 
 ### tools（新規）/analyze_reliable_1k_log.py
-- `gui_reliable_1k_events.jsonl` から集計CSVを生成:
+- GUI保存JSONL から集計CSVを生成:
   - `restore_rate`, `retry_rate`, `fail_reason_breakdown`。
 - `test_logs/<session>/reliable_1k_summary.csv` を出力。
 

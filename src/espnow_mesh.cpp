@@ -13,6 +13,11 @@ namespace lpwa {
 namespace {
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint32_t kParseRejectDuplicateWindowMs = 250;
+#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE) && defined(WIFI_PROTOCOL_LR)
+constexpr bool kLongRangeProfileAvailable = true;
+#else
+constexpr bool kLongRangeProfileAvailable = false;
+#endif
 
 uint16_t randomDelayMs(uint16_t minMs, uint16_t maxMs) {
   if (maxMs < minMs) {
@@ -24,13 +29,6 @@ uint16_t randomDelayMs(uint16_t minMs, uint16_t maxMs) {
   const uint32_t span = static_cast<uint32_t>(maxMs - minMs) + 1U;
   const uint32_t r = esp_random() % span;
   return static_cast<uint16_t>(static_cast<uint32_t>(minMs) + r);
-}
-
-void delayRandomRange(uint16_t minMs, uint16_t maxMs) {
-  const uint16_t waitMs = randomDelayMs(minMs, maxMs);
-  if (waitMs > 0) {
-    delay(waitMs);
-  }
 }
 }
 
@@ -77,6 +75,14 @@ bool EspNowMesh::begin() {
   if (rxQueue_ == nullptr) {
     return false;
   }
+  if (txResultQueue_ == nullptr) {
+    txResultQueue_ = xQueueCreate(kRxQueueDepth, sizeof(TxResultItem));
+  } else {
+    xQueueReset(txResultQueue_);
+  }
+  if (txResultQueue_ == nullptr) {
+    return false;
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -84,29 +90,7 @@ bool EspNowMesh::begin() {
 
   // Best-effort tuning: if a platform build does not support one of these knobs,
   // continue with defaults instead of failing mesh startup.
-#if LPWA_ENABLE_BLE_RELAY
-  // Wi-Fi + BLE coexist requires modem sleep enabled on ESP32-C3.
-  (void)esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-#else
-  (void)esp_wifi_set_ps(WIFI_PS_NONE);
-#endif
   (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
-
-  uint8_t protocolMask = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
-#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
-#ifdef WIFI_PROTOCOL_LR
-  protocolMask = static_cast<uint8_t>(protocolMask | WIFI_PROTOCOL_LR);
-#endif
-#endif
-  esp_err_t protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, protocolMask);
-#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
-#ifdef WIFI_PROTOCOL_LR
-  if (protocolResult != ESP_OK) {
-    protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-  }
-#endif
-#endif
-  (void)protocolResult;
 
   hasStaMac_ = false;
   std::memset(staMac_, 0, sizeof(staMac_));
@@ -119,11 +103,9 @@ bool EspNowMesh::begin() {
     return false;
   }
 
-  // 84 == 21.0 dBm in 0.25 dBm steps (chip/regulatory limits still apply).
-  const esp_err_t txPowerResult = esp_wifi_set_max_tx_power(kMeshTxPowerQuarterDbm);
-  if (txPowerResult != ESP_OK) {
-    return false;
-  }
+  radioProfile_ = kWifiLongRangeDefault ? RadioProfile::LongRange : RadioProfile::Balanced;
+  nodeInfoTtl_ = kDefaultNodeInfoTtl;
+  nodeInfoPeriodMs_ = kNodeInfoPeriodMs;
 
   const esp_err_t initResult = esp_now_init();
   if (initResult != ESP_OK && initResult != ESP_ERR_ESPNOW_EXIST) {
@@ -141,6 +123,12 @@ bool EspNowMesh::begin() {
 
   const esp_err_t peerResult = esp_now_add_peer(&peerInfo);
   if (peerResult != ESP_OK && peerResult != ESP_ERR_ESPNOW_EXIST) {
+    return false;
+  }
+
+  // Apply profile after ESP-NOW init/peer setup because some Wi-Fi state can
+  // be reset during bring-up; this keeps LR/BT coexist settings effective.
+  if (!applyRadioProfile(radioProfile_)) {
     return false;
   }
 
@@ -164,6 +152,7 @@ bool EspNowMesh::begin() {
 }
 
 void EspNowMesh::loop() {
+  processTxResultQueue();
   processRxQueue();
 
   uint32_t droppedByTimeout = 0;
@@ -172,9 +161,9 @@ void EspNowMesh::loop() {
 
   const uint32_t nowMs = millis();
   if (static_cast<int32_t>(nowMs - nextNodeInfoDueMs_) >= 0) {
-    sendNodeInfo(3);
+    sendNodeInfo(nodeInfoTtl_);
     const uint32_t jitterMs = randomDelayMs(0, kNodeInfoJitterMaxMs);
-    nextNodeInfoDueMs_ = nowMs + kNodeInfoPeriodMs + jitterMs;
+    nextNodeInfoDueMs_ = nowMs + nodeInfoPeriodMs_ + jitterMs;
   }
 }
 
@@ -251,22 +240,33 @@ size_t EspNowMesh::copyRouteRecords(RouteRecord* outRecords, size_t maxRecords) 
     if (!route.used || route.dstNodeId == 0) {
       continue;
     }
-    const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
-    if (std::memcmp(route.nextHopMac, zeroMac, 6) == 0) {
-      continue;
+    if (isRouteLegValid(route.nextHopMac, route.learnedMs, nowMs)) {
+      RouteRecord rec{};
+      rec.dstNodeId = route.dstNodeId;
+      rec.nextHopNodeId = route.nextHopNodeId;
+      rec.learnedMs = route.learnedMs;
+      rec.hops = route.hops;
+      rec.rank = 0;
+      rec.metricQ8 = route.metricQ8;
+      rec.hasNextHopMac = true;
+      std::memcpy(rec.nextHopMac, route.nextHopMac, sizeof(rec.nextHopMac));
+      outRecords[count++] = rec;
     }
-    if ((nowMs - route.learnedMs) > kRouteExpireMs) {
-      continue;
+    if (count >= maxRecords) {
+      break;
     }
-    RouteRecord rec{};
-    rec.dstNodeId = route.dstNodeId;
-    rec.nextHopNodeId = route.nextHopNodeId;
-    rec.learnedMs = route.learnedMs;
-    rec.hops = route.hops;
-    rec.metricQ8 = route.metricQ8;
-    rec.hasNextHopMac = true;
-    std::memcpy(rec.nextHopMac, route.nextHopMac, sizeof(rec.nextHopMac));
-    outRecords[count++] = rec;
+    if (isRouteLegValid(route.backupNextHopMac, route.backupLearnedMs, nowMs)) {
+      RouteRecord rec{};
+      rec.dstNodeId = route.dstNodeId;
+      rec.nextHopNodeId = route.backupNextHopNodeId;
+      rec.learnedMs = route.backupLearnedMs;
+      rec.hops = route.backupHops;
+      rec.rank = 1;
+      rec.metricQ8 = route.backupMetricQ8;
+      rec.hasNextHopMac = true;
+      std::memcpy(rec.nextHopMac, route.backupNextHopMac, sizeof(rec.nextHopMac));
+      outRecords[count++] = rec;
+    }
   }
   return count;
 }
@@ -291,6 +291,93 @@ bool EspNowMesh::resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) con
     }
   }
   return false;
+}
+
+bool EspNowMesh::setRadioProfile(RadioProfile profile) {
+  if (profile == RadioProfile::LongRange && !kLongRangeProfileAvailable) {
+    return false;
+  }
+  if (!applyRadioProfile(profile)) {
+    return false;
+  }
+  radioProfile_ = profile;
+  return true;
+}
+
+void EspNowMesh::setNodeInfoConfig(uint8_t ttl, uint32_t periodMs) {
+  nodeInfoTtl_ = clampTtl(ttl);
+  nodeInfoPeriodMs_ = clampNodeInfoPeriodMs(periodMs);
+  const uint32_t nowMs = millis();
+  if (nextNodeInfoDueMs_ == 0 || static_cast<int32_t>(nextNodeInfoDueMs_ - nowMs) > static_cast<int32_t>(nodeInfoPeriodMs_)) {
+    nextNodeInfoDueMs_ = nowMs + randomDelayMs(0, kNodeInfoJitterMaxMs);
+  }
+}
+
+bool EspNowMesh::parseRadioProfileText(const char* text, RadioProfile* outProfile) {
+  if (outProfile != nullptr) {
+    *outProfile = RadioProfile::Balanced;
+  }
+  if (text == nullptr || text[0] == '\0') {
+    return false;
+  }
+  if (std::strcmp(text, "balanced") == 0 || std::strcmp(text, "normal") == 0) {
+    if (outProfile != nullptr) {
+      *outProfile = RadioProfile::Balanced;
+    }
+    return true;
+  }
+  if (std::strcmp(text, "long_range") == 0 || std::strcmp(text, "lr") == 0) {
+    if (outProfile != nullptr) {
+      *outProfile = RadioProfile::LongRange;
+    }
+    return true;
+  }
+  if (std::strcmp(text, "coexist") == 0 || std::strcmp(text, "ble") == 0) {
+    if (outProfile != nullptr) {
+      *outProfile = RadioProfile::Coexist;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool EspNowMesh::applyRadioProfile(RadioProfile profile) {
+  wifi_ps_type_t psMode = WIFI_PS_NONE;
+  uint8_t protocolMask = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+  // ESP32-C3 requires Wi-Fi modem sleep when BLE and some Wi-Fi combinations
+  // (notably LR) are enabled together; otherwise IDF can abort at runtime.
+#if LPWA_ENABLE_BLE_RELAY
+  const bool bleRelayEnabled = true;
+#else
+  const bool bleRelayEnabled = false;
+#endif
+  // ESP32-C3 Wi-Fi+BLE coexistence requires modem sleep enabled.
+  const bool needsModemSleep = bleRelayEnabled || (profile == RadioProfile::Coexist);
+  if (needsModemSleep) {
+    psMode = WIFI_PS_MIN_MODEM;
+  }
+  if (profile == RadioProfile::LongRange) {
+    if (!kLongRangeProfileAvailable) {
+      return false;
+    }
+#ifdef WIFI_PROTOCOL_LR
+    protocolMask = static_cast<uint8_t>(protocolMask | WIFI_PROTOCOL_LR);
+#else
+    return false;
+#endif
+  }
+  if (esp_wifi_set_ps(psMode) != ESP_OK) {
+    return false;
+  }
+  esp_err_t protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, protocolMask);
+  if (protocolResult != ESP_OK) {
+    return false;
+  }
+  // 84 == 21.0 dBm in 0.25 dBm steps (chip/regulatory limits still apply).
+  if (esp_wifi_set_max_tx_power(kMeshTxPowerQuarterDbm) != ESP_OK) {
+    return false;
+  }
+  return true;
 }
 
 void EspNowMesh::onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
@@ -325,18 +412,18 @@ void EspNowMesh::onRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int 
 #endif
 
 void EspNowMesh::onSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    stats_.txSuccess++;
-  } else {
-    stats_.txFailed++;
+  const bool success = (status == ESP_NOW_SEND_SUCCESS);
+  if (!enqueueTxResult(mac_addr, success)) {
+    stats_.txResultQueueDropped++;
+    if (success) {
+      stats_.txSuccess++;
+    } else {
+      stats_.txFailed++;
+    }
   }
-  (void)mac_addr;
 }
 
 void EspNowMesh::onRecv(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len) {
-  if (mac_addr != nullptr) {
-    (void)ensurePeerForMac(mac_addr);
-  }
   if (!enqueueRx(mac_addr, rssi, data, len)) {
     stats_.rxQueueDropped++;
   }
@@ -358,6 +445,43 @@ bool EspNowMesh::enqueueRx(const uint8_t* mac_addr, int8_t rssi, const uint8_t* 
   std::memcpy(item.data, data, len);
 
   return xQueueSend(rxQueue_, &item, 0) == pdTRUE;
+}
+
+bool EspNowMesh::enqueueTxResult(const uint8_t* mac_addr, bool success) {
+  if (txResultQueue_ == nullptr) {
+    return false;
+  }
+  TxResultItem item{};
+  item.success = success;
+  item.hasMac = (mac_addr != nullptr) && (std::memcmp(mac_addr, kBroadcastMac, 6) != 0);
+  if (item.hasMac) {
+    std::memcpy(item.mac, mac_addr, sizeof(item.mac));
+  } else {
+    std::memset(item.mac, 0, sizeof(item.mac));
+  }
+  return xQueueSend(txResultQueue_, &item, 0) == pdTRUE;
+}
+
+void EspNowMesh::processTxResultQueue() {
+  if (txResultQueue_ == nullptr) {
+    return;
+  }
+  TxResultItem item{};
+  uint8_t processed = 0;
+  while (processed < kRxProcessBudgetPerLoop && xQueueReceive(txResultQueue_, &item, 0) == pdTRUE) {
+    if (item.success) {
+      stats_.txSuccess++;
+    } else {
+      stats_.txFailed++;
+    }
+    if (item.hasMac) {
+      NeighborEntry* neighbor = findNeighbor(item.mac);
+      if (neighbor != nullptr) {
+        updateNeighborTxEtx(neighbor, item.success);
+      }
+    }
+    processed++;
+  }
 }
 
 void EspNowMesh::processRxQueue() {
@@ -466,11 +590,13 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
 
   uint8_t forwardBuffer[kEspNowMaxPayload];
   std::memcpy(forwardBuffer, item.data, item.len);
-  MeshFrameHeader* forwardHeader = reinterpret_cast<MeshFrameHeader*>(forwardBuffer);
-  forwardHeader->ttl = static_cast<uint8_t>(forwardHeader->ttl - 1);
-  if (forwardHeader->hops < 0xFF) {
-    forwardHeader->hops = static_cast<uint8_t>(forwardHeader->hops + 1);
+  MeshFrameHeader forwardHeader{};
+  std::memcpy(&forwardHeader, forwardBuffer, sizeof(forwardHeader));
+  forwardHeader.ttl = static_cast<uint8_t>(forwardHeader.ttl - 1);
+  if (forwardHeader.hops < 0xFF) {
+    forwardHeader.hops = static_cast<uint8_t>(forwardHeader.hops + 1);
   }
+  std::memcpy(forwardBuffer, &forwardHeader, sizeof(forwardHeader));
 
   uint8_t attempts = 1;
   if (header.type == static_cast<uint8_t>(FrameType::NodeInfo)) {
@@ -494,7 +620,7 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
         }
         stats_.routedUnicastFail++;
         if ((attempt + 1) < attempts) {
-          delayRandomRange(kForwardJitterMinMs, kForwardJitterMaxMs);
+          cooperativeDelay(kForwardJitterMinMs, kForwardJitterMaxMs);
         }
       }
     } else {
@@ -512,7 +638,7 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
         break;
       }
       if ((attempt + 1) < attempts) {
-        delayRandomRange(kForwardJitterMinMs, kForwardJitterMaxMs);
+        cooperativeDelay(kForwardJitterMinMs, kForwardJitterMaxMs);
       }
     }
   }
@@ -741,14 +867,14 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
         sentAny = true;
       }
       if ((attempt + 1) < attemptBudget) {
-        delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
+        cooperativeDelay(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
     if (!sentAny) {
       return false;
     }
     if ((index + 1) < fragmentCount) {
-      delayRandomRange(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
+      cooperativeDelay(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
     }
   }
 
@@ -761,7 +887,7 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
 bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* payload, size_t len,
                                      uint32_t dstNodeId, uint8_t ttl, uint32_t* outMessageId) {
   if (dstNodeId == 0 || dstNodeId == nodeId_) {
-    return sendPayload(payloadType, payload, len, ttl, outMessageId);
+    return false;
   }
   if (LPWA_ROUTING_MODE <= 0) {
     return sendPayload(payloadType, payload, len, ttl, outMessageId);
@@ -863,14 +989,14 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
         sentAny = true;
       }
       if ((attempt + 1) < attemptBudget) {
-        delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
+        cooperativeDelay(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
     if (!sentAny) {
       return false;
     }
     if ((index + 1) < fragmentCount) {
-      delayRandomRange(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
+      cooperativeDelay(kInterFragmentGapMinMs, kInterFragmentGapMaxMs);
     }
   }
 
@@ -971,7 +1097,7 @@ bool EspNowMesh::sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len) 
       break;
     }
     stats_.txNoMemRetries++;
-    delayRandomRange(kSendRawNoMemBackoffMinMs, kSendRawNoMemBackoffMaxMs);
+    cooperativeDelay(kSendRawNoMemBackoffMinMs, kSendRawNoMemBackoffMaxMs);
   }
   if (result == ESP_ERR_ESPNOW_NO_MEM) {
     stats_.txNoMemDrops++;
@@ -990,6 +1116,17 @@ uint8_t EspNowMesh::clampTtl(uint8_t ttl) const {
   return ttl;
 }
 
+uint32_t EspNowMesh::clampNodeInfoPeriodMs(uint32_t periodMs) const {
+  uint32_t v = periodMs;
+  if (v < kNodeInfoPeriodMinMs) {
+    v = kNodeInfoPeriodMinMs;
+  }
+  if (v > kNodeInfoPeriodMaxMs) {
+    v = kNodeInfoPeriodMaxMs;
+  }
+  return v;
+}
+
 uint8_t EspNowMesh::adaptiveAttemptBudget(uint8_t baseAttempts) const {
   uint8_t attempts = (baseAttempts == 0) ? 1 : baseAttempts;
   uint16_t queued = 0;
@@ -1005,6 +1142,100 @@ uint8_t EspNowMesh::adaptiveAttemptBudget(uint8_t baseAttempts) const {
     attempts = 1;
   }
   return attempts;
+}
+
+bool EspNowMesh::isZeroMac(const uint8_t* mac) const {
+  if (mac == nullptr) {
+    return true;
+  }
+  const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
+  return std::memcmp(mac, zeroMac, 6) == 0;
+}
+
+bool EspNowMesh::isRouteLegValid(const uint8_t* nextHopMac, uint32_t learnedMs, uint32_t nowMs) const {
+  if (isZeroMac(nextHopMac)) {
+    return false;
+  }
+  if ((nowMs - learnedMs) > kRouteExpireMs) {
+    return false;
+  }
+  return true;
+}
+
+void EspNowMesh::promoteBackup(RouteEntry* route, uint32_t nowMs) {
+  if (route == nullptr) {
+    return;
+  }
+  if (!isRouteLegValid(route->backupNextHopMac, route->backupLearnedMs, nowMs)) {
+    return;
+  }
+  std::memcpy(route->nextHopMac, route->backupNextHopMac, sizeof(route->nextHopMac));
+  route->nextHopNodeId = route->backupNextHopNodeId;
+  route->hops = route->backupHops;
+  route->metricQ8 = route->backupMetricQ8;
+  route->learnedMs = route->backupLearnedMs;
+
+  std::memset(route->backupNextHopMac, 0, sizeof(route->backupNextHopMac));
+  route->backupNextHopNodeId = 0;
+  route->backupHops = 0;
+  route->backupMetricQ8 = 0;
+  route->backupLearnedMs = 0;
+  stats_.routePromoted++;
+}
+
+void EspNowMesh::cooperativeDelay(uint16_t minMs, uint16_t maxMs) {
+  const uint16_t waitMs = randomDelayMs(minMs, maxMs);
+  if (waitMs == 0) {
+    return;
+  }
+  const bool pumpRxQueue = !inCooperativeDelay_;
+  if (pumpRxQueue) {
+    inCooperativeDelay_ = true;
+  }
+  const uint32_t started = millis();
+  while ((millis() - started) < waitMs) {
+    if (pumpRxQueue) {
+      processRxQueue();
+    }
+    delay(1);
+  }
+  if (pumpRxQueue) {
+    inCooperativeDelay_ = false;
+  }
+}
+
+void EspNowMesh::updateNeighborTxEtx(NeighborEntry* neighbor, bool success) {
+  if (neighbor == nullptr) {
+    return;
+  }
+  if (success) {
+    if (neighbor->txOk < 0xFFFFU) {
+      neighbor->txOk++;
+    }
+  } else {
+    if (neighbor->txFail < 0xFFFFU) {
+      neighbor->txFail++;
+    }
+  }
+  const uint32_t total = static_cast<uint32_t>(neighbor->txOk) + static_cast<uint32_t>(neighbor->txFail);
+  if (total > 320U) {
+    neighbor->txOk = static_cast<uint16_t>(neighbor->txOk / 2U);
+    neighbor->txFail = static_cast<uint16_t>(neighbor->txFail / 2U);
+  }
+  const uint16_t ok = (neighbor->txOk == 0) ? 1 : neighbor->txOk;
+  const uint16_t fail = neighbor->txFail;
+  uint32_t sampleQ8 = ((static_cast<uint32_t>(ok) + static_cast<uint32_t>(fail)) * 256U) / ok;
+  if (sampleQ8 < 256U) {
+    sampleQ8 = 256U;
+  } else if (sampleQ8 > 2048U) {
+    sampleQ8 = 2048U;
+  }
+  if (neighbor->etxQ8 == 0) {
+    neighbor->etxQ8 = static_cast<uint16_t>(sampleQ8);
+  } else {
+    neighbor->etxQ8 = static_cast<uint16_t>(
+        (static_cast<uint32_t>(neighbor->etxQ8) * 7U + sampleQ8 + 4U) / 8U);
+  }
 }
 
 bool EspNowMesh::ensurePeerForMac(const uint8_t* mac) {
@@ -1041,9 +1272,22 @@ void EspNowMesh::pruneRoutingTables(uint32_t nowMs) {
     if (!r.used) {
       continue;
     }
-    if ((nowMs - r.learnedMs) > kRouteExpireMs) {
+    const bool primaryValid = isRouteLegValid(r.nextHopMac, r.learnedMs, nowMs);
+    const bool backupValid = isRouteLegValid(r.backupNextHopMac, r.backupLearnedMs, nowMs);
+    if (!primaryValid && backupValid) {
+      promoteBackup(&r, nowMs);
+    }
+    if (!primaryValid && !backupValid) {
       r = RouteEntry{};
       stats_.routeExpired++;
+      continue;
+    }
+    if (!backupValid) {
+      std::memset(r.backupNextHopMac, 0, sizeof(r.backupNextHopMac));
+      r.backupNextHopNodeId = 0;
+      r.backupHops = 0;
+      r.backupMetricQ8 = 0;
+      r.backupLearnedMs = 0;
     }
   }
 }
@@ -1074,39 +1318,56 @@ void EspNowMesh::learnRouteFromFrame(uint32_t originId, const uint8_t* senderMac
     return;
   }
 
-  const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
-  const bool empty =
-      !route->used || route->dstNodeId == 0 || std::memcmp(route->nextHopMac, zeroMac, 6) == 0;
-  bool better = empty;
-  if (!better) {
-    if ((nowMs - route->learnedMs) > kRouteExpireMs) {
-      better = true;
-    } else if (std::memcmp(route->nextHopMac, senderMac, 6) == 0) {
-      better = true;
-    } else {
-      const uint32_t old = route->metricQ8;
-      const uint32_t now = metricQ8;
-      better = (now + kRouteHysteresisQ8) < old;
-    }
-  }
-  if (!better) {
-    return;
-  }
-
   uint32_t nextHopNodeId = 0;
   (void)resolveNodeIdByMac(senderMac, &nextHopNodeId);
+  const bool empty = !route->used || route->dstNodeId == 0 || !isRouteLegValid(route->nextHopMac, route->learnedMs, nowMs);
 
-  const bool changed =
-      empty || std::memcmp(route->nextHopMac, senderMac, 6) != 0 || route->hops != routeHops ||
-      route->metricQ8 != metricQ8 || route->nextHopNodeId != nextHopNodeId;
-
-  route->used = true;
-  route->dstNodeId = originId;
-  std::memcpy(route->nextHopMac, senderMac, 6);
-  route->learnedMs = nowMs;
-  route->hops = routeHops;
-  route->metricQ8 = metricQ8;
-  route->nextHopNodeId = nextHopNodeId;
+  bool changed = false;
+  const bool samePrimary = std::memcmp(route->nextHopMac, senderMac, 6) == 0;
+  if (empty || samePrimary) {
+    changed = empty || route->hops != routeHops || route->metricQ8 != metricQ8 ||
+              route->nextHopNodeId != nextHopNodeId;
+    route->used = true;
+    route->dstNodeId = originId;
+    std::memcpy(route->nextHopMac, senderMac, 6);
+    route->learnedMs = nowMs;
+    route->hops = routeHops;
+    route->metricQ8 = metricQ8;
+    route->nextHopNodeId = nextHopNodeId;
+  } else {
+    const uint32_t currentMetric = route->metricQ8;
+    const bool primaryBetter = (metricQ8 + kRouteHysteresisQ8) < currentMetric;
+    if (primaryBetter) {
+      const bool backupPresent = !isZeroMac(route->nextHopMac);
+      if (backupPresent) {
+        std::memcpy(route->backupNextHopMac, route->nextHopMac, sizeof(route->backupNextHopMac));
+        route->backupNextHopNodeId = route->nextHopNodeId;
+        route->backupHops = route->hops;
+        route->backupMetricQ8 = route->metricQ8;
+        route->backupLearnedMs = route->learnedMs;
+      }
+      route->used = true;
+      route->dstNodeId = originId;
+      std::memcpy(route->nextHopMac, senderMac, 6);
+      route->nextHopNodeId = nextHopNodeId;
+      route->hops = routeHops;
+      route->metricQ8 = metricQ8;
+      route->learnedMs = nowMs;
+      changed = true;
+    } else {
+      const bool sameBackup = std::memcmp(route->backupNextHopMac, senderMac, 6) == 0;
+      const bool hasBackup = isRouteLegValid(route->backupNextHopMac, route->backupLearnedMs, nowMs);
+      if (sameBackup || !hasBackup || (metricQ8 + kRouteHysteresisQ8) < route->backupMetricQ8) {
+        changed = sameBackup || !hasBackup || route->backupMetricQ8 != metricQ8 ||
+                  route->backupHops != routeHops || route->backupNextHopNodeId != nextHopNodeId;
+        std::memcpy(route->backupNextHopMac, senderMac, sizeof(route->backupNextHopMac));
+        route->backupNextHopNodeId = nextHopNodeId;
+        route->backupHops = routeHops;
+        route->backupMetricQ8 = metricQ8;
+        route->backupLearnedMs = nowMs;
+      }
+    }
+  }
   if (changed) {
     stats_.routeLearned++;
   }
@@ -1124,17 +1385,23 @@ bool EspNowMesh::selectRoute(uint32_t dstNodeId, RouteEntry* outRoute) {
     return false;
   }
   const uint32_t nowMs = millis();
-  if ((nowMs - route->learnedMs) > kRouteExpireMs) {
+  const bool primaryValid = isRouteLegValid(route->nextHopMac, route->learnedMs, nowMs);
+  const bool backupValid = isRouteLegValid(route->backupNextHopMac, route->backupLearnedMs, nowMs);
+  if (!primaryValid && backupValid) {
+    promoteBackup(route, nowMs);
+  }
+  if (!primaryValid && !backupValid) {
     route->used = false;
     route->dstNodeId = 0;
     stats_.routeExpired++;
     return false;
   }
-  const uint8_t zeroMac[6] = {0, 0, 0, 0, 0, 0};
-  if (std::memcmp(route->nextHopMac, zeroMac, 6) == 0) {
-    route->used = false;
-    route->dstNodeId = 0;
-    return false;
+  if (!backupValid) {
+    std::memset(route->backupNextHopMac, 0, sizeof(route->backupNextHopMac));
+    route->backupNextHopNodeId = 0;
+    route->backupHops = 0;
+    route->backupMetricQ8 = 0;
+    route->backupLearnedMs = 0;
   }
   if (outRoute != nullptr) {
     *outRoute = *route;
@@ -1258,7 +1525,11 @@ uint16_t EspNowMesh::computeRouteMetricQ8(const NeighborEntry* neighbor, uint8_t
   const uint16_t etxQ8 = (neighbor != nullptr) ? neighbor->etxQ8 : static_cast<uint16_t>(256);
   const uint32_t hopTerm = static_cast<uint32_t>(hops) * static_cast<uint32_t>(kMetricWeightHopQ8) * 8U;
   const uint32_t etxTerm = (static_cast<uint32_t>(etxQ8) * static_cast<uint32_t>(kMetricWeightEtxQ8)) / 16U;
-  const int16_t rssiAbs = static_cast<int16_t>(-rssi);
+  int16_t usedRssi = static_cast<int16_t>(rssi);
+  if (neighbor != nullptr && neighbor->rssiEwmaQ8 != 0) {
+    usedRssi = static_cast<int16_t>(neighbor->rssiEwmaQ8 / 256);
+  }
+  const int16_t rssiAbs = static_cast<int16_t>(-usedRssi);
   const uint32_t rssiTerm =
       (static_cast<uint32_t>((rssiAbs > 0) ? rssiAbs : 0) * static_cast<uint32_t>(kMetricWeightRssiQ8)) / 2U;
   const uint32_t total = hopTerm + etxTerm + rssiTerm;

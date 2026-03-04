@@ -26,19 +26,31 @@ class PingStats:
     sent_count: int = 0
     recv_count: int = 0
     _pending_sent_ts: dict[int, int] = field(default_factory=dict)
+    _pending_meta: dict[int, dict[str, str | int]] = field(default_factory=dict)
     _latencies_ms: list[float] = field(default_factory=list)
+    _sent_by_dst: dict[str, int] = field(default_factory=dict)
+    _recv_by_dst: dict[str, int] = field(default_factory=dict)
+    _latencies_by_dst: dict[str, list[float]] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.sent_count = 0
         self.recv_count = 0
         self._pending_sent_ts.clear()
+        self._pending_meta.clear()
         self._latencies_ms.clear()
+        self._sent_by_dst.clear()
+        self._recv_by_dst.clear()
+        self._latencies_by_dst.clear()
 
-    def register_sent(self, seq: int, sent_ts_ms: int | None = None) -> None:
+    def register_sent(self, seq: int, sent_ts_ms: int | None = None, *, dst: str | None = None) -> None:
+        dst_key = (dst or "all").strip() or "all"
         self.sent_count += 1
         self._pending_sent_ts[seq] = sent_ts_ms if sent_ts_ms is not None else _now_ms()
+        self._pending_meta[seq] = {"dst": dst_key}
+        self._sent_by_dst[dst_key] = int(self._sent_by_dst.get(dst_key, 0)) + 1
 
     def expire_pending(self, seq: int) -> bool:
+        self._pending_meta.pop(seq, None)
         return self._pending_sent_ts.pop(seq, None) is not None
 
     def register_received(
@@ -47,9 +59,13 @@ class PingStats:
         *,
         recv_ts_ms: int | None = None,
         latency_ms: float | None = None,
+        dst: str | None = None,
     ) -> float | None:
         if seq in self._pending_sent_ts or latency_ms is not None:
             self.recv_count += 1
+
+        meta = self._pending_meta.get(seq) or {}
+        dst_key = (dst or str(meta.get("dst") or "all")).strip() or "all"
 
         measured: float | None = None
         if latency_ms is not None:
@@ -62,24 +78,36 @@ class PingStats:
 
         if measured is not None:
             self._latencies_ms.append(measured)
+            self._latencies_by_dst.setdefault(dst_key, []).append(measured)
+        self._recv_by_dst[dst_key] = int(self._recv_by_dst.get(dst_key, 0)) + 1
 
+        self._pending_meta.pop(seq, None)
         self._pending_sent_ts.pop(seq, None)
         return measured
 
-    def snapshot(self) -> dict[str, float | int]:
-        lost = max(0, self.sent_count - self.recv_count)
-        pdr = (float(self.recv_count) / float(self.sent_count) * 100.0) if self.sent_count else 0.0
-        avg = (sum(self._latencies_ms) / len(self._latencies_ms)) if self._latencies_ms else 0.0
+    def snapshot(self, *, target: str = "all") -> dict[str, float | int]:
+        target_key = (target or "all").strip() or "all"
+        if target_key == "all":
+            sent_count = self.sent_count
+            recv_count = self.recv_count
+            latencies = self._latencies_ms
+        else:
+            sent_count = int(self._sent_by_dst.get(target_key, 0))
+            recv_count = int(self._recv_by_dst.get(target_key, 0))
+            latencies = self._latencies_by_dst.get(target_key, [])
+        lost = max(0, sent_count - recv_count)
+        pdr = (float(recv_count) / float(sent_count) * 100.0) if sent_count else 0.0
+        avg = (sum(latencies) / len(latencies)) if latencies else 0.0
         return {
-            "sent": self.sent_count,
-            "received": self.recv_count,
+            "sent": sent_count,
+            "received": recv_count,
             "lost": lost,
             "pdr": pdr,
             "avg_ms": avg,
-            "min_ms": min(self._latencies_ms) if self._latencies_ms else 0.0,
-            "max_ms": max(self._latencies_ms) if self._latencies_ms else 0.0,
-            "p50_ms": _percentile(self._latencies_ms, 0.50),
-            "p95_ms": _percentile(self._latencies_ms, 0.95),
+            "min_ms": min(latencies) if latencies else 0.0,
+            "max_ms": max(latencies) if latencies else 0.0,
+            "p50_ms": _percentile(list(latencies), 0.50),
+            "p95_ms": _percentile(list(latencies), 0.95),
         }
 
 

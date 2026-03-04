@@ -129,7 +129,9 @@ $ports6 = @("COM6","COM7","COM8","COM9","COM10","COM11")
 - `--collect-stats`（各ラウンド前後で `{"cmd":"get_stats"}` を自動取得）
 - `--threshold-file <path>` + `--strict-pass`（閾値判定で終了コード制御）
 - `--require-min-hops N`（成功ラウンドで最小ホップ要件を課す）
+- `--session-dir <path>` / `--run-id <id>` / `--scenario <name>`
 - `--jsonl-out <path>`（ラウンドごとの詳細）
+- `--events-jsonl <path>`（イベントログ）
 - `--summary-json <path>`（集計結果）
 
 ### 8.2 ラウンド集計ロジック（実装済み）
@@ -139,17 +141,25 @@ $ports6 = @("COM6","COM7","COM8","COM9","COM10","COM11")
   - `retry_rate` / `rx_queue_drop_ratio`（`mesh_delta` から算出）
 - 最終集計:
   - `success_rate`
-  - `latency min/max/avg`
+  - `latency min/max/avg/p95`
   - `hops min/max`
+  - `max_consecutive_failures_observed`
+  - `route_hit_rate_observed`
+  - `route_fallback_ratio_observed`
   - `threshold_violations`
 
 ### 8.3 閾値ファイル仕様（実装済み）
 - JSON object のキー:
   - `min_success_rate`（0.0..1.0）
   - `max_latency_ms`（>0）
+  - `max_latency_p95_ms`（>0）
   - `max_retry_rate`（0.0..1.0）
   - `max_rx_queue_drop_ratio`（0.0..1.0）
   - `require_min_hops`（>=0）
+  - `max_consecutive_failures`（>=0）
+  - `min_probe_hash_ok_rate`（0.0..1.0）
+  - `min_route_hit_rate`（0.0..1.0）
+  - `max_route_fallback_ratio`（0.0..1.0）
 - CLI側 `--require-min-hops` / `--r1k-max-latency-ms` / `--r1k-max-retry-rate` と合成される。
 
 ### 8.4 実行例（3台）
@@ -158,9 +168,11 @@ py -3 .\tools\mesh_smoke_test.py `
   --ports COM6 COM7 COM8 `
   --timeout 45 --ack-timeout 4 --ack-retries 6 --skip-ble `
   --rounds 12 --interval-ms 700 --rotate-tx --collect-stats `
+  --session-dir .\test_logs\session_xxx --run-id smoke_a --scenario indoor_s5 `
   --threshold-file .\docs\reliable_1k_thresholds.json --strict-pass `
-  --jsonl-out .\test_logs\latest_rounds.jsonl `
-  --summary-json .\test_logs\latest_summary.json
+  --jsonl-out .\test_logs\session_xxx\smoke\smoke_a_rounds.jsonl `
+  --events-jsonl .\test_logs\session_xxx\smoke\smoke_a_events.jsonl `
+  --summary-json .\test_logs\session_xxx\smoke\smoke_a_summary.json
 ```
 
 補足:

@@ -12,6 +12,9 @@
 namespace lpwa {
 
 namespace {
+#ifndef LPWA_ENABLE_TRACE_TELEMETRY
+#define LPWA_ENABLE_TRACE_TELEMETRY 0
+#endif
 constexpr uint8_t kTraceTelemetryTtl = 3;
 constexpr uint32_t kTraceTelemetryMinIntervalMs = 120;
 constexpr uint16_t kPingProbeMagic = 0x504C;  // 'LP'
@@ -21,6 +24,11 @@ constexpr uint8_t kPingProbeKindPongOk = 2;
 constexpr uint8_t kPingProbeKindPongBad = 3;
 constexpr uint16_t kPingProbeBytesDefault = 1000;
 constexpr uint16_t kPingProbeBytesMax = 1000;
+#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE) && defined(WIFI_PROTOCOL_LR)
+constexpr bool kLongRangeProfileAvailable = true;
+#else
+constexpr bool kLongRangeProfileAvailable = false;
+#endif
 
 struct PingProbeHeader {
   uint16_t magic;
@@ -191,6 +199,41 @@ String formatHex8(uint32_t value) {
   return String(buffer);
 }
 
+const char* radioProfileName(EspNowMesh::RadioProfile profile) {
+  switch (profile) {
+    case EspNowMesh::RadioProfile::Balanced:
+      return "balanced";
+    case EspNowMesh::RadioProfile::LongRange:
+      return "long_range";
+    case EspNowMesh::RadioProfile::Coexist:
+      return "coexist";
+    default:
+      return "unknown";
+  }
+}
+
+bool parseRadioProfile(const String& text, EspNowMesh::RadioProfile* outProfile) {
+  if (outProfile != nullptr) {
+    *outProfile = EspNowMesh::RadioProfile::Balanced;
+  }
+  if (text.equalsIgnoreCase("balanced") || text.equalsIgnoreCase("normal")) {
+    return true;
+  }
+  if (text.equalsIgnoreCase("long_range") || text.equalsIgnoreCase("lr")) {
+    if (outProfile != nullptr) {
+      *outProfile = EspNowMesh::RadioProfile::LongRange;
+    }
+    return true;
+  }
+  if (text.equalsIgnoreCase("coexist") || text.equalsIgnoreCase("ble")) {
+    if (outProfile != nullptr) {
+      *outProfile = EspNowMesh::RadioProfile::Coexist;
+    }
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 SerialJsonBridge::SerialJsonBridge(EspNowMesh* mesh, BleRelay* ble) : mesh_(mesh), ble_(ble) {}
@@ -218,6 +261,8 @@ void SerialJsonBridge::begin(Stream* stream) {
     caps["routing_mode"] = LPWA_ROUTING_MODE;
     caps["reliable_1k"] = true;
     caps["reliable_profiles"] = "0:25+8,1:25+10";
+    caps["radio_profile"] = true;
+    caps["nodeinfo_cfg"] = true;
   }
   serializeJson(doc, *serial_);
   serial_->println();
@@ -284,7 +329,7 @@ void SerialJsonBridge::handleLine(const char* line) {
 
   bridgeStats_.commandCount++;
 
-  DynamicJsonDocument request(4096);
+  DynamicJsonDocument request(3072);
   const DeserializationError err = deserializeJson(request, line);
   if (err) {
     bridgeStats_.commandErrors++;
@@ -650,6 +695,61 @@ void SerialJsonBridge::handleLine(const char* line) {
     return;
   }
 
+  if (cmd == "set_radio_profile") {
+    if (mesh_ == nullptr) {
+      bridgeStats_.commandErrors++;
+      emitError("mesh_unavailable", "mesh not initialized");
+      return;
+    }
+    String profileText = request["profile"] | "";
+    EspNowMesh::RadioProfile profile = EspNowMesh::RadioProfile::Balanced;
+    if (profileText.isEmpty() || !parseRadioProfile(profileText, &profile)) {
+      bridgeStats_.commandErrors++;
+      emitError("invalid_field", "profile must be balanced/long_range/coexist");
+      return;
+    }
+    if (profile == EspNowMesh::RadioProfile::LongRange && !kLongRangeProfileAvailable) {
+      bridgeStats_.commandErrors++;
+      emitError("unsupported_profile", "long_range is disabled by build flags");
+      emitAck("set_radio_profile", false, "wifi", 0);
+      return;
+    }
+    const bool ok = mesh_->setRadioProfile(profile);
+    emitAck("set_radio_profile", ok, "wifi", 0);
+    return;
+  }
+
+  if (cmd == "set_nodeinfo_cfg") {
+    if (mesh_ == nullptr) {
+      bridgeStats_.commandErrors++;
+      emitError("mesh_unavailable", "mesh not initialized");
+      return;
+    }
+    uint8_t ttl = request["ttl"] | kDefaultNodeInfoTtl;
+    if (ttl == 0) {
+      ttl = 1;
+    }
+    uint32_t periodMs = request["period_ms"] | kNodeInfoPeriodMs;
+    mesh_->setNodeInfoConfig(ttl, periodMs);
+    emitAck("set_nodeinfo_cfg", true, "wifi", 0);
+    return;
+  }
+
+  if (cmd == "get_radio_profile") {
+    if (mesh_ == nullptr) {
+      bridgeStats_.commandErrors++;
+      emitError("mesh_unavailable", "mesh not initialized");
+      return;
+    }
+    DynamicJsonDocument out(256);
+    out["event"] = "radio_profile";
+    out["type"] = "radio_profile";
+    out["profile"] = radioProfileName(mesh_->radioProfile());
+    serializeJson(out, *serial_);
+    serial_->println();
+    return;
+  }
+
   if (cmd == "send_binary") {
     const char* b64 = request["data_b64"] | nullptr;
     if (b64 == nullptr) {
@@ -795,6 +895,7 @@ void SerialJsonBridge::handleLine(const char* line) {
     meshObj["tx_failed"] = meshStats.txFailed;
     meshObj["tx_no_mem_retries"] = meshStats.txNoMemRetries;
     meshObj["tx_no_mem_drops"] = meshStats.txNoMemDrops;
+    meshObj["tx_result_queue_dropped"] = meshStats.txResultQueueDropped;
     meshObj["rx_frames"] = meshStats.rxFrames;
     meshObj["rx_queue_dropped"] = meshStats.rxQueueDropped;
     meshObj["rx_parse_errors"] = meshStats.rxParseErrors;
@@ -808,6 +909,7 @@ void SerialJsonBridge::handleLine(const char* line) {
     meshObj["route_lookup_hit"] = meshStats.routeLookupHit;
     meshObj["route_lookup_miss"] = meshStats.routeLookupMiss;
     meshObj["route_learned"] = meshStats.routeLearned;
+    meshObj["route_promoted"] = meshStats.routePromoted;
     meshObj["route_expired"] = meshStats.routeExpired;
     meshObj["routed_unicast_attempts"] = meshStats.routedUnicastAttempts;
     meshObj["routed_unicast_success"] = meshStats.routedUnicastSuccess;
@@ -832,28 +934,40 @@ void SerialJsonBridge::handleLine(const char* line) {
   }
 
   if (cmd == "get_nodes") {
-    DynamicJsonDocument out(4600);
+    DynamicJsonDocument out(2048);
     out["event"] = "nodes";
     out["type"] = "node_list";
 
     JsonArray nodes = out.createNestedArray("nodes");
+    size_t total = 0;
+    size_t exported = 0;
+    bool truncated = false;
     if (mesh_ != nullptr) {
       NodeRecord records[kMaxKnownNodes];
       const size_t count = mesh_->copyNodeRecords(records, kMaxKnownNodes);
+      total = count;
       for (size_t i = 0; i < count; ++i) {
         JsonObject node = nodes.createNestedObject();
+        if (node.isNull()) {
+          truncated = true;
+          break;
+        }
         node["node_id"] = formatNodeId(records[i].nodeId);
         node["last_seen_ms"] = records[i].lastSeenMs;
         node["rssi"] = records[i].lastRssi;
-        if (records[i].hasMac) {
-          node["mac"] = formatMac(records[i].staMac);
-        }
         node["uptime_sec"] = records[i].uptimeSec;
         node["free_heap"] = records[i].freeHeap;
         node["remote_rx_frames"] = records[i].remoteRxFrames;
         node["remote_tx_frames"] = records[i].remoteTxFrames;
+        if (records[i].hasMac) {
+          node["mac"] = formatMac(records[i].staMac);
+        }
+        exported++;
       }
     }
+    out["count"] = exported;
+    out["total"] = total;
+    out["truncated"] = truncated;
 
     serializeJson(out, *serial_);
     serial_->println();
@@ -861,7 +975,7 @@ void SerialJsonBridge::handleLine(const char* line) {
   }
 
   if (cmd == "get_routes") {
-    DynamicJsonDocument out(8192);
+    DynamicJsonDocument out(4096);
     out["event"] = "routes";
     out["type"] = "route_list";
 
@@ -884,6 +998,7 @@ void SerialJsonBridge::handleLine(const char* line) {
           route["next_hop_mac"] = formatMac(records[i].nextHopMac);
         }
         route["hops"] = records[i].hops;
+        route["rank"] = records[i].rank;
         route["metric_q8"] = records[i].metricQ8;
         route["learned_ms"] = records[i].learnedMs;
         route["age_ms"] = nowMs - records[i].learnedMs;
@@ -989,7 +1104,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
           return;
         }
 
-        StaticJsonDocument<384> ack;
+        DynamicJsonDocument ack(384);
         ack["app"] = "lpwa";
         ack["type"] = "delivery_ack";
         ack["src"] = selfNodeId;
@@ -1026,6 +1141,9 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       };
 
       const auto emitTraceTelemetry = [&]() {
+#if !LPWA_ENABLE_TRACE_TELEMETRY
+        return;
+#endif
         if (mesh_ == nullptr || appType[0] == '\0' || std::strcmp(appType, "trace_obs") == 0) {
           return;
         }
@@ -1043,7 +1161,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
           return;
         }
         lastTraceTelemetryMs_ = nowMs;
-        StaticJsonDocument<512> trace;
+        DynamicJsonDocument trace(512);
         trace["app"] = "lpwa";
         trace["type"] = "trace_obs";
         trace["observer"] = selfNodeId;
@@ -1076,7 +1194,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (appType[0] == '\0' || std::strcmp(appType, "trace_obs") == 0) {
           return;
         }
-        StaticJsonDocument<640> observed;
+        DynamicJsonDocument observed(640);
         observed["event"] = "mesh_observed";
         observed["type"] = "mesh_observed";
         observed["app_type"] = appType;
@@ -1128,7 +1246,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       };
 
       if (std::strcmp(appType, "trace_obs") == 0) {
-        StaticJsonDocument<768> traceOut;
+        DynamicJsonDocument traceOut(768);
         traceOut["event"] = "mesh_trace";
         traceOut["type"] = "mesh_trace";
         traceOut["via"] = "wifi";
@@ -1163,7 +1281,8 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       emitObserved();
 
       if (std::strcmp(appType, "delivery_ack") == 0) {
-        if (!accepted) {
+        const char* ackDst = appDoc["dst"] | "";
+        if (ackDst[0] == '\0' || isBroadcastTarget(ackDst) || !equalsIgnoreCase(selfNodeId, ackDst)) {
           return;
         }
         DynamicJsonDocument out(384);
@@ -1237,7 +1356,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!accepted) {
           return;
         }
-        StaticJsonDocument<384> out;
+        DynamicJsonDocument out(384);
         out["event"] = "pong";
         out["type"] = "pong";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
@@ -1272,7 +1391,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!accepted) {
           return;
         }
-        StaticJsonDocument<512> out;
+        DynamicJsonDocument out(512);
         out["event"] = "mesh_rx";
         out["type"] = "chat";
         out["via"] = "wifi";
@@ -1633,7 +1752,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       }
     }
 
-    StaticJsonDocument<900> out;
+    DynamicJsonDocument out(900);
     out["event"] = "mesh_rx";
     out["type"] = "chat";
     out["via"] = "wifi";
@@ -1660,7 +1779,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       const uint32_t gotHash = fnv1a32(probePayload, probe.payloadLen);
       const bool hashOk = (gotHash == probe.payloadHash);
       if (mesh_ != nullptr && message.originId != 0 && message.originId != mesh_->nodeId()) {
-        StaticJsonDocument<320> pong;
+        DynamicJsonDocument pong(320);
         pong["app"] = "lpwa";
         pong["type"] = "pong";
         pong["src"] = selfNodeId;
@@ -1680,7 +1799,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
     }
 
     if (probe.kind == kPingProbeKindPongOk || probe.kind == kPingProbeKindPongBad) {
-      StaticJsonDocument<384> out;
+      DynamicJsonDocument out(384);
       out["event"] = "pong";
       out["type"] = "pong";
       out["via"] = "wifi";

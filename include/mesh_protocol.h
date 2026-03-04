@@ -32,7 +32,7 @@ namespace lpwa {
 #endif
 
 #ifndef LPWA_MESH_TX_POWER_QDBM
-#define LPWA_MESH_TX_POWER_QDBM 84
+#define LPWA_MESH_TX_POWER_QDBM 72
 #endif
 
 constexpr uint16_t kMeshMagic = 0x4C50;
@@ -45,7 +45,11 @@ constexpr uint8_t kDefaultTtl = 10;
 constexpr uint8_t kMaxTtl = 14;
 constexpr uint8_t kMeshChannel = LPWA_MESH_CHANNEL;
 constexpr int8_t kMeshTxPowerQuarterDbm = LPWA_MESH_TX_POWER_QDBM;
-#if LPWA_ENABLE_WIFI_LR && (!LPWA_ENABLE_BLE_RELAY || LPWA_ALLOW_WIFI_LR_WITH_BLE)
+#if LPWA_ENABLE_BLE_RELAY
+// Stability-first default: keep BLE coexistence mode as baseline.
+// Note: LPWA_ALLOW_WIFI_LR_WITH_BLE=0 の場合、runtime long_range も無効。
+constexpr bool kWifiLongRangeDefault = false;
+#elif LPWA_ENABLE_WIFI_LR
 constexpr bool kWifiLongRangeDefault = true;
 #else
 constexpr bool kWifiLongRangeDefault = false;
@@ -62,6 +66,9 @@ constexpr size_t kMaxAppPayload = 1024;
 constexpr size_t kMaxFragments = (kMaxAppPayload + kFragmentChunkSize - 1) / kFragmentChunkSize;
 
 constexpr uint32_t kNodeInfoPeriodMs = 15000;
+constexpr uint32_t kNodeInfoPeriodMinMs = 3000;
+constexpr uint32_t kNodeInfoPeriodMaxMs = 120000;
+constexpr uint8_t kDefaultNodeInfoTtl = 3;
 constexpr uint16_t kNodeInfoInitialJitterMinMs = 800;
 constexpr uint16_t kNodeInfoInitialJitterMaxMs = 4200;
 constexpr uint16_t kNodeInfoJitterMaxMs = 1800;
@@ -100,10 +107,10 @@ constexpr uint8_t kAdaptiveAttemptMax = 5;
 constexpr uint16_t kAdaptiveQueueHighWater = 96;
 constexpr uint16_t kAdaptiveQueueLowWater = 24;
 
-constexpr size_t kMaxKnownNodes = 32;
-constexpr size_t kMaxNeighborNodes = 32;
-constexpr size_t kMaxRouteEntries = 48;
-constexpr size_t kInboundMessageQueueDepth = 32;
+constexpr size_t kMaxKnownNodes = 48;
+constexpr size_t kMaxNeighborNodes = 48;
+constexpr size_t kMaxRouteEntries = 96;
+constexpr size_t kInboundMessageQueueDepth = 48;
 constexpr size_t kRxQueueDepth = 128;
 
 enum class FrameType : uint8_t {

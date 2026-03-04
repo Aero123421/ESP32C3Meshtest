@@ -13,14 +13,15 @@
   - PC-B <-> PC-C: text / long_text(1000文字級) / image
   - PC-A <-> PC-C: text / long_text(1000文字級) / image
 
-## 2.1 Phase定義（1〜4）
+## 2.1 Phase定義（1〜5）
 
 | Phase | 目的 | 実装要素 | 完了判定 |
 |---|---|---|---|
 | Phase1 | P2P成立 | chat/ping基本疎通 | 2台で双方向chat/ping成功 |
 | Phase2 | 経路最適化 | route学習 + next-hop転送 + fallback flood | `route_lookup_hit/(hit+miss) >= 70%` |
 | Phase3 | 1KB高信頼 | `reliable_1k_start/chunk/end` + NACK/repair | 1KB復元成功 + `delivery_ack` 成立 |
-| Phase4 | 自動適応/運用 | 宛先別profile自動調整 + Reliable統計 | 復元率/再送率がKPI範囲で安定 |
+| Phase4 | 自動適応/運用 | 宛先別profile自動調整 + Reliable統計 + route可視化 | 復元率/再送率がKPI範囲で安定 |
+| Phase5 | 回帰自動化 | session標準化 + 閾値プロファイル + triage自動化 | `run_mesh_regression.ps1` で再現可能 |
 
 補足:
 - Phase3/4の詳細基準は `docs/reliable_1k_test_design.md` を優先する。
@@ -39,9 +40,9 @@
 1. セッションテンプレートを作成
    - `.\tools\prepare_test_session.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12`
 2. 同一ビルドを書き込み
-   - `.\tools\flash_all.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12`
+   - `.\tools\flash_all.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12 -SessionDir .\test_logs\<session>`
 3. ログ保存付きモニタ起動
-   - `.\tools\monitor_all.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12 -Baud 115200 -LogDir .\test_logs\session_xxx`
+   - `.\tools\monitor_all.ps1 -Ports COM3,COM4,COM5,COM6,COM7,COM8,COM9,COM10,COM11,COM12 -Baud 115200 -SessionDir .\test_logs\<session>`
 4. PC GUIで各PCの直結ノードを接続し、`nodes_request` でノード一覧を取得
 
 ## 5. 評価KPI（初期値）
@@ -89,7 +90,10 @@
 
 ## 8. 収集ログ
 - `test_logs/<timestamp>/session.md`
-- `test_logs/<timestamp>/Node*_COM*.log`（`monitor_all.ps1` で自動出力）
+- `test_logs/<timestamp>/session.json`
+- `test_logs/<timestamp>/flash_result.json`
+- `test_logs/<timestamp>/monitor_manifest.json`
+- `test_logs/<timestamp>/monitor/Node*_COM*.log`（`monitor_all.ps1` を `-SessionDir` で実行時）
 - GUIログ（必要に応じて保存）
 - `test_logs/*.jsonl` / `test_logs/*.json`（`mesh_smoke_test.py --jsonl-out --summary-json`）
 
@@ -99,13 +103,19 @@ py -3 .\tools\mesh_smoke_test.py `
   --ports COM6 COM7 COM8 `
   --timeout 45 --ack-timeout 4 --ack-retries 6 --skip-ble `
   --rounds 12 --interval-ms 700 --rotate-tx --collect-stats `
+  --scenario indoor_s5 `
+  --session-dir .\test_logs\session_xxx --run-id smoke_a `
   --threshold-file .\docs\reliable_1k_thresholds.json --strict-pass `
-  --jsonl-out .\test_logs\latest_rounds.jsonl `
-  --summary-json .\test_logs\latest_summary.json
+  --jsonl-out .\test_logs\session_xxx\smoke\smoke_a_rounds.jsonl `
+  --events-jsonl .\test_logs\session_xxx\smoke\smoke_a_events.jsonl `
+  --summary-json .\test_logs\session_xxx\smoke\smoke_a_summary.json
 ```
 
 補足:
 - `require_min_hops` は threshold file で制御する。中継強制の配置で値を `1` 以上にする。
+- 環境別しきい値は `docs/threshold_profiles/*.json` を使用する。
+- 3台ベンチの初期確認は `docs/threshold_profiles/indoor_s3_baseline.json` を推奨する。
+- `run_mesh_regression.ps1` は既定で `delivery_ack` 必須。初期確認のみ `-AllowMissingDeliveryAck` で緩和する。
 
 ## 9. 未解決事項
 - 最終KPI（本番運用値）の確定

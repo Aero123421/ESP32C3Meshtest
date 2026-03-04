@@ -53,9 +53,9 @@ python -m platformio device list
 - 書き込み:
 
 ```powershell
-.\tools\flash_all.ps1 -Ports COM5,COM6,COM7
+.\tools\flash_all.ps1 -Ports COM5,COM6,COM7 -SessionDir .\test_logs\<session>
 # もしくは
-.\tools\flash_all.ps1 -Ports @("COM5","COM6","COM7")
+.\tools\flash_all.ps1 -Ports @("COM5","COM6","COM7") -SessionDir .\test_logs\<session>
 ```
 
 10台例:
@@ -67,9 +67,9 @@ python -m platformio device list
 - モニタ:
 
 ```powershell
-.\tools\monitor_all.ps1 -Ports COM5,COM6,COM7 -Baud 115200
+.\tools\monitor_all.ps1 -Ports COM5,COM6,COM7 -Baud 115200 -SessionDir .\test_logs\<session>
 # もしくは
-.\tools\monitor_all.ps1 -Ports @("COM5","COM6","COM7") -Baud 115200
+.\tools\monitor_all.ps1 -Ports @("COM5","COM6","COM7") -Baud 115200 -SessionDir .\test_logs\<session>
 ```
 
 ログ保存先を固定したい場合:

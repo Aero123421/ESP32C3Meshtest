@@ -10,6 +10,7 @@ struct MeshStats {
   uint32_t txFailed = 0;
   uint32_t txNoMemRetries = 0;
   uint32_t txNoMemDrops = 0;
+  uint32_t txResultQueueDropped = 0;
   uint32_t rxFrames = 0;
   uint32_t rxQueueDropped = 0;
   uint32_t rxParseErrors = 0;
@@ -23,6 +24,7 @@ struct MeshStats {
   uint32_t routeLookupHit = 0;
   uint32_t routeLookupMiss = 0;
   uint32_t routeLearned = 0;
+  uint32_t routePromoted = 0;
   uint32_t routeExpired = 0;
   uint32_t routedUnicastAttempts = 0;
   uint32_t routedUnicastSuccess = 0;
@@ -47,6 +49,7 @@ struct RouteRecord {
   uint32_t nextHopNodeId = 0;
   uint32_t learnedMs = 0;
   uint8_t hops = 0;
+  uint8_t rank = 0;  // 0: primary, 1: backup
   bool hasNextHopMac = false;
   uint8_t nextHopMac[6]{};
   uint16_t metricQ8 = 0;
