@@ -29,6 +29,9 @@
 補足:
 - `復帰成功` は「障害注入後 `recovery_window_sec` 内に PDR と遅延が基準値へ復帰」と定義する。
 - `mesh.rx_queue_dropped` は `rx_frames` 比率で監視し、過負荷兆候として別途 fail 判定に使う。
+- 現行 `mesh_smoke_test.py` のラウンド判定は次を使用する:
+  - 遅延: 成功ラウンドの `latency_ms` の `max`
+  - 再送率: `mesh_delta.tx_no_mem_retries / mesh_delta.tx_frames`（`--collect-stats` 時）
 
 ## 4. 試験環境の定義（家屋内 / 障害物 / 屋外）
 
@@ -118,38 +121,51 @@ $ports6 = @("COM6","COM7","COM8","COM9","COM10","COM11")
 - `rx_queue_dropped / rx_frames >= 1%`（`get_stats` で確認）
 - ノードハング/再起動が発生
 
-## 8. `tools/mesh_smoke_test.py` 拡張案
+## 8. `tools/mesh_smoke_test.py` 実装済み拡張
 
-### 8.1 追加CLI（提案）
-- `--profile reliable_1k`（既定シーケンスを 1KB 信頼性評価向けに固定）
+### 8.1 追加CLI（実装済み）
 - `--rounds N` / `--interval-ms N`
-- `--tx-port COMx` / `--dst-port COMy` / `--pair-mode all-gw|ring|full`
-- `--collect-stats`（各ラウンド前後で `cmd=get_stats` を自動取得）
-- `--json-out <path>` / `--csv-out <path>`（集計結果保存）
+- `--rotate-tx`（ラウンドごとに送信ノードをローテーション）
+- `--collect-stats`（各ラウンド前後で `{"cmd":"get_stats"}` を自動取得）
 - `--threshold-file <path>` + `--strict-pass`（閾値判定で終了コード制御）
-- `--recovery-window-sec N`（復旧判定窓）
+- `--require-min-hops N`（成功ラウンドで最小ホップ要件を課す）
+- `--jsonl-out <path>`（ラウンドごとの詳細）
+- `--summary-json <path>`（集計結果）
 
-### 8.2 集計ロジック（提案）
-- 送信ごとに `sent_ts_ms` を保持し、`pong`/`delivery_ack` 到着で E2E 遅延を算出
-- `retry_no` を成功レコードへ紐づけ、再送率を自動算出
-- 成功payload bytes と経過秒から goodput を算出
-- 障害注入区間（手動マーカー）前後で復元率を算出
+### 8.2 ラウンド集計ロジック（実装済み）
+- directed `ping_probe` を `N` ラウンド実行し、各ラウンドで:
+  - `success` / `latency_ms` / `hops` / `probe_hash_ok`
+  - `mesh_delta`（`--collect-stats` 時）
+  - `retry_rate` / `rx_queue_drop_ratio`（`mesh_delta` から算出）
+- 最終集計:
+  - `success_rate`
+  - `latency min/max/avg`
+  - `hops min/max`
+  - `threshold_violations`
 
-### 8.3 出力フォーマット（提案）
-- `summary.json`: 環境・台数・全指標・pass/fail
-- `details.csv`: ラウンド単位（pair, payload, latency_ms, retry_no, result）
-- `stats_delta.json`: `get_stats` 差分（`rx_queue_dropped`, `route_lookup_hit` など）
+### 8.3 閾値ファイル仕様（実装済み）
+- JSON object のキー:
+  - `min_success_rate`（0.0..1.0）
+  - `max_latency_ms`（>0）
+  - `max_retry_rate`（0.0..1.0）
+  - `max_rx_queue_drop_ratio`（0.0..1.0）
+  - `require_min_hops`（>=0）
+- CLI側 `--require-min-hops` / `--r1k-max-latency-ms` / `--r1k-max-retry-rate` と合成される。
 
-### 8.4 拡張後コマンド例（提案）
+### 8.4 実行例（3台）
 ```powershell
 py -3 .\tools\mesh_smoke_test.py `
-  --ports COM6 COM7 COM8 COM9 COM10 COM11 COM12 COM13 COM14 COM15 `
-  --profile reliable_1k --pair-mode all-gw --rounds 120 --interval-ms 800 `
-  --ack-timeout 4 --ack-retries 8 --collect-stats `
+  --ports COM6 COM7 COM8 `
+  --timeout 45 --ack-timeout 4 --ack-retries 6 --skip-ble `
+  --rounds 12 --interval-ms 700 --rotate-tx --collect-stats `
   --threshold-file .\docs\reliable_1k_thresholds.json --strict-pass `
-  --json-out .\test_logs\reliable_1k_20260303\S5_outdoor_summary.json `
-  --csv-out .\test_logs\reliable_1k_20260303\S5_outdoor_details.csv
+  --jsonl-out .\test_logs\latest_rounds.jsonl `
+  --summary-json .\test_logs\latest_summary.json
 ```
+
+補足:
+- 近距離で直通リンクが成立する配置では `hops=0` になり、`--require-min-hops 1` は fail/violation になる。
+- 中継強制を評価する場合は `A-C` を直通不可に配置し、`A->B->C` を物理的に作る。
 
 ## 9. 運用記録
 - 実施時は `test_logs/<session>/session.md` に以下を必須記録:

@@ -330,44 +330,12 @@ void EspNowMesh::onSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
   } else {
     stats_.txFailed++;
   }
-  if (mac_addr == nullptr || std::memcmp(mac_addr, kBroadcastMac, 6) == 0) {
-    return;
-  }
-  NeighborEntry* neighbor = upsertNeighbor(mac_addr);
-  if (neighbor == nullptr) {
-    return;
-  }
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    if (neighbor->txOk < 0xFFFF) {
-      neighbor->txOk++;
-    }
-  } else {
-    if (neighbor->txFail < 0xFFFF) {
-      neighbor->txFail++;
-    }
-  }
-  const uint32_t total = static_cast<uint32_t>(neighbor->txOk) + static_cast<uint32_t>(neighbor->txFail);
-  if (total > 0) {
-    const uint16_t instantEtxQ8 = static_cast<uint16_t>((static_cast<uint32_t>(neighbor->txFail) * 256U) / total);
-    const int32_t blended = static_cast<int32_t>(neighbor->etxQ8) * 7 + static_cast<int32_t>(instantEtxQ8);
-    neighbor->etxQ8 = static_cast<uint16_t>((blended + 4) / 8);
-  }
+  (void)mac_addr;
 }
 
 void EspNowMesh::onRecv(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len) {
   if (mac_addr != nullptr) {
     (void)ensurePeerForMac(mac_addr);
-    NeighborEntry* neighbor = upsertNeighbor(mac_addr);
-    if (neighbor != nullptr) {
-      neighbor->lastSeenMs = millis();
-      const int16_t sampleQ8 = static_cast<int16_t>(static_cast<int16_t>(rssi) << 8);
-      if (neighbor->rssiEwmaQ8 == 0) {
-        neighbor->rssiEwmaQ8 = sampleQ8;
-      } else {
-        neighbor->rssiEwmaQ8 =
-            static_cast<int16_t>((static_cast<int32_t>(neighbor->rssiEwmaQ8) * 7 + sampleQ8 + 4) / 8);
-      }
-    }
   }
   if (!enqueueRx(mac_addr, rssi, data, len)) {
     stats_.rxQueueDropped++;
@@ -510,9 +478,7 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   } else {
     attempts = kForwardSendAttemptsFragment;
   }
-  if (attempts == 0) {
-    attempts = 1;
-  }
+  attempts = adaptiveAttemptBudget(attempts);
 
   bool forwarded = false;
   if (routedFrame && routedMeta.dstNodeId != 0 && routedMeta.dstNodeId != nodeId_ && LPWA_ROUTING_MODE >= 2) {
@@ -718,9 +684,7 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
   if (len > 0 && payload == nullptr) {
     return false;
   }
-  if (ttl == 0) {
-    ttl = 1;
-  }
+  ttl = clampTtl(ttl);
 
   const uint8_t fragmentCount = Fragmenter::CalculateFragmentCount(len);
   if (fragmentCount == 0) {
@@ -771,11 +735,12 @@ bool EspNowMesh::sendPayload(AppPayloadType payloadType, const uint8_t* payload,
     duplicateFilter_.seenAndRemember(localFrameKey, millis(), kDuplicateWindowMs);
 
     bool sentAny = false;
-    for (uint8_t attempt = 0; attempt < kOriginFrameRepeatCount; ++attempt) {
+    const uint8_t attemptBudget = adaptiveAttemptBudget(kOriginFrameRepeatCount);
+    for (uint8_t attempt = 0; attempt < attemptBudget; ++attempt) {
       if (sendRawBroadcast(frame, frameLen)) {
         sentAny = true;
       }
-      if ((attempt + 1) < kOriginFrameRepeatCount) {
+      if ((attempt + 1) < attemptBudget) {
         delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
@@ -807,9 +772,7 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
   if (len > 0 && payload == nullptr) {
     return false;
   }
-  if (ttl == 0) {
-    ttl = 1;
-  }
+  ttl = clampTtl(ttl);
 
   const uint8_t fragmentCount = Fragmenter::CalculateFragmentCount(len);
   if (fragmentCount == 0) {
@@ -876,7 +839,8 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
       stats_.routeLookupMiss++;
     }
 
-    for (uint8_t attempt = 0; attempt < kOriginFrameRepeatCount; ++attempt) {
+    const uint8_t attemptBudget = adaptiveAttemptBudget(kOriginFrameRepeatCount);
+    for (uint8_t attempt = 0; attempt < attemptBudget; ++attempt) {
       bool sentThis = false;
       if (hasRoute) {
         stats_.routedUnicastAttempts++;
@@ -887,8 +851,10 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
           stats_.routedUnicastFail++;
         }
       }
-      if (!sentThis) {
-        if (attempt == 0) {
+      // If unicast path did not accept the frame, immediately try flood relay.
+      const bool fallbackNow = !sentThis;
+      if (fallbackNow) {
+        if (!hasRoute || attempt == 0) {
           stats_.routedFallbackFlood++;
         }
         sentThis = sendRawBroadcast(frame, frameLen);
@@ -896,7 +862,7 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
       if (sentThis) {
         sentAny = true;
       }
-      if ((attempt + 1) < kOriginFrameRepeatCount) {
+      if ((attempt + 1) < attemptBudget) {
         delayRandomRange(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
@@ -915,9 +881,7 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
 }
 
 bool EspNowMesh::sendNodeInfo(uint8_t ttl) {
-  if (ttl == 0) {
-    ttl = 1;
-  }
+  ttl = clampTtl(ttl);
 
   MeshFrameHeader header{};
   header.magic = kMeshMagic;
@@ -1014,6 +978,33 @@ bool EspNowMesh::sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len) 
   }
   stats_.txFailed++;
   return false;
+}
+
+uint8_t EspNowMesh::clampTtl(uint8_t ttl) const {
+  if (ttl == 0) {
+    ttl = 1;
+  }
+  if (ttl > kMaxTtl) {
+    ttl = kMaxTtl;
+  }
+  return ttl;
+}
+
+uint8_t EspNowMesh::adaptiveAttemptBudget(uint8_t baseAttempts) const {
+  uint8_t attempts = (baseAttempts == 0) ? 1 : baseAttempts;
+  uint16_t queued = 0;
+  if (rxQueue_ != nullptr) {
+    queued = static_cast<uint16_t>(uxQueueMessagesWaiting(rxQueue_));
+  }
+  if (queued >= kAdaptiveQueueHighWater && attempts > 1) {
+    attempts = static_cast<uint8_t>(attempts - 1);
+  } else if (queued <= kAdaptiveQueueLowWater && attempts < kAdaptiveAttemptMax) {
+    attempts = static_cast<uint8_t>(attempts + 1);
+  }
+  if (attempts == 0) {
+    attempts = 1;
+  }
+  return attempts;
 }
 
 bool EspNowMesh::ensurePeerForMac(const uint8_t* mac) {

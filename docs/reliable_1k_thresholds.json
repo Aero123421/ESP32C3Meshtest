@@ -1,0 +1,7 @@
+{
+  "min_success_rate": 0.95,
+  "max_latency_ms": 2200,
+  "max_retry_rate": 0.25,
+  "max_rx_queue_drop_ratio": 0.01,
+  "require_min_hops": 0
+}

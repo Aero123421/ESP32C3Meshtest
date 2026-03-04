@@ -75,6 +75,7 @@
 | U08 | 再起動復帰 | 運用回復性確認 | 再参加と通信再開が30秒以内 |
 | U09 | 長時間安定性 | 連続運転耐性 | 2時間で重大異常なし |
 | U10 | reliable_1k | 1KB級E2E信頼性（3〜10台）評価 | `docs/reliable_1k_test_design.md` の受け入れ基準を満たす |
+| U10b | round統計試験 | ラウンド連続時の劣化検出 | `mesh_smoke_test.py` の `summary_json` で success_rate/latency/hops/queue drop を評価 |
 
 ## 7. 実施時の注意
 - 1セッション内ではファーム差分を混在させない。
@@ -90,6 +91,21 @@
 - `test_logs/<timestamp>/session.md`
 - `test_logs/<timestamp>/Node*_COM*.log`（`monitor_all.ps1` で自動出力）
 - GUIログ（必要に応じて保存）
+- `test_logs/*.jsonl` / `test_logs/*.json`（`mesh_smoke_test.py --jsonl-out --summary-json`）
+
+## 8.1 3台の高速回帰コマンド（実装済み）
+```powershell
+py -3 .\tools\mesh_smoke_test.py `
+  --ports COM6 COM7 COM8 `
+  --timeout 45 --ack-timeout 4 --ack-retries 6 --skip-ble `
+  --rounds 12 --interval-ms 700 --rotate-tx --collect-stats `
+  --threshold-file .\docs\reliable_1k_thresholds.json --strict-pass `
+  --jsonl-out .\test_logs\latest_rounds.jsonl `
+  --summary-json .\test_logs\latest_summary.json
+```
+
+補足:
+- `require_min_hops` は threshold file で制御する。中継強制の配置で値を `1` 以上にする。
 
 ## 9. 未解決事項
 - 最終KPI（本番運用値）の確定

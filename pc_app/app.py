@@ -173,6 +173,11 @@ class LPWAApp(tk.Tk):
         self.long_text_seen: dict[str, int] = {}
         self.continuous_after_id: str | None = None
         self.continuous_remaining: int | None = None
+        self.continuous_dynamic_interval_ms: int | None = None
+        self.continuous_context: dict[str, Any] | None = None
+        self.continuous_interval_min_ms = 400
+        self.continuous_interval_max_ms = 4000
+        self.continuous_interval_last_log_ms = 0
         self.log_lines: list[str] = []
         self.max_log_lines = 3000
         self.image_rx_sessions: dict[str, dict[str, Any]] = {}
@@ -237,8 +242,16 @@ class LPWAApp(tk.Tk):
         self.quality_points: deque[dict[str, float | int]] = deque(maxlen=QUALITY_GRAPH_MAX_POINTS)
         self._quality_last_draw_ms = 0
         self.quality_graph_canvas: tk.Canvas | None = None
+        self.interval_entry: ttk.Entry | None = None
+        self.count_entry: ttk.Entry | None = None
+        self.ttl_entry: ttk.Entry | None = None
+        self.reliable_mode_combo: ttk.Combobox | None = None
 
         self._build_ui_tabbed()
+        self.reliable_mode_var.trace_add("write", self._on_reliable_mode_changed)
+        self.reliable_auto_var.trace_add("write", self._on_reliable_mode_changed)
+        self.reliable_profile_var.trace_add("write", self._on_reliable_mode_changed)
+        self._sync_reliable_controls()
         self.refresh_destination_choices()
         self.refresh_ports()
         self.after(100, self.poll_worker_events)
@@ -341,11 +354,14 @@ class LPWAApp(tk.Tk):
         ttk.Button(ping_frame, text="Ping送信", command=self.send_ping).grid(row=0, column=2, padx=4, pady=4)
 
         ttk.Label(ping_frame, text="間隔(ms)").grid(row=1, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.interval_var, width=12).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        self.interval_entry = ttk.Entry(ping_frame, textvariable=self.interval_var, width=12)
+        self.interval_entry.grid(row=1, column=1, padx=4, pady=4, sticky="w")
         ttk.Label(ping_frame, text="回数(0=無限)").grid(row=2, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.count_var, width=12).grid(row=2, column=1, padx=4, pady=4, sticky="w")
+        self.count_entry = ttk.Entry(ping_frame, textvariable=self.count_var, width=12)
+        self.count_entry.grid(row=2, column=1, padx=4, pady=4, sticky="w")
         ttk.Label(ping_frame, text="TTL").grid(row=3, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(ping_frame, textvariable=self.ttl_var, width=12).grid(row=3, column=1, padx=4, pady=4, sticky="w")
+        self.ttl_entry = ttk.Entry(ping_frame, textvariable=self.ttl_var, width=12)
+        self.ttl_entry.grid(row=3, column=1, padx=4, pady=4, sticky="w")
         self.start_test_btn = ttk.Button(ping_frame, text="連続開始", command=self.start_continuous_ping)
         self.start_test_btn.grid(row=1, column=2, padx=4, pady=4)
         self.stop_test_btn = ttk.Button(ping_frame, text="停止", command=self.stop_continuous_ping, state=tk.DISABLED)
@@ -579,9 +595,8 @@ class LPWAApp(tk.Tk):
         ttk.Button(top, text="選択ノード→宛先", command=self.apply_selected_node_to_targets).grid(
             row=0, column=12, padx=4, pady=4
         )
-        ttk.Button(top, text="宛先を全体送信", command=self.set_broadcast_targets).grid(
-            row=0, column=13, padx=4, pady=4
-        )
+        self.broadcast_targets_btn = ttk.Button(top, text="宛先を全体送信", command=self.set_broadcast_targets)
+        self.broadcast_targets_btn.grid(row=0, column=13, padx=4, pady=4)
 
     def _build_comm_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=5)
@@ -713,21 +728,23 @@ class LPWAApp(tk.Tk):
         reliable_frame.columnconfigure(1, weight=1)
         reliable_frame.columnconfigure(3, weight=1)
         ttk.Label(reliable_frame, text="モード").grid(row=0, column=0, padx=6, pady=4, sticky="w")
-        ttk.Combobox(
+        self.reliable_mode_combo = ttk.Combobox(
             reliable_frame,
             textvariable=self.reliable_mode_var,
             values=RELIABLE_MODE_CHOICES,
             width=14,
             state="readonly",
-        ).grid(row=0, column=1, padx=6, pady=4, sticky="w")
+        )
+        self.reliable_mode_combo.grid(row=0, column=1, padx=6, pady=4, sticky="w")
         ttk.Label(reliable_frame, text="Profile").grid(row=0, column=2, padx=6, pady=4, sticky="w")
-        ttk.Combobox(
+        self.reliable_profile_combo = ttk.Combobox(
             reliable_frame,
             textvariable=self.reliable_profile_var,
             values=RELIABLE_PROFILE_CHOICES,
             width=10,
             state="readonly",
-        ).grid(row=0, column=3, padx=6, pady=4, sticky="w")
+        )
+        self.reliable_profile_combo.grid(row=0, column=3, padx=6, pady=4, sticky="w")
         ttk.Checkbutton(
             reliable_frame,
             text="Auto最適化",
@@ -1056,8 +1073,37 @@ class LPWAApp(tk.Tk):
         if not self.reliable_auto_var.get():
             return self._parse_reliable_profile_choice(selected)
         if selected == "auto":
+            if dst not in self.reliable_profile_pref_by_dst:
+                self._seed_reliable_profile_pref(dst)
             return int(self.reliable_profile_pref_by_dst.get(dst, 0))
         return self._parse_reliable_profile_choice(selected)
+
+    def _seed_reliable_profile_pref(self, dst: str) -> None:
+        profile = 0
+        rssi_value: int | None = None
+        ping_value: float | None = None
+        for node in self.registry.snapshot():
+            if node.node_id != dst:
+                continue
+            rssi_value = node.rssi
+            ping_value = node.ping_ms
+            break
+        ping_snapshot = self.ping_stats.snapshot()
+        ping_pdr = float(ping_snapshot.get("pdr", 0.0))
+        ping_sent = int(ping_snapshot.get("sent", 0))
+        if (rssi_value is not None and rssi_value <= -82) or (ping_value is not None and ping_value >= 700.0):
+            profile = 1
+        elif ping_sent >= 20 and ping_pdr < 90.0:
+            profile = 1
+        self.reliable_profile_pref_by_dst[dst] = profile
+        self.append_log(
+            (
+                f"reliable profile seed: dst={dst} profile={RELIABLE_PROFILE_ID_TO_NAME.get(profile, '25+8')} "
+                f"rssi={rssi_value} ping_ms={ping_value} pdr={ping_pdr:.1f}%"
+            ),
+            level="SYSTEM",
+            category="R1K",
+        )
 
     def _reliable_payload_text(self, r1k_id: str, dst: str) -> str:
         header = f"R1K-{r1k_id}-{dst}-"
@@ -1411,23 +1457,92 @@ class LPWAApp(tk.Tk):
         self.append_log(f"選択ノード {node_id} をチャット/画像/Ping の宛先に設定しました。", level="SYSTEM", category="UI")
 
     def set_broadcast_targets(self) -> None:
+        if self._is_hardened_mode_enabled():
+            messagebox.showwarning("モード制約", "mode=reliable_1k では Broadcast 宛先は使用できません。")
+            return
         self.chat_target_var.set(BROADCAST_LABEL)
         self.image_target_var.set(BROADCAST_LABEL)
         self.ping_target_var.set(BROADCAST_LABEL)
         self.refresh_destination_choices()
         self.append_log("宛先を Broadcast に戻しました。", level="SYSTEM", category="UI")
 
+    def _on_reliable_mode_changed(self, *_: Any) -> None:
+        self._sync_reliable_controls()
+
+    def _is_hardened_mode_enabled(self) -> bool:
+        return (self.reliable_mode_var.get() or "").strip().lower() == "reliable_1k"
+
+    def _preferred_directed_target(self) -> str | None:
+        selected = self._selected_node_id()
+        if selected:
+            return selected
+
+        nodes = self.registry.snapshot()
+        local = (self.local_node_id or "").strip()
+        for node in nodes:
+            node_id = str(node.node_id).strip()
+            if not node_id:
+                continue
+            if local and node_id == local:
+                continue
+            return node_id
+        if local:
+            return local
+        for node in nodes:
+            node_id = str(node.node_id).strip()
+            if node_id:
+                return node_id
+        return None
+
+    def _sync_reliable_controls(self) -> None:
+        auto_mode = bool(self.reliable_auto_var.get())
+        profile_combo = getattr(self, "reliable_profile_combo", None)
+        if auto_mode:
+            if (self.reliable_profile_var.get() or "").strip().lower() != "auto":
+                self.reliable_profile_var.set("auto")
+            if profile_combo is not None:
+                profile_combo.configure(state=tk.DISABLED)
+        else:
+            if profile_combo is not None:
+                profile_combo.configure(state="readonly")
+
+        broadcast_btn = getattr(self, "broadcast_targets_btn", None)
+        if broadcast_btn is not None:
+            if self._is_hardened_mode_enabled():
+                broadcast_btn.configure(state=tk.DISABLED)
+            else:
+                broadcast_btn.configure(state=tk.NORMAL)
+
+        self.refresh_destination_choices()
+        if self.continuous_after_id is None:
+            self._set_continuous_controls_enabled(True)
+
+    def _ensure_directed_target(self, target: str | None, *, operation: str) -> bool:
+        if self._is_hardened_mode_enabled() and target is None:
+            messagebox.showwarning("宛先エラー", f"{operation} は mode=reliable_1k で宛先指定が必須です。")
+            return False
+        return True
+
     def refresh_destination_choices(self) -> None:
-        choices: list[str] = [BROADCAST_LABEL]
+        allow_broadcast = not self._is_hardened_mode_enabled()
+        choices: list[str] = [BROADCAST_LABEL] if allow_broadcast else []
         for node in self.registry.snapshot():
             if node.node_id not in choices:
                 choices.append(node.node_id)
 
+        fallback_directed = self._preferred_directed_target()
+        if fallback_directed and fallback_directed not in choices:
+            choices.append(fallback_directed)
         for var in (self.chat_target_var, self.image_target_var, self.ping_target_var):
             current = var.get().strip()
-            if current and current not in choices:
+            if current and current not in choices and (allow_broadcast or current != BROADCAST_LABEL):
                 choices.append(current)
-            if not current:
+            if not allow_broadcast and (not current or current == BROADCAST_LABEL):
+                if fallback_directed:
+                    var.set(fallback_directed)
+                else:
+                    var.set("")
+            elif allow_broadcast and not current:
                 var.set(BROADCAST_LABEL)
 
         self.chat_target_combo["values"] = choices
@@ -2340,6 +2455,16 @@ class LPWAApp(tk.Tk):
         self._prune_rx_sessions()
         self.after(30 if backlog > 0 else 100, self.poll_worker_events)
 
+    def _is_stale_worker_event(self, event: dict[str, Any]) -> bool:
+        event_worker_id = str(event.get("_worker_id") or "").strip()
+        if not event_worker_id:
+            return False
+        current = self.worker
+        if current is None:
+            return False
+        current_worker_id = str(getattr(current, "worker_id", "") or "").strip()
+        return bool(current_worker_id) and (current_worker_id != event_worker_id)
+
     def handle_worker_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("_event")
         if event_type == "flash":
@@ -2360,6 +2485,9 @@ class LPWAApp(tk.Tk):
                     messagebox.showinfo("Build/書き込み", summary)
                 else:
                     messagebox.showerror("Build/書き込み", summary)
+            return
+
+        if event_type in {"status", "error", "tx", "rx", "rx_raw"} and self._is_stale_worker_event(event):
             return
 
         if event_type == "status":
@@ -3253,6 +3381,8 @@ class LPWAApp(tk.Tk):
             return
         dst = self._normalize_target(self.chat_target_var.get())
         via = self.chat_via_var.get().strip() or "wifi"
+        if via == "wifi" and not self._ensure_directed_target(dst, operation="チャット送信"):
+            return
         ttl = self._current_ttl()
         reliable = self._is_reliable_target(via=via, dst=dst)
         text_bytes = text.encode("utf-8")
@@ -3321,6 +3451,8 @@ class LPWAApp(tk.Tk):
             return
 
         dst = self._normalize_target(self.image_target_var.get())
+        if not self._ensure_directed_target(dst, operation="画像送信"):
+            return
         ttl = self._current_ttl()
         reliable = self._is_reliable_target(via="wifi", dst=dst)
         file_size = path.stat().st_size
@@ -3416,7 +3548,12 @@ class LPWAApp(tk.Tk):
             "result_deadline_ms": now + self.reliable_result_deadline_ms,
         }
 
+        worker = self.worker
         for payload in packets:
+            if worker is not None and worker.is_running:
+                max_q = max(1, int(worker.tx_queue_max))
+                if int(worker.tx_queue_size) >= int(max_q * 0.80):
+                    time.sleep(0.003)
             if not self.send_json(payload):
                 self.reliable_tx_sessions.pop(session_id, None)
                 self.reliable_stats.register_failure("tx_enqueue_failed")
@@ -3446,11 +3583,9 @@ class LPWAApp(tk.Tk):
     def request_routes(self) -> None:
         self.send_json(make_routes_request())
 
-    def send_ping(self) -> bool:
+    def _send_ping_with_context(self, *, dst: str | None, ttl: int) -> bool:
         self.ping_seq += 1
         seq = self.ping_seq
-        dst = self._normalize_target(self.ping_target_var.get())
-        ttl = self._current_ttl()
         ping_id = uuid.uuid4().hex[:8]
         payload = make_ping_probe_command(
             seq=seq,
@@ -3476,6 +3611,13 @@ class LPWAApp(tk.Tk):
         }
         self.update_stats_view()
         return True
+
+    def send_ping(self) -> bool:
+        dst = self._normalize_target(self.ping_target_var.get())
+        if not self._ensure_directed_target(dst, operation="Ping送信(1KB)"):
+            return False
+        ttl = self._current_ttl()
+        return self._send_ping_with_context(dst=dst, ttl=ttl)
 
     def handle_pong(self, payload: dict[str, Any]) -> None:
         seq_raw = payload.get("seq")
@@ -3573,24 +3715,104 @@ class LPWAApp(tk.Tk):
     def start_continuous_ping(self) -> None:
         if self.continuous_after_id is not None:
             return
-        interval_ms = max(1, _to_int(self.interval_var.get(), 1000))
+        interval_ms = self._clamp_continuous_interval_ms(_to_int(self.interval_var.get(), 1000), apply_to_ui=True)
+        dst = self._normalize_target(self.ping_target_var.get())
+        if not self._ensure_directed_target(dst, operation="連続Ping"):
+            return
+        ttl = self._current_ttl()
         count = max(0, _to_int(self.count_var.get(), 0))
         self.continuous_remaining = count if count > 0 else None
+        self.continuous_dynamic_interval_ms = interval_ms
+        self.continuous_context = {"dst": dst, "ttl": ttl}
+        self.continuous_interval_last_log_ms = self._now_ms()
         self.start_test_btn.configure(state=tk.DISABLED)
         self.stop_test_btn.configure(state=tk.NORMAL)
+        self._set_continuous_controls_enabled(False)
         self.append_log(
             (
                 f"連続Ping開始: interval={interval_ms}ms, "
                 f"count={'∞' if self.continuous_remaining is None else self.continuous_remaining}, "
-                f"ttl={self._current_ttl()}, probe={PING_PROBE_BYTES}B"
+                f"dst={self._target_label(dst)}, ttl={ttl}, probe={PING_PROBE_BYTES}B"
             ),
             level="SYSTEM",
             category="PING",
         )
         self._run_continuous_ping(interval_ms)
 
+    def _clamp_continuous_interval_ms(self, interval_ms: int, *, apply_to_ui: bool = False) -> int:
+        interval = int(interval_ms)
+        if interval < self.continuous_interval_min_ms:
+            interval = self.continuous_interval_min_ms
+        if interval > self.continuous_interval_max_ms:
+            interval = self.continuous_interval_max_ms
+        if apply_to_ui and str(interval) != self.interval_var.get().strip():
+            self.interval_var.set(str(interval))
+        return interval
+
+    def _set_continuous_controls_enabled(self, enabled: bool) -> None:
+        target_combo_state = "readonly" if enabled else tk.DISABLED
+        entry_state = tk.NORMAL if enabled else tk.DISABLED
+        mode_combo_state = "readonly" if enabled else tk.DISABLED
+        if self.ping_target_combo is not None:
+            self.ping_target_combo.configure(state=target_combo_state)
+        if self.interval_entry is not None:
+            self.interval_entry.configure(state=entry_state)
+        if self.count_entry is not None:
+            self.count_entry.configure(state=entry_state)
+        if self.ttl_entry is not None:
+            self.ttl_entry.configure(state=entry_state)
+        if self.reliable_mode_combo is not None:
+            self.reliable_mode_combo.configure(state=mode_combo_state)
+
+    def _next_continuous_interval_ms(self, base_interval_ms: int) -> int:
+        base_interval = self._clamp_continuous_interval_ms(base_interval_ms, apply_to_ui=False)
+        interval = self._clamp_continuous_interval_ms(
+            int(self.continuous_dynamic_interval_ms or base_interval), apply_to_ui=False
+        )
+
+        if not self._is_hardened_mode_enabled():
+            self.continuous_dynamic_interval_ms = base_interval
+            return base_interval
+
+        pending_ping = len(self.pending_ping_rounds)
+        pending_e2e = len(self.pending_e2e)
+        queue_size = 0
+        worker = self.worker
+        if worker is not None and worker.is_running:
+            queue_size = int(worker.tx_queue_size)
+        ping_snapshot = self.ping_stats.snapshot()
+        sent = int(ping_snapshot.get("sent", 0))
+        pdr = float(ping_snapshot.get("pdr", 0.0))
+
+        if queue_size >= 48 or pending_ping >= 6 or pending_e2e >= 12:
+            interval = min(self.continuous_interval_max_ms, int(interval * 1.15) + 25)
+        elif sent >= 20 and pdr < 88.0:
+            interval = min(self.continuous_interval_max_ms, int(interval * 1.10) + 20)
+        elif pending_ping == 0 and pending_e2e == 0 and sent >= 20 and pdr > 96.0:
+            interval = max(base_interval, int(interval * 0.92) - 10)
+
+        now = self._now_ms()
+        if abs(interval - int(self.continuous_dynamic_interval_ms or base_interval)) >= 80 and (
+            now - self.continuous_interval_last_log_ms
+        ) >= 4000:
+            self.continuous_interval_last_log_ms = now
+            self.append_log(
+                (
+                    f"連続Pingレート調整: interval={interval}ms "
+                    f"(queue={queue_size} pending_ping={pending_ping} pending_e2e={pending_e2e} pdr={pdr:.1f}%)"
+                ),
+                level="SYSTEM",
+                category="PING",
+            )
+        self.continuous_dynamic_interval_ms = interval
+        return interval
+
     def _run_continuous_ping(self, interval_ms: int) -> None:
-        if not self.send_ping():
+        next_interval_ms = self._next_continuous_interval_ms(interval_ms)
+        context = self.continuous_context or {}
+        dst = context.get("dst")
+        ttl = _to_int(str(context.get("ttl", self._current_ttl())), self._current_ttl())
+        if not self._send_ping_with_context(dst=dst, ttl=ttl):
             self.stop_continuous_ping()
             return
         if self.continuous_remaining is not None:
@@ -3598,7 +3820,7 @@ class LPWAApp(tk.Tk):
             if self.continuous_remaining <= 0:
                 self.stop_continuous_ping()
                 return
-        self.continuous_after_id = self.after(interval_ms, lambda: self._run_continuous_ping(interval_ms))
+        self.continuous_after_id = self.after(next_interval_ms, lambda: self._run_continuous_ping(interval_ms))
 
     def stop_continuous_ping(self) -> None:
         if self.continuous_after_id is not None:
@@ -3608,6 +3830,10 @@ class LPWAApp(tk.Tk):
         self.start_test_btn.configure(state=tk.NORMAL)
         self.stop_test_btn.configure(state=tk.DISABLED)
         self.continuous_remaining = None
+        self.continuous_dynamic_interval_ms = None
+        self.continuous_context = None
+        self._set_continuous_controls_enabled(True)
+        self._sync_reliable_controls()
 
     def _record_quality_point(self, snapshot: dict[str, float | int]) -> None:
         point = {

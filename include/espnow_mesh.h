@@ -104,6 +104,8 @@ class EspNowMesh {
   bool sendRawBroadcast(const uint8_t* data, size_t len);
   bool sendRawUnicast(const uint8_t* mac, const uint8_t* data, size_t len);
   bool sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len);
+  uint8_t clampTtl(uint8_t ttl) const;
+  uint8_t adaptiveAttemptBudget(uint8_t baseAttempts) const;
   bool ensurePeerForMac(const uint8_t* mac);
   void pruneRoutingTables(uint32_t nowMs);
   void learnRouteFromFrame(uint32_t originId, const uint8_t* senderMac, uint8_t hops, int8_t rssi,

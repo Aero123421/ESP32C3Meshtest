@@ -77,13 +77,14 @@
   - `esp_wifi_set_max_tx_power(84)`（21dBm相当、法規/実装制限に依存）
   - `esp_wifi_set_ps(WIFI_PS_NONE)`（Wi-Fi省電力OFFで応答遅延を抑制）
   - `esp_wifi_set_protocol(...11b/11g/11n + LR)`（長距離寄りの既定）
-  - 送信フレームのオリジン側リピート送信（既定3回）
+  - 送信フレームのオリジン側リピート送信（既定4回, robust mode）
   - オリジン再送間隔と中継転送間隔のランダムジッタ（衝突確率低減）
   - NodeInfo周期の延長（10s→15s）で常時オーバーヘッド抑制
   - NodeInfo送信タイミングの個体ジッタ化（同時送信バースト緩和）
-  - フレーム種別ごとの中継再送回数（Fragment重視 / NodeInfo軽量）
+  - フレーム種別ごとの中継再送回数（Fragment=4 / NodeInfo=1）
   - `esp_now_send` の `NO_MEM` 時に短いバックオフ再試行
   - `trace_obs` は `TTL=3` + 最短送信間隔（120ms）でテレメトリ過負荷を抑制
+  - `adaptiveAttemptBudget` によりRXキュー水位を見て再送回数を自動調整
 - 補足:
   - 必要に応じて `platformio.ini` の build flag で切替可能
     - `LPWA_ENABLE_WIFI_LR`（0/1）
@@ -97,9 +98,10 @@
 - ルーティング指標は `hop + ETX + RSSI` の重み付き合成とし、ヒステリシスで経路フラップを抑制する。
 - 中継時の動作:
   - ルート有り: 次ホップへ unicast 転送
-  - ルート無し/失敗: flood fallback
+  - ルート無し/失敗: 同一attempt内で即座に flood fallback
 - 安全策:
   - 期限切れ経路の自動削除
+  - ルート失効は `sendRawUnicast()` 戻り値では判定しない（MAC送信コールバック由来での誤失効を回避）
   - フラグメント整合チェック（`frag_count/index/chunk_len/total_len`）
   - hopカウントとメトリック計算の飽和処理（オーバーフロー回避）
 

@@ -45,10 +45,24 @@ class SerialWorker:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tx_dropped = 0
+        self._tx_batch_per_tick = 4
+        self._worker_id = f"sw-{time.time_ns()}-{id(self)}"
 
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def tx_queue_size(self) -> int:
+        return int(self._tx_queue.qsize())
+
+    @property
+    def tx_queue_max(self) -> int:
+        return int(self._tx_queue_max)
+
+    @property
+    def worker_id(self) -> str:
+        return self._worker_id
 
     def start(self) -> None:
         if self.is_running:
@@ -57,8 +71,22 @@ class SerialWorker:
         self._thread = threading.Thread(target=self._run, name="serial-worker", daemon=True)
         self._thread.start()
 
-    def stop(self, *, join_timeout: float = 2.0) -> None:
+    def _clear_tx_queue(self) -> int:
+        dropped = 0
+        while True:
+            try:
+                self._tx_queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        return dropped
+
+    def stop(self, *, join_timeout: float = 2.0, drop_pending: bool = True) -> None:
         self._stop_event.set()
+        if drop_pending:
+            dropped = self._clear_tx_queue()
+            if dropped > 0:
+                self._emit({"_event": "error", "message": f"切断により未送信キューを破棄: {dropped}件"})
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
@@ -81,13 +109,17 @@ class SerialWorker:
             return False
 
     def _emit(self, event: dict[str, Any]) -> None:
-        self._incoming_queue.put(event)
+        emitted = dict(event)
+        emitted["_worker_id"] = self._worker_id
+        self._incoming_queue.put(emitted)
 
     def _write_all(self, ser: "serial.Serial", encoded: bytes) -> None:
         view = memoryview(encoded)
         offset = 0
         chunk_size = 64
         while offset < len(view):
+            if self._stop_event.is_set():
+                raise SerialException("serial worker stopped")
             end = offset + chunk_size
             if end > len(view):
                 end = len(view)
@@ -101,8 +133,9 @@ class SerialWorker:
                 time.sleep(0.001)
         ser.flush()
 
-    def _drain_tx(self, ser: "serial.Serial") -> None:
-        while True:
+    def _drain_tx(self, ser: "serial.Serial", *, max_items: int) -> bool:
+        sent_count = 0
+        while sent_count < max_items and not self._stop_event.is_set():
             try:
                 payload = self._tx_queue.get_nowait()
             except queue.Empty:
@@ -129,11 +162,15 @@ class SerialWorker:
                         raise SerialException("serial write failed")
                     raise last_error
                 self._emit({"_event": "tx", "payload": payload})
+                sent_count += 1
             except (SerialException, OSError) as exc:
+                if self._stop_event.is_set():
+                    return False
                 self._emit({"_event": "error", "message": f"送信失敗: {exc}"})
-                break
+                return False
             except ProtocolError as exc:
                 self._emit({"_event": "error", "message": f"JSON変換失敗: {exc}"})
+        return True
 
     def _run(self) -> None:
         if serial is None:
@@ -159,7 +196,10 @@ class SerialWorker:
             )
 
             while not self._stop_event.is_set():
-                self._drain_tx(ser)
+                if not self._drain_tx(ser, max_items=max(1, int(self._tx_batch_per_tick))):
+                    break
+                if self._stop_event.is_set():
+                    break
 
                 try:
                     raw = ser.readline()
