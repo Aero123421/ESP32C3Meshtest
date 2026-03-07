@@ -535,6 +535,9 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   }
 
   if (duplicateFilter_.seen(dedupKey, nowMs, kDuplicateWindowMs)) {
+    // Learn from alternate duplicate arrivals before dropping them so backup routes
+    // can still improve even when the first copy already won dedup.
+    learnRouteFromFrame(header.originId, item.senderMac, header.hops, item.rssi, nowMs);
     stats_.droppedDuplicates++;
     return;
   }
@@ -957,39 +960,41 @@ bool EspNowMesh::sendPayloadDirected(AppPayloadType payloadType, const uint8_t* 
     duplicateFilter_.seenAndRemember(localFrameKey, millis(), kDuplicateWindowMs);
 
     bool sentAny = false;
-    RouteEntry route{};
-    const bool hasRoute = selectRoute(dstNodeId, &route);
-    if (hasRoute) {
+    bool hadRoute = false;
+    const uint8_t unicastAttempts = adaptiveAttemptBudget(kDirectedOriginAttemptCount);
+    for (uint8_t attempt = 0; attempt < unicastAttempts; ++attempt) {
+      RouteEntry route{};
+      if (!selectRoute(dstNodeId, &route)) {
+        break;
+      }
+      hadRoute = true;
+      stats_.routedUnicastAttempts++;
+      if (sendRawUnicast(route.nextHopMac, frame, frameLen)) {
+        stats_.routedUnicastSuccess++;
+        sentAny = true;
+        break;
+      }
+      stats_.routedUnicastFail++;
+      if ((attempt + 1) < unicastAttempts) {
+        cooperativeDelay(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
+      }
+    }
+    if (hadRoute) {
       stats_.routeLookupHit++;
     } else {
       stats_.routeLookupMiss++;
     }
-
-    const uint8_t attemptBudget = adaptiveAttemptBudget(kOriginFrameRepeatCount);
-    for (uint8_t attempt = 0; attempt < attemptBudget; ++attempt) {
-      bool sentThis = false;
-      if (hasRoute) {
-        stats_.routedUnicastAttempts++;
-        if (sendRawUnicast(route.nextHopMac, frame, frameLen)) {
-          stats_.routedUnicastSuccess++;
-          sentThis = true;
-        } else {
-          stats_.routedUnicastFail++;
+    if (!sentAny) {
+      stats_.routedFallbackFlood++;
+      const uint8_t floodAttempts = adaptiveAttemptBudget(kDirectedFallbackFloodAttempts);
+      for (uint8_t attempt = 0; attempt < floodAttempts; ++attempt) {
+        if (sendRawBroadcast(frame, frameLen)) {
+          sentAny = true;
+          break;
         }
-      }
-      // If unicast path did not accept the frame, immediately try flood relay.
-      const bool fallbackNow = !sentThis;
-      if (fallbackNow) {
-        if (!hasRoute || attempt == 0) {
-          stats_.routedFallbackFlood++;
+        if ((attempt + 1) < floodAttempts) {
+          cooperativeDelay(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
         }
-        sentThis = sendRawBroadcast(frame, frameLen);
-      }
-      if (sentThis) {
-        sentAny = true;
-      }
-      if ((attempt + 1) < attemptBudget) {
-        cooperativeDelay(kOriginFrameRepeatGapMinMs, kOriginFrameRepeatGapMaxMs);
       }
     }
     if (!sentAny) {

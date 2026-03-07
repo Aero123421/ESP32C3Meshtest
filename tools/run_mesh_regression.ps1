@@ -25,7 +25,7 @@ param(
 
     [switch]$SkipFlash,
 
-    [switch]$StartMonitor,
+    [switch]$StartMonitor = $true,
 
     [switch]$AllowMissingDeliveryAck
 )
@@ -106,11 +106,13 @@ if (-not $SkipFlash) {
 }
 
 if ($StartMonitor) {
-    Write-Host "== Step 3/5: monitor spawn ==" -ForegroundColor Cyan
-    & (Join-Path $PSScriptRoot "monitor_all.ps1") -Ports $Ports -Baud $Baud -SessionDir $sessionDir
+    Write-Host "== Step 3/5: monitor spawn (deferred) ==" -ForegroundColor Yellow
+    Write-Host "WARN: smoke test uses the COM ports exclusively, so live monitors are not attached before smoke." -ForegroundColor Yellow
 } else {
     Write-Host "== Step 3/5: monitor spawn (skipped) ==" -ForegroundColor Yellow
 }
+
+$monitorLogFiles = @()
 
 $runId = Get-Date -Format "yyyyMMdd_HHmmss"
 $summaryJson = Join-Path $sessionDir ("smoke\{0}_summary.json" -f $runId)
@@ -215,23 +217,76 @@ $triageLogs = @()
 if (Test-Path $smokeLog) {
     $triageLogs += $smokeLog
 }
-$monitorManifest = Join-Path $sessionDir "monitor_manifest.json"
-if (Test-Path $monitorManifest) {
-    try {
-        $manifestObj = Get-Content -Raw -Path $monitorManifest | ConvertFrom-Json -ErrorAction Stop
-        if ($null -ne $manifestObj.items) {
-            foreach ($item in $manifestObj.items) {
-                if ($null -eq $item) { continue }
-                $logFile = [string]$item.log_file
-                if (-not [string]::IsNullOrWhiteSpace($logFile) -and (Test-Path $logFile)) {
-                    $triageLogs += $logFile
+try {
+    if (Test-Path $summaryJson) {
+        $summaryObj = Get-Content -Raw -Path $summaryJson | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $summaryObj) {
+            $expectedMonitorPorts = @()
+            $missingMonitorPorts = @()
+            $monitorCaptureMode = if ($StartMonitor) { "deferred_not_attached" } else { "disabled" }
+            if ($StartMonitor) {
+                $expectedMonitorPorts = @($Ports)
+                $attachedPortMap = @{}
+                foreach ($monitorPath in $monitorLogFiles) {
+                    foreach ($candidatePort in $Ports) {
+                        if ($monitorPath -match [regex]::Escape($candidatePort)) {
+                            $attachedPortMap[$candidatePort.ToUpperInvariant()] = $true
+                        }
+                    }
+                }
+                foreach ($candidatePort in $Ports) {
+                    if (-not $attachedPortMap.ContainsKey($candidatePort.ToUpperInvariant())) {
+                        $missingMonitorPorts += $candidatePort
+                    }
+                }
+                if ($monitorLogFiles.Count -gt 0 -and $missingMonitorPorts.Count -eq 0) {
+                    $monitorCaptureMode = "attached"
+                } elseif ($monitorLogFiles.Count -gt 0) {
+                    $monitorCaptureMode = "partial"
                 }
             }
+            $monitorMissing = ([bool]$StartMonitor -and $missingMonitorPorts.Count -gt 0)
+            if ($summaryObj.PSObject.Properties.Match("monitor_logs_attached").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_logs_attached" -NotePropertyValue @($monitorLogFiles)
+            } else {
+                $summaryObj.monitor_logs_attached = @($monitorLogFiles)
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_logs_attached_count").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_logs_attached_count" -NotePropertyValue $monitorLogFiles.Count
+            } else {
+                $summaryObj.monitor_logs_attached_count = $monitorLogFiles.Count
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_logs_missing").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_logs_missing" -NotePropertyValue $monitorMissing
+            } else {
+                $summaryObj.monitor_logs_missing = $monitorMissing
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_expected_ports").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_expected_ports" -NotePropertyValue @($expectedMonitorPorts)
+            } else {
+                $summaryObj.monitor_expected_ports = @($expectedMonitorPorts)
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_missing_ports").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_missing_ports" -NotePropertyValue @($missingMonitorPorts)
+            } else {
+                $summaryObj.monitor_missing_ports = @($missingMonitorPorts)
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_requested").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_requested" -NotePropertyValue ([bool]$StartMonitor)
+            } else {
+                $summaryObj.monitor_requested = [bool]$StartMonitor
+            }
+            if ($summaryObj.PSObject.Properties.Match("monitor_capture_mode").Count -eq 0) {
+                $summaryObj | Add-Member -NotePropertyName "monitor_capture_mode" -NotePropertyValue $monitorCaptureMode
+            } else {
+                $summaryObj.monitor_capture_mode = $monitorCaptureMode
+            }
+            Write-JsonNoBom -Path $summaryJson -Data $summaryObj -Depth 16
         }
     }
-    catch {
-        Write-Host ("WARN: failed to parse monitor manifest: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-    }
+}
+catch {
+    Write-Host ("WARN: failed to annotate monitor metadata: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
 }
 
 $triageArgs = @(

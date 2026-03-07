@@ -34,7 +34,7 @@ class SerialWorker:
         baudrate: int,
         incoming_queue: queue.Queue[dict[str, Any]],
         *,
-        read_timeout: float = 0.1,
+        read_timeout: float = 0.02,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -45,7 +45,8 @@ class SerialWorker:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tx_dropped = 0
-        self._tx_batch_per_tick = 2
+        self._tx_batch_per_tick = 12
+        self._rx_batch_per_tick = 24
         self._worker_id = f"sw-{time.time_ns()}-{id(self)}"
 
     @property
@@ -116,7 +117,7 @@ class SerialWorker:
     def _write_all(self, ser: "serial.Serial", encoded: bytes) -> None:
         view = memoryview(encoded)
         offset = 0
-        chunk_size = 64
+        chunk_size = 128
         while offset < len(view):
             if self._stop_event.is_set():
                 raise SerialException("serial worker stopped")
@@ -131,7 +132,6 @@ class SerialWorker:
             offset += written
             if offset < len(view):
                 time.sleep(0.001)
-        ser.flush()
 
     def _drain_tx(self, ser: "serial.Serial", *, max_items: int) -> bool:
         sent_count = 0
@@ -170,6 +170,42 @@ class SerialWorker:
                 return False
             except ProtocolError as exc:
                 self._emit({"_event": "error", "message": f"JSON変換失敗: {exc}"})
+        if sent_count > 0:
+            try:
+                ser.flush()
+            except (SerialException, OSError) as exc:
+                self._emit({"_event": "error", "message": f"送信flush失敗: {exc}"})
+                return False
+        return True
+
+    def _read_available(self, ser: "serial.Serial", *, max_items: int) -> bool:
+        read_count = 0
+        while read_count < max_items and not self._stop_event.is_set():
+            waiting = 0
+            try:
+                waiting = int(getattr(ser, "in_waiting", 0) or 0)
+            except Exception:
+                waiting = 0
+            # Keep the loop responsive to TX load while still allowing short blocking reads
+            # when the line is still arriving from the device.
+            ser.timeout = 0 if waiting > 0 else self._read_timeout
+            try:
+                raw = ser.readline()
+            except (SerialException, OSError) as exc:
+                self._emit({"_event": "error", "message": f"受信失敗: {exc}"})
+                return False
+            if not raw:
+                break
+            text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not text:
+                read_count += 1
+                continue
+            try:
+                payload = decode_json_line(text)
+                self._emit({"_event": "rx", "payload": payload, "raw": text})
+            except ProtocolError as exc:
+                self._emit({"_event": "rx_raw", "raw": text, "error": str(exc)})
+            read_count += 1
         return True
 
     def _run(self) -> None:
@@ -200,25 +236,8 @@ class SerialWorker:
                     break
                 if self._stop_event.is_set():
                     break
-
-                try:
-                    raw = ser.readline()
-                except (SerialException, OSError) as exc:
-                    self._emit({"_event": "error", "message": f"受信失敗: {exc}"})
+                if not self._read_available(ser, max_items=max(1, int(self._rx_batch_per_tick))):
                     break
-
-                if not raw:
-                    continue
-
-                text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not text:
-                    continue
-
-                try:
-                    payload = decode_json_line(text)
-                    self._emit({"_event": "rx", "payload": payload, "raw": text})
-                except ProtocolError as exc:
-                    self._emit({"_event": "rx_raw", "raw": text, "error": str(exc)})
 
         except (SerialException, OSError) as exc:
             self._emit({"_event": "error", "message": f"シリアル接続失敗 ({self.port}): {exc}"})

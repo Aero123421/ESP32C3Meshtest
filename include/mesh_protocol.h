@@ -65,10 +65,10 @@ constexpr size_t kFragmentChunkSize = 180;
 constexpr size_t kMaxAppPayload = 1024;
 constexpr size_t kMaxFragments = (kMaxAppPayload + kFragmentChunkSize - 1) / kFragmentChunkSize;
 
-constexpr uint32_t kNodeInfoPeriodMs = 15000;
+constexpr uint32_t kNodeInfoPeriodMs = 10000;
 constexpr uint32_t kNodeInfoPeriodMinMs = 3000;
 constexpr uint32_t kNodeInfoPeriodMaxMs = 120000;
-constexpr uint8_t kDefaultNodeInfoTtl = 3;
+constexpr uint8_t kDefaultNodeInfoTtl = 5;
 constexpr uint16_t kNodeInfoInitialJitterMinMs = 800;
 constexpr uint16_t kNodeInfoInitialJitterMaxMs = 4200;
 constexpr uint16_t kNodeInfoJitterMaxMs = 1800;
@@ -87,6 +87,8 @@ constexpr uint8_t kOriginFrameRepeatCount = 4;
 #else
 constexpr uint8_t kOriginFrameRepeatCount = 3;
 #endif
+constexpr uint8_t kDirectedOriginAttemptCount = 2;
+constexpr uint8_t kDirectedFallbackFloodAttempts = 1;
 constexpr uint8_t kOriginFrameRepeatGapMinMs = 6;
 constexpr uint8_t kOriginFrameRepeatGapMaxMs = 14;
 constexpr uint8_t kInterFragmentGapMinMs = 7;

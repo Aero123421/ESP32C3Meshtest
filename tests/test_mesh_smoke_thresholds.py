@@ -74,3 +74,58 @@ def test_combine_thresholds_cli_and_file() -> None:
     assert combined["max_retry_rate"] == 0.2
     assert combined["require_min_hops"] == 1
     assert combined["max_latency_p95_ms"] == 1800
+
+
+def test_build_rotate_round_pairs_covers_all_directed_pairs() -> None:
+    mod = _load_mesh_smoke_module()
+    states = [
+        mod.PortState(port="COM1", ser=None, node_id="A"),
+        mod.PortState(port="COM2", ser=None, node_id="B"),
+        mod.PortState(port="COM3", ser=None, node_id="C"),
+    ]
+    pairs = mod.build_rotate_round_pairs(states)
+    pair_ids = [(tx.node_id, dst.node_id) for tx, dst in pairs]
+    assert pair_ids == [
+        ("A", "B"),
+        ("B", "C"),
+        ("C", "A"),
+        ("A", "C"),
+        ("B", "A"),
+        ("C", "B"),
+    ]
+
+
+def test_evaluate_node_list_coverage_requires_each_port_to_see_known_nodes() -> None:
+    mod = _load_mesh_smoke_module()
+    states = [
+        mod.PortState(port="COM1", ser=None, node_id="A"),
+        mod.PortState(port="COM2", ser=None, node_id="B"),
+        mod.PortState(port="COM3", ser=None, node_id="C"),
+    ]
+    status = mod.evaluate_node_list_coverage(
+        states=states,
+        per_port_node_ids={
+            "COM1": {"A", "B", "C"},
+            "COM2": {"A", "B", "X"},
+            "COM3": {"A", "B", "C"},
+        },
+        expected_node_ids={"A", "B", "C"},
+        expected_nodes=3,
+    )
+    assert status["ready"] is False
+    assert status["per_port_missing_known"]["COM2"] == ["C"]
+    assert status["per_port_ready"]["COM2"] is False
+
+
+def test_summarize_stats_collection_reports_incomplete_rounds() -> None:
+    mod = _load_mesh_smoke_module()
+    summary = mod.summarize_stats_collection(
+        [
+            {"round": 1, "mesh_delta": {"tx_frames": 2}, "errors": []},
+            {"round": 2, "mesh_delta": None, "errors": ["stats_before_timeout"]},
+            {"round": 3, "mesh_delta": None, "errors": ["stats_after_timeout"]},
+        ]
+    )
+    assert summary["complete_rounds"] == 1
+    assert summary["incomplete_rounds"] == [2, 3]
+    assert summary["timeout_rounds"] == [2, 3]

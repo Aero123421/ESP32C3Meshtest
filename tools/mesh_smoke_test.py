@@ -158,6 +158,78 @@ def percentile(values: list[float], p: float) -> float | None:
     return ordered[low] * (1.0 - blend) + ordered[high] * blend
 
 
+def build_rotate_round_pairs(states: list[PortState]) -> list[tuple[PortState, PortState]]:
+    if len(states) < 2:
+        return []
+    pairs: list[tuple[PortState, PortState]] = []
+    # 先頭数ラウンドでも偏らないよう、hop距離ごとに全送信元を1周させる。
+    for offset in range(1, len(states)):
+        for tx_idx, tx_state in enumerate(states):
+            dst_state = states[(tx_idx + offset) % len(states)]
+            pairs.append((tx_state, dst_state))
+    return pairs
+
+
+def evaluate_node_list_coverage(
+    *,
+    states: list[PortState],
+    per_port_node_ids: dict[str, set[str]],
+    expected_node_ids: set[str],
+    expected_nodes: int,
+) -> dict[str, Any]:
+    union_node_ids = sorted({node_id for node_ids in per_port_node_ids.values() for node_id in node_ids})
+    per_port_counts = {st.port: len(per_port_node_ids.get(st.port, set())) for st in states}
+    per_port_missing_known = {
+        st.port: sorted(expected_node_ids - per_port_node_ids.get(st.port, set()))
+        for st in states
+    }
+    per_port_ready = {
+        st.port: (
+            len(per_port_node_ids.get(st.port, set())) >= expected_nodes
+            and expected_node_ids.issubset(per_port_node_ids.get(st.port, set()))
+        )
+        for st in states
+    }
+    ready = bool(states) and all(per_port_ready.values())
+    return {
+        "ready": ready,
+        "union_node_ids": union_node_ids,
+        "per_port_counts": per_port_counts,
+        "per_port_missing_known": per_port_missing_known,
+        "per_port_ready": per_port_ready,
+    }
+
+
+def summarize_stats_collection(round_results: list[dict[str, Any]]) -> dict[str, Any]:
+    before_timeout_rounds: list[int] = []
+    after_timeout_rounds: list[int] = []
+    complete_rounds: list[int] = []
+    incomplete_rounds: list[int] = []
+    for round_record in round_results:
+        round_no = to_int(round_record.get("round"), 0)
+        errors = {str(err) for err in (round_record.get("errors") or [])}
+        if "stats_before_timeout" in errors:
+            before_timeout_rounds.append(round_no)
+        if "stats_after_timeout" in errors:
+            after_timeout_rounds.append(round_no)
+        if isinstance(round_record.get("mesh_delta"), dict):
+            complete_rounds.append(round_no)
+        elif "stats_before_timeout" in errors or "stats_after_timeout" in errors:
+            incomplete_rounds.append(round_no)
+    expected_rounds = len(round_results)
+    complete_count = len(complete_rounds)
+    return {
+        "expected_rounds": expected_rounds,
+        "complete_rounds": complete_count,
+        "complete_round_ids": complete_rounds,
+        "incomplete_rounds": incomplete_rounds,
+        "before_timeout_rounds": before_timeout_rounds,
+        "after_timeout_rounds": after_timeout_rounds,
+        "timeout_rounds": sorted(set(before_timeout_rounds) | set(after_timeout_rounds)),
+        "completeness_ratio": calc_ratio(complete_count, expected_rounds),
+    }
+
+
 def parse_threshold_file(path: Path | None) -> dict[str, float | int | None]:
     allowed_keys = {
         "min_success_rate",
@@ -362,6 +434,25 @@ def reader_loop(state: PortState, stop_event: threading.Event) -> None:
                 state.lines.put(payload)
         except json.JSONDecodeError:
             continue
+
+
+def open_port_state(port: str, baud: int, node_id: str | None) -> PortState:
+    require_serial_module()
+    last_error: Exception | None = None
+    for attempt in range(8):
+        try:
+            ser = serial.Serial(port=port, baudrate=baud, timeout=0.2, write_timeout=0.5)
+            ser.dtr = False
+            ser.rts = False
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            return PortState(port=port, ser=ser, node_id=node_id)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2 * float(attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"failed to open serial port: {port}")
 
 
 def send_json(state: PortState, payload: dict[str, Any]) -> None:
@@ -648,12 +739,7 @@ def main() -> int:
             print(f"[{p}] node_id={node}")
 
         for p in args.ports:
-            ser = serial.Serial(port=p, baudrate=args.baud, timeout=0.2, write_timeout=0.5)
-            ser.dtr = False
-            ser.rts = False
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            st = PortState(port=p, ser=ser, node_id=node_by_port.get(p))
+            st = open_port_state(p, args.baud, node_by_port.get(p))
             states.append(st)
 
         for st in states:
@@ -717,8 +803,15 @@ def main() -> int:
         expected_nodes = args.min_node_count if args.min_node_count > 0 else len(args.ports)
         deadline = time.time() + args.timeout
         next_request = 0.0
-        observed_node_ids: set[str] = set()
-        per_port_max: dict[str, int] = {}
+        expected_node_ids = {str(st.node_id).strip() for st in states if st.node_id}
+        per_port_node_ids: dict[str, set[str]] = {}
+        node_list_status: dict[str, Any] = {
+            "ready": False,
+            "union_node_ids": [],
+            "per_port_counts": {},
+            "per_port_missing_known": {},
+            "per_port_ready": {},
+        }
         while time.time() < deadline:
             now = time.time()
             if now >= next_request:
@@ -730,31 +823,39 @@ def main() -> int:
                 if ev.get("type") != "node_list" or not isinstance(ev.get("nodes"), list):
                     continue
                 port_name = str(ev.get("_port") or "")
-                current_count = len(ev["nodes"])
-                if current_count > per_port_max.get(port_name, 0):
-                    per_port_max[port_name] = current_count
+                current_node_ids: set[str] = set()
                 for entry in ev["nodes"]:
                     if not isinstance(entry, dict):
                         continue
                     node_id = str(entry.get("node_id") or "").strip()
                     if node_id:
-                        observed_node_ids.add(node_id)
-            observed_count = len(observed_node_ids)
-            if observed_count >= expected_nodes:
+                        current_node_ids.add(node_id)
+                if port_name:
+                    per_port_node_ids[port_name] = current_node_ids
+            node_list_status = evaluate_node_list_coverage(
+                states=states,
+                per_port_node_ids=per_port_node_ids,
+                expected_node_ids=expected_node_ids,
+                expected_nodes=expected_nodes,
+            )
+            if bool(node_list_status.get("ready")):
                 break
             time.sleep(0.05)
-        observed_count = len(observed_node_ids)
-        if observed_count < expected_nodes:
+        observed_count = len(node_list_status.get("union_node_ids") or [])
+        if not bool(node_list_status.get("ready")):
             print(
                 f"NG: node_list count too small count={observed_count} expected>={expected_nodes} "
-                f"unique_nodes={sorted(observed_node_ids)} per_port_max={per_port_max}"
+                f"unique_nodes={node_list_status.get('union_node_ids')} "
+                f"per_port_counts={node_list_status.get('per_port_counts')} "
+                f"per_port_missing_known={node_list_status.get('per_port_missing_known')}"
             )
             for e in event_history[-10:]:
                 print(e)
             return 1
         print(
             f"OK: node_list observed count={observed_count} "
-            f"unique_nodes={sorted(observed_node_ids)} per_port_max={per_port_max}"
+            f"unique_nodes={node_list_status.get('union_node_ids')} "
+            f"per_port_counts={node_list_status.get('per_port_counts')}"
         )
 
         marker = f"smoke-wifi-{uuid.uuid4().hex[:8]}"
@@ -1120,6 +1221,7 @@ def main() -> int:
             for packet in r1k_packets:
                 packet_type = str(packet.get("type") or "")
                 expected_idx = to_int(packet.get("index", -1), -1)
+                packet_requires_delivery_ack = bool(packet.get("need_ack")) and bool(args.require_delivery_ack)
                 ok_packet, retry_packet, delivery_packet = send_with_delivery_retry(
                     tx=tx,
                     dst=directed_target,
@@ -1128,7 +1230,7 @@ def main() -> int:
                     payload=packet,
                     ack_timeout=args.ack_timeout,
                     ack_retries=args.ack_retries,
-                    require_delivery_ack=args.require_delivery_ack,
+                    require_delivery_ack=packet_requires_delivery_ack,
                     rx_match=lambda ev, expected_type=packet_type, expected_index=expected_idx: (
                         ev.get("_port") == directed_target.port
                         and str(ev.get("type") or "") == expected_type
@@ -1140,11 +1242,12 @@ def main() -> int:
                     ),
                 )
                 if not ok_packet:
-                    print(f"NG: reliable_1k delivery_ack timeout type={packet_type} index={expected_idx}")
+                    fail_reason = "delivery_ack timeout" if packet_requires_delivery_ack else "rx correlation timeout"
+                    print(f"NG: reliable_1k {fail_reason} type={packet_type} index={expected_idx}")
                     for e in event_history[-25:]:
                         print(e)
                     return 1
-                if not delivery_packet:
+                if packet_requires_delivery_ack and not delivery_packet:
                     print(
                         f"WARN: reliable_1k packet delivered without delivery_ack "
                         f"type={packet_type} index={expected_idx}"
@@ -1243,14 +1346,15 @@ def main() -> int:
         round_results: list[dict[str, Any]] = []
         stats_timeout_s = min(max(args.ack_timeout, 1.0), max(args.timeout, 1.0))
         round_seq_base = 1000
+        rotate_pair_cycle = build_rotate_round_pairs(states) if args.rotate_tx else []
         for round_idx in range(args.rounds):
             round_no = round_idx + 1
             round_tx = tx
             round_dst = ping_target
+            rotate_pair_index = None
             if args.rotate_tx:
-                round_tx = states[round_idx % len(states)]
-                if round_tx.port == ping_target.port:
-                    round_dst = states[(round_idx + 1) % len(states)]
+                rotate_pair_index = round_idx % len(rotate_pair_cycle)
+                round_tx, round_dst = rotate_pair_cycle[rotate_pair_index]
 
             seq_round = round_seq_base + round_no
             ping_id_round = uuid.uuid4().hex[:8]
@@ -1345,6 +1449,7 @@ def main() -> int:
                 "tx_node": round_tx.node_id,
                 "dst_port": round_dst.port,
                 "dst_node": round_dst.node_id,
+                "rotate_pair_index": rotate_pair_index,
                 "seq": seq_round,
                 "ping_id": ping_id_round,
                 "success": success_round,
@@ -1391,6 +1496,8 @@ def main() -> int:
 
         round_success_count = sum(1 for r in round_results if bool(r.get("success")))
         success_rate = float(round_success_count) / float(args.rounds) if args.rounds > 0 else 0.0
+        stats_summary = summarize_stats_collection(round_results) if args.collect_stats else None
+        stats_timeout_count = len((stats_summary or {}).get("timeout_rounds") or [])
         latency_samples = [
             int(r["latency_ms"])
             for r in round_results
@@ -1414,6 +1521,16 @@ def main() -> int:
         max_rx_drop_ratio_observed = max(rx_drop_ratio_samples) if rx_drop_ratio_samples else None
         probe_hash_ok_count = sum(1 for r in round_results if r.get("probe_hash_ok") is True)
         probe_hash_ok_rate = (float(probe_hash_ok_count) / float(args.rounds)) if args.rounds > 0 else 0.0
+        rotate_tx_counts: dict[str, int] = {}
+        rotate_dst_counts: dict[str, int] = {}
+        rotate_pair_counts: dict[str, int] = {}
+        for r in round_results:
+            tx_node_key = str(r.get("tx_node") or r.get("tx_port") or "?")
+            dst_node_key = str(r.get("dst_node") or r.get("dst_port") or "?")
+            pair_key = f"{tx_node_key}->{dst_node_key}"
+            rotate_tx_counts[tx_node_key] = rotate_tx_counts.get(tx_node_key, 0) + 1
+            rotate_dst_counts[dst_node_key] = rotate_dst_counts.get(dst_node_key, 0) + 1
+            rotate_pair_counts[pair_key] = rotate_pair_counts.get(pair_key, 0) + 1
         consecutive_failures = 0
         max_consecutive_failures_observed = 0
         route_hit_total = 0
@@ -1512,6 +1629,15 @@ def main() -> int:
                         "limit": float(max_retry_limit),
                     }
                 )
+        if args.collect_stats and stats_timeout_count > 0:
+            threshold_violations.append(
+                {
+                    "metric": "stats_collection",
+                    "actual": stats_timeout_count,
+                    "limit": 0,
+                    "reason": "stats_timeout_rounds",
+                }
+            )
         max_drop_limit = effective_thresholds.get("max_rx_queue_drop_ratio")
         if isinstance(max_drop_limit, (int, float)):
             if not args.collect_stats:
@@ -1639,6 +1765,14 @@ def main() -> int:
             "route_fallback_ratio_observed": route_fallback_ratio_observed,
             "max_retry_rate_observed": max_retry_rate_observed,
             "max_rx_queue_drop_ratio_observed": max_rx_drop_ratio_observed,
+            "stats_timeout_rounds": stats_timeout_count,
+            "stats": stats_summary,
+            "rotate_schedule": {
+                "pair_cycle_length": len(rotate_pair_cycle) if args.rotate_tx else 0,
+                "tx_counts": rotate_tx_counts,
+                "dst_counts": rotate_dst_counts,
+                "pair_counts": rotate_pair_counts,
+            },
             "thresholds": effective_thresholds,
             "threshold_violations": threshold_violations,
             "threshold_pass": len(threshold_violations) == 0,

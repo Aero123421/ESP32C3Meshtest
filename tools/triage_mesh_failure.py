@@ -19,6 +19,7 @@ FAILURE_HINTS: dict[str, str] = {
     "min_probe_hash_ok_rate": "整合性不一致が多い。衝突・ノイズ・フラグメント欠損を疑う。",
     "min_route_hit_rate": "ルートヒット率不足。NodeInfo収束待ち、経路学習時間を確保。",
     "max_route_fallback_ratio": "fallback flood依存が高い。経路固定性と隣接品質を見直し。",
+    "stats_collection": "統計取得が途中で欠落。PC/FW負荷や monitor ログも併せて確認。",
 }
 
 LOG_SIGNATURES: list[tuple[str, str, str, str]] = [
@@ -94,6 +95,12 @@ def classify(summary: dict[str, Any], raw_logs: list[Path]) -> list[dict[str, An
             )
 
     round_summary = summary.get("round_summary") if isinstance(summary.get("round_summary"), dict) else {}
+    stats_section = round_summary.get("stats") if isinstance(round_summary.get("stats"), dict) else {}
+    stats_timeout_rounds = int(round_summary.get("stats_timeout_rounds") or 0) if isinstance(round_summary, dict) else 0
+    stats_expected_rounds = int(stats_section.get("expected_rounds") or 0) if isinstance(stats_section, dict) else 0
+    stats_complete_rounds = int(stats_section.get("complete_rounds") or 0) if isinstance(stats_section, dict) else 0
+    stats_incomplete_rounds = stats_section.get("incomplete_rounds") if isinstance(stats_section, dict) else []
+    collect_stats = bool(round_summary.get("collect_stats")) if isinstance(round_summary, dict) else False
     violations = round_summary.get("threshold_violations") if isinstance(round_summary, dict) else []
     if isinstance(violations, list):
         for v in violations:
@@ -110,6 +117,73 @@ def classify(summary: dict[str, Any], raw_logs: list[Path]) -> list[dict[str, An
                     "hint": FAILURE_HINTS.get(metric, "詳細ログを確認してください。"),
                 }
             )
+    if (
+        collect_stats
+        and stats_expected_rounds > 0
+        and stats_complete_rounds < stats_expected_rounds
+        and not isinstance(stats_incomplete_rounds, list)
+    ):
+        stats_incomplete_rounds = []
+    if (
+        collect_stats
+        and stats_expected_rounds > 0
+        and stats_complete_rounds < stats_expected_rounds
+        and not any(str(f.get("code") or "") == "STATS_COLLECTION" for f in findings)
+    ):
+        add_finding(
+            {
+                "code": "STATS_COLLECTION",
+                "metric": "stats_collection",
+                "actual": {
+                    "complete_rounds": stats_complete_rounds,
+                    "expected_rounds": stats_expected_rounds,
+                    "timeout_rounds": stats_timeout_rounds,
+                    "incomplete_rounds": stats_incomplete_rounds,
+                },
+                "limit": stats_expected_rounds,
+                "reason": "stats_incomplete",
+                "hint": FAILURE_HINTS["stats_collection"],
+            }
+        )
+    elif stats_timeout_rounds > 0 and not any(str(f.get("code") or "") == "STATS_COLLECTION" for f in findings):
+        add_finding(
+            {
+                "code": "STATS_COLLECTION",
+                "metric": "stats_collection",
+                "actual": stats_timeout_rounds,
+                "limit": 0,
+                "reason": "stats_timeout_rounds",
+                "hint": FAILURE_HINTS["stats_collection"],
+            }
+        )
+    monitor_logs = [path for path in raw_logs if "monitor" in str(path).lower()]
+    summary_monitor_logs = summary.get("monitor_logs_attached") if isinstance(summary.get("monitor_logs_attached"), list) else []
+    monitor_requested = bool(summary.get("monitor_requested")) if isinstance(summary, dict) and "monitor_requested" in summary else bool(summary)
+    monitor_logs_missing = bool(summary.get("monitor_logs_missing")) if isinstance(summary, dict) else False
+    monitor_expected_ports = summary.get("monitor_expected_ports") if isinstance(summary.get("monitor_expected_ports"), list) else []
+    monitor_missing_ports = summary.get("monitor_missing_ports") if isinstance(summary.get("monitor_missing_ports"), list) else []
+    attached_monitor_count = max(len(monitor_logs), len(summary_monitor_logs))
+    if monitor_requested and (monitor_logs_missing or attached_monitor_count == 0 or len(monitor_missing_ports) > 0):
+        add_finding(
+            {
+                "code": "MONITOR_LOG_MISSING",
+                "metric": "monitor_log",
+                "actual": {
+                    "attached_count": attached_monitor_count,
+                    "expected_ports": monitor_expected_ports,
+                    "missing_ports": monitor_missing_ports,
+                },
+                "limit": max(1, len(monitor_expected_ports)),
+                "reason": (
+                    "monitor_logs_missing"
+                    if monitor_logs_missing
+                    else "monitor_logs_incomplete"
+                    if len(monitor_missing_ports) > 0
+                    else "no_monitor_log_attached"
+                ),
+                "hint": "monitorログが triage 対象に含まれていません。run_mesh_regression では monitor を有効化してください。",
+            }
+        )
 
     for log_file in raw_logs:
         try:

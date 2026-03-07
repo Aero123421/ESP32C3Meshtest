@@ -380,9 +380,6 @@ def make_reliable_1k_messages(
         }
         if ttl is not None:
             packet["ttl"] = max(1, min(255, int(ttl)))
-        if require_ack:
-            packet["need_ack"] = True
-            packet["e2e_id"] = f"{session_id}:c:{wire_idx}"
         packets.append(packet)
 
     end: dict[str, Any] = {

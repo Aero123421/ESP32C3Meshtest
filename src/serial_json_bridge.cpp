@@ -1583,8 +1583,6 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         bridgeStats_.rxReliable++;
         if (isR1kStart) {
           maybeSendDeliveryAck("reliable_1k_start");
-        } else if (isR1kChunk) {
-          maybeSendDeliveryAck("reliable_1k_chunk");
         } else if (isR1kEnd) {
           maybeSendDeliveryAck("reliable_1k_end");
         } else if (isR1kNack) {

@@ -156,10 +156,14 @@ def check_reliable_messages() -> None:
         original_size=int(meta["size"]),
     )
     assert restored is not None and restored.decode("utf-8") == text, "reliable payload reconstruction failed"
+    ackable_types = {"reliable_1k_start", "reliable_1k_end"}
     for p in packets:
-        if p["type"] in {"reliable_1k_start", "reliable_1k_chunk", "reliable_1k_end"}:
-            assert p.get("need_ack") is True, "need_ack missing in reliable_1k packet"
-            assert isinstance(p.get("e2e_id"), str) and p["e2e_id"], "e2e_id missing in reliable_1k packet"
+        if p["type"] in ackable_types:
+            assert p.get("need_ack") is True, "need_ack missing in reliable control packet"
+            assert isinstance(p.get("e2e_id"), str) and p["e2e_id"], "e2e_id missing in reliable control packet"
+        if p["type"] == "reliable_1k_chunk":
+            assert "need_ack" not in p, "reliable data chunk should not request delivery_ack by default"
+            assert "e2e_id" not in p, "reliable data chunk should not carry e2e_id by default"
 
 
 def check_reliable_stats() -> None:

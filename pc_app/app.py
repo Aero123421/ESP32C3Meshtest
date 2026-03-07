@@ -76,8 +76,9 @@ TOPOLOGY_FLOW_EVENT_LIMIT = 240
 QUALITY_GRAPH_MAX_POINTS = 240
 QUALITY_GRAPH_MIN_REDRAW_INTERVAL_MS = 200
 QUALITY_GRAPH_DUPLICATE_WINDOW_MS = 300
-MAX_WORKER_EVENTS_PER_TICK = 120
+MAX_WORKER_EVENTS_PER_TICK = 320
 WORKER_BACKLOG_LOG_INTERVAL_MS = 1200
+LOG_WIDGET_FLUSH_INTERVAL_MS = 60
 PING_PENDING_MAX_AGE_MS = 20000
 PING_BROADCAST_RESPONSE_WINDOW_MS = 2600
 PING_PROBE_BYTES = 1000
@@ -137,6 +138,13 @@ TOPOLOGY_TRACK_MESSAGE_TYPES = {
     "r1k_o",
     "binary",
 }
+HIGH_VOLUME_MESSAGE_TYPES = {
+    "delivery_ack",
+    "long_text_chunk",
+    "image_chunk",
+    "reliable_1k_chunk",
+    "reliable_1k_repair",
+}
 TOPOLOGY_EDGE_COLORS: dict[str, tuple[str, str]] = {
     "chat": ("#22c55e", "#166534"),
     "ping": ("#38bdf8", "#1d4ed8"),
@@ -187,13 +195,16 @@ class LPWAApp(tk.Tk):
         self.log_lines: list[str] = []
         self.event_records: list[dict[str, Any]] = []
         self.max_log_lines = 3000
+        self._log_widget_buffer: list[tuple[str, str]] = []
+        self._log_flush_after_id: str | None = None
         self.image_rx_sessions: dict[str, dict[str, Any]] = {}
         self.long_text_rx_sessions: dict[str, dict[str, Any]] = {}
         self.reliable_tx_sessions: dict[str, dict[str, Any]] = {}
         self.reliable_rx_sessions: dict[str, dict[str, Any]] = {}
+        self.reliable_rx_completed: dict[str, int] = {}
         self.reliable_profile_pref_by_dst: dict[str, int] = {}
         self.reliable_auto_state_by_dst: dict[str, dict[str, Any]] = {}
-        self.reliable_result_deadline_ms = 15000
+        self.reliable_result_deadline_ms = 25000
         self.reliable_rx_session_timeout_ms = 30000
         self.reliable_auto_up_retry_rate_pct = 20.0
         self.reliable_auto_down_retry_rate_pct = 5.0
@@ -1089,8 +1100,19 @@ class LPWAApp(tk.Tk):
         if len(self.event_records) > self.max_log_lines:
             self.event_records = self.event_records[-self.max_log_lines :]
 
+        if hasattr(self, "log_text"):
+            self._log_widget_buffer.append((stamped, level_tag))
+            if self._log_flush_after_id is None:
+                self._log_flush_after_id = self.after(LOG_WIDGET_FLUSH_INTERVAL_MS, self._flush_log_widget)
+
+    def _flush_log_widget(self) -> None:
+        self._log_flush_after_id = None
+        if not hasattr(self, "log_text") or not self._log_widget_buffer:
+            return
         self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, stamped + "\n", (level_tag,))
+        for stamped, level_tag in self._log_widget_buffer:
+            self.log_text.insert(tk.END, stamped + "\n", (level_tag,))
+        self._log_widget_buffer.clear()
         self._trim_log_widget()
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
@@ -1314,6 +1336,25 @@ class LPWAApp(tk.Tk):
             "dst": str(payload.get("dst") or BROADCAST_LABEL),
         }
 
+    def _clear_pending_e2e_for_r1k(self, r1k_id: str) -> int:
+        session_id = str(r1k_id or "").strip().lower()
+        if not session_id:
+            return 0
+        removed = 0
+        prefixes = (
+            f"{session_id}:s",
+            f"{session_id}:e",
+            f"{session_id}:n:",
+            f"{session_id}:r:",
+            f"{session_id}:o:",
+        )
+        for e2e_id in list(self.pending_e2e.keys()):
+            key = str(e2e_id or "").strip().lower()
+            if any(key.startswith(prefix) for prefix in prefixes):
+                self.pending_e2e.pop(e2e_id, None)
+                removed += 1
+        return removed
+
     def _process_e2e_retries(self) -> None:
         if not self.pending_e2e:
             return
@@ -1358,14 +1399,15 @@ class LPWAApp(tk.Tk):
                 entry["payload"] = payload
                 entry["attempt"] = attempt
                 entry["last_send_ms"] = now
-                self.append_log(
-                    (
-                        f"delivery retry pending(queue full): type={entry.get('type')} "
-                        f"dst={entry.get('dst')} e2e_id={e2e_id}"
-                    ),
-                    level="WARN",
-                    category="E2E",
-                )
+                if not self._is_high_volume_message_type(str(entry.get("type") or "").strip().lower()):
+                    self.append_log(
+                        (
+                            f"delivery retry pending(queue full): type={entry.get('type')} "
+                            f"dst={entry.get('dst')} e2e_id={e2e_id}"
+                        ),
+                        level="WARN",
+                        category="E2E",
+                    )
                 retry_sent_this_tick += 1
                 continue
             entry["payload"] = payload
@@ -1382,11 +1424,12 @@ class LPWAApp(tk.Tk):
                         tx["last_update_ms"] = now
                         tx["result_deadline_ms"] = now + self.reliable_result_deadline_ms
                 stats_dirty = True
-            self.append_log(
-                f"delivery retry#{attempt}: type={entry.get('type')} dst={entry.get('dst')} e2e_id={e2e_id}",
-                level="WARN",
-                category="E2E",
-            )
+            if not self._is_high_volume_message_type(str(entry.get("type") or "").strip().lower()):
+                self.append_log(
+                    f"delivery retry#{attempt}: type={entry.get('type')} dst={entry.get('dst')} e2e_id={e2e_id}",
+                    level="WARN",
+                    category="E2E",
+                )
             retry_sent_this_tick += 1
         if stats_dirty:
             self.update_stats_view()
@@ -1465,6 +1508,12 @@ class LPWAApp(tk.Tk):
             self.reliable_rx_sessions.pop(r1k_id, None)
             self.reliable_stats.register_failure("rx_timeout")
             reliable_stats_dirty = True
+
+        expired_reliable_completed = [
+            r1k_id for r1k_id, completed_ms in self.reliable_rx_completed.items() if int(completed_ms) < reliable_cutoff
+        ]
+        for r1k_id in expired_reliable_completed:
+            self.reliable_rx_completed.pop(r1k_id, None)
             self.append_log(
                 f"reliable session expired: id={r1k_id}",
                 level="WARN",
@@ -1481,6 +1530,7 @@ class LPWAApp(tk.Tk):
             session = self.reliable_tx_sessions.pop(r1k_id, None)
             if session is None:
                 continue
+            self._clear_pending_e2e_for_r1k(r1k_id)
             self.reliable_stats.register_failure("result_timeout")
             retry_packets = int(session.get("retry_packets") or 0) + int(session.get("repair_packets") or 0)
             total_packets = int(session.get("packet_count") or 0) + int(session.get("repair_packets") or 0)
@@ -1665,6 +1715,17 @@ class LPWAApp(tk.Tk):
 
     def _payload_type(self, payload: dict[str, Any]) -> str:
         return str(payload.get("type") or payload.get("event") or "payload").strip().lower()
+
+    def _is_high_volume_message_type(self, kind: str) -> bool:
+        return kind in HIGH_VOLUME_MESSAGE_TYPES
+
+    def _should_log_worker_payload(self, *, event_type: str, kind: str) -> bool:
+        del event_type
+        if kind in {"mesh_observed", "mesh_trace"}:
+            return False
+        if self._is_high_volume_message_type(kind):
+            return False
+        return True
 
     def _shorten(self, text: str, max_len: int = LOG_PREVIEW_MAX) -> str:
         if len(text) <= max_len:
@@ -2686,7 +2747,7 @@ class LPWAApp(tk.Tk):
         self._process_e2e_retries()
         self._prune_stale_pending_pings()
         self._prune_rx_sessions()
-        self.after(30 if backlog > 0 else 100, self.poll_worker_events)
+        self.after(20 if backlog > 0 else 80, self.poll_worker_events)
 
     def _is_stale_worker_event(self, event: dict[str, Any]) -> bool:
         event_worker_id = str(event.get("_worker_id") or "").strip()
@@ -2750,7 +2811,9 @@ class LPWAApp(tk.Tk):
             payload = event.get("payload")
             if isinstance(payload, dict):
                 self._track_topology_payload(payload, direction="tx")
-                self.append_log(self._summarize_payload(payload), level="TX", category=self._payload_type(payload))
+                kind = self._payload_type(payload)
+                if self._should_log_worker_payload(event_type="tx", kind=kind):
+                    self.append_log(self._summarize_payload(payload), level="TX", category=kind)
             else:
                 self.append_log(f"tx_raw {payload}", level="TX", category="RAW")
             return
@@ -2763,7 +2826,7 @@ class LPWAApp(tk.Tk):
                 level = "RX"
                 if kind == "error":
                     level = "ERROR"
-                if kind not in {"mesh_observed", "mesh_trace"}:
+                if self._should_log_worker_payload(event_type="rx", kind=kind):
                     self.append_log(self._summarize_payload(payload), level=level, category=kind)
                 self.handle_payload(payload)
             else:
@@ -2973,6 +3036,9 @@ class LPWAApp(tk.Tk):
             return
         elapsed_ms = self._now_ms() - int(entry.get("created_ms") or self._now_ms())
         retry_count = int(entry.get("attempt") or 0)
+        expected_type = str(entry.get("type") or "").strip().lower()
+        if self._is_high_volume_message_type(expected_type):
+            return
         self.append_log(
             (
                 f"delivery ok: type={entry.get('type')} dst={entry.get('dst')} "
@@ -3180,6 +3246,9 @@ class LPWAApp(tk.Tk):
         if not r1k_id:
             return
         now = self._now_ms()
+        completed_ms = int(self.reliable_rx_completed.get(r1k_id) or 0)
+        if completed_ms > 0 and (now - completed_ms) <= self.reliable_rx_session_timeout_ms:
+            return
 
         def ensure_rx_session(*, reason: str) -> dict[str, Any]:
             session = self.reliable_rx_sessions.get(r1k_id)
@@ -3277,6 +3346,7 @@ class LPWAApp(tk.Tk):
                         latency_ms=latency_ms,
                     )
                 self.reliable_rx_sessions.pop(r1k_id, None)
+                self.reliable_rx_completed[r1k_id] = now_ms
                 self.append_log(
                     (
                         f"reliable_1k 復元成功: id={r1k_id} src={src} bytes={len(restored)} "
@@ -3365,6 +3435,10 @@ class LPWAApp(tk.Tk):
                 session["shards"] = shards
             shards[idx] = data_b64
             session["last_update_ms"] = now
+            if bool(session.get("start_received")) and not bool(session.get("end_received")):
+                data_shards = int(session.get("data_shards") or 0)
+                if data_shards > 0 and len(shards) >= data_shards:
+                    try_finalize_reliable(session, allow_nack=False, now_ms=now)
             if kind == "reliable_1k_repair" and bool(session.get("end_received")):
                 try_finalize_reliable(session, allow_nack=True, now_ms=now)
             return
@@ -3430,6 +3504,7 @@ class LPWAApp(tk.Tk):
             session = self.reliable_tx_sessions.pop(r1k_id, None)
             if session is None:
                 return
+            self._clear_pending_e2e_for_r1k(r1k_id)
             status = str(payload.get("status") or "").strip().lower()
             if not status:
                 status = "unknown"
