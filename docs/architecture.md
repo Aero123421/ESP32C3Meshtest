@@ -174,3 +174,7 @@
   - PDR（Packet Delivery Rate）目標
   - 遅延上限
   - 電池駆動時間目標
+## 9.1 Hop Telemetry Update
+- `pong` and `delivery_ack` now carry `request_hops` in their payload. This is the forward-path hop count observed at the responder.
+- PC/serial receive events keep `hops` for backward compatibility and also mirror the return-path hop count into `reply_hops`.
+- `trace_obs` / `mesh_trace` / `mesh_observed` forward these fields so forward/return hop asymmetry can be inspected from logs and topology tools.

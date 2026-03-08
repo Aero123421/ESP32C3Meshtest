@@ -1722,21 +1722,46 @@ class LPWAApp(tk.Tk):
     def _payload_type(self, payload: dict[str, Any]) -> str:
         return str(payload.get("type") or payload.get("event") or "payload").strip().lower()
 
-    def _payload_hops(self, payload: dict[str, Any]) -> int | None:
-        raw = payload.get("hops")
+    def _payload_named_hops(self, payload: dict[str, Any], *keys: str, allow_zero: bool = False) -> int | None:
+        raw = None
+        for key in keys:
+            if key in payload:
+                raw = payload.get(key)
+                break
         if isinstance(raw, bool):
             return None
         if isinstance(raw, int):
-            return raw if raw > 0 else None
+            return raw if (raw >= 0 if allow_zero else raw > 0) else None
         if isinstance(raw, float):
             hops = int(raw)
-            return hops if hops > 0 else None
+            return hops if (hops >= 0 if allow_zero else hops > 0) else None
         if isinstance(raw, str):
             text = raw.strip()
             if text and (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
                 hops = int(text)
-                return hops if hops > 0 else None
+                return hops if (hops >= 0 if allow_zero else hops > 0) else None
         return None
+
+    def _payload_hops(self, payload: dict[str, Any]) -> int | None:
+        return self._payload_named_hops(payload, "reply_hops", "hops", allow_zero=True)
+
+    def _payload_request_hops(self, payload: dict[str, Any]) -> int | None:
+        return self._payload_named_hops(payload, "request_hops", allow_zero=True)
+
+    def _hop_fields_summary(self, payload: dict[str, Any]) -> str:
+        observed_hops = self._payload_hops(payload)
+        request_hops = self._payload_request_hops(payload)
+        parts: list[str] = []
+        if request_hops is not None:
+            parts.append(f"request_hops={request_hops}")
+        if observed_hops is not None:
+            label = "reply_hops" if (request_hops is not None or "reply_hops" in payload) else "hops"
+            parts.append(f"{label}={observed_hops}")
+        elif "hops" in payload:
+            parts.append(f"hops={payload.get('hops')}")
+        if not parts:
+            return ""
+        return " ".join(parts)
 
     def _route_stats(self, routes: list[Any] | None = None) -> tuple[int, int]:
         route_entries = routes if routes is not None else self.latest_routes
@@ -1783,13 +1808,18 @@ class LPWAApp(tk.Tk):
         next_hop = str(route.get("next_hop_node_id") or route.get("next_hop") or "").strip() or None
         return (hops if hops > 0 else None), next_hop
 
-    def _hop_log_suffix(self, *, src_node: str, observed_hops: int | None) -> str:
+    def _hop_log_suffix(self, *, src_node: str, observed_hops: int | None, request_hops: int | None = None) -> str:
         route_hops, route_next = self._route_hint_for_node(src_node)
         if observed_hops is not None:
-            parts = [f"hops={observed_hops}"]
+            if request_hops is not None:
+                parts = [f"request_hops={request_hops}", f"reply_hops={observed_hops}"]
+            else:
+                parts = [f"hops={observed_hops}"]
             if observed_hops > 1 and route_next:
                 parts.append(f"next={route_next}")
             return " " + " ".join(parts)
+        if request_hops is not None:
+            return f" request_hops={request_hops}"
         if route_hops is not None:
             parts = [f"route_hops={route_hops}"]
             if route_hops > 1 and route_next:
@@ -1859,16 +1889,18 @@ class LPWAApp(tk.Tk):
             multi_hop, max_hops = self._route_stats(routes if isinstance(routes, list) else [])
             return f"route_list count={count} multi_hop={multi_hop} max_hops={max_hops}"
         if kind == "mesh_observed":
+            hop_text = self._hop_fields_summary(payload) or f"hops={payload.get('hops')}"
             return (
                 f"mesh_observed app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
                 f"observer={payload.get('observer')} via_node={payload.get('via_node')} "
-                f"hops={payload.get('hops')} rssi={payload.get('rssi')} msg_id={payload.get('msg_id')}"
+                f"{hop_text} rssi={payload.get('rssi')} msg_id={payload.get('msg_id')}"
             )
         if kind == "mesh_trace":
+            hop_text = self._hop_fields_summary(payload) or f"hops={payload.get('hops')}"
             return (
                 f"mesh_trace app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
                 f"observer={payload.get('observer')} via_node={payload.get('via_node')} "
-                f"hops={payload.get('hops')} msg_id={payload.get('msg_id')}"
+                f"{hop_text} msg_id={payload.get('msg_id')}"
             )
         if kind == "chat":
             via = payload.get("via", "wifi")
@@ -1889,7 +1921,7 @@ class LPWAApp(tk.Tk):
             src = str(payload.get("src") or payload.get("from") or "").strip()
             return (
                 f"pong seq={payload.get('seq')} src={payload.get('src')} latency={payload.get('latency_ms')}ms"
-                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload))}"
+                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload), request_hops=self._payload_request_hops(payload))}"
             )
         if kind == "ack":
             return (
@@ -1902,7 +1934,7 @@ class LPWAApp(tk.Tk):
                 f"delivery_ack ack_for={payload.get('ack_for')} src={payload.get('src')} "
                 f"e2e_id={payload.get('e2e_id')} msg_id={payload.get('msg_id')} "
                 f"status={payload.get('status')} retry={payload.get('retry_no', 0)}"
-                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload))}"
+                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload), request_hops=self._payload_request_hops(payload))}"
             )
         if kind == "error":
             return f"fw_error code={payload.get('code')} detail={payload.get('detail')}"
@@ -2611,6 +2643,8 @@ class LPWAApp(tk.Tk):
                 if ev.observer == self.local_node_id:
                     observer_label = f"★ {observer_label}"
             msg_label = ev.msg_id or ev.e2e_id or "-"
+            if ev.hop_note:
+                msg_label = ev.hop_note if msg_label == "-" else f"{msg_label} {ev.hop_note}"
             self.topology_flow_tree.insert(
                 "",
                 tk.END,
@@ -3227,6 +3261,7 @@ class LPWAApp(tk.Tk):
         hop_suffix = self._hop_log_suffix(
             src_node=str(payload.get("src") or entry.get("dst") or "").strip(),
             observed_hops=self._payload_hops(payload),
+            request_hops=self._payload_request_hops(payload),
         )
         expected_type = str(entry.get("type") or "").strip().lower()
         if self._is_high_volume_message_type(expected_type):

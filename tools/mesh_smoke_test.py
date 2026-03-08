@@ -1178,6 +1178,10 @@ def main() -> int:
             None,
         )
         ping_latency_ms = to_int((pong_event or {}).get("latency_ms", -1), -1)
+        ping_request_hops = to_int((pong_event or {}).get("request_hops", -1), -1)
+        ping_reply_hops = to_int((pong_event or {}).get("reply_hops", -1), -1)
+        if ping_reply_hops < 0:
+            ping_reply_hops = to_int((pong_event or {}).get("hops", -1), -1)
         if args.r1k_max_latency_ms > 0 and (ping_latency_ms < 0 or ping_latency_ms > args.r1k_max_latency_ms):
             print(f"NG: reliable_1k latency too high latency_ms={ping_latency_ms} limit={args.r1k_max_latency_ms}")
             return 1
@@ -1194,11 +1198,20 @@ def main() -> int:
             "seq": seq,
             "ping_id": ping_id,
             "latency_ms": ping_latency_ms,
+            "hops": ping_reply_hops if ping_reply_hops >= 0 else None,
+            "request_hops": ping_request_hops if ping_request_hops >= 0 else None,
+            "reply_hops": ping_reply_hops if ping_reply_hops >= 0 else None,
             "retry_rate": retry_rate,
             "dst_node": ping_target.node_id,
             "tx_node": tx.node_id,
         }
-        print(f"OK: pong received latency={ping_latency_ms}ms retry_rate={retry_rate:.3f}")
+        hop_bits = []
+        if ping_request_hops >= 0:
+            hop_bits.append(f"request_hops={ping_request_hops}")
+        if ping_reply_hops >= 0:
+            hop_bits.append(f"reply_hops={ping_reply_hops}")
+        hop_suffix = "" if not hop_bits else " " + " ".join(hop_bits)
+        print(f"OK: pong received latency={ping_latency_ms}ms retry_rate={retry_rate:.3f}{hop_suffix}")
 
         if args.skip_r1k:
             print("SKIP: Directed reliable_1k (FEC)")
@@ -1427,6 +1440,8 @@ def main() -> int:
 
             latency_round = None
             hops_round = None
+            request_hops_round = None
+            reply_hops_round = None
             probe_hash_ok_round = None
             if pong_event_round is None:
                 round_error_tags.append("pong_timeout")
@@ -1434,9 +1449,15 @@ def main() -> int:
                 latency_value = to_int(pong_event_round.get("latency_ms"), -1)
                 if latency_value >= 0:
                     latency_round = latency_value
-                hops_value = to_int(pong_event_round.get("hops"), -1)
-                if hops_value >= 0:
-                    hops_round = hops_value
+                request_hops_value = to_int(pong_event_round.get("request_hops"), -1)
+                if request_hops_value >= 0:
+                    request_hops_round = request_hops_value
+                reply_hops_value = to_int(pong_event_round.get("reply_hops"), -1)
+                if reply_hops_value < 0:
+                    reply_hops_value = to_int(pong_event_round.get("hops"), -1)
+                if reply_hops_value >= 0:
+                    reply_hops_round = reply_hops_value
+                    hops_round = reply_hops_value
                 if "probe_hash_ok" in pong_event_round:
                     probe_hash_ok_round = bool(pong_event_round.get("probe_hash_ok"))
                 else:
@@ -1455,6 +1476,8 @@ def main() -> int:
                 "success": success_round,
                 "latency_ms": latency_round,
                 "hops": hops_round,
+                "request_hops": request_hops_round,
+                "reply_hops": reply_hops_round,
                 "probe_hash_ok": probe_hash_ok_round,
                 "mesh_delta": mesh_delta,
                 "retry_rate": retry_rate_round,

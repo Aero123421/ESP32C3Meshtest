@@ -40,6 +40,12 @@
 - `pong` / `delivery_ack` に `route_hops` / `next` を補足表示
 - トポロジの `Hops` 列で `~2` は `route_list` 推定、`Path` 列で `SELF -> next -> ... -> dst` を表示
 
+### Hop Telemetry
+
+- Newer firmware emits `request_hops` on `pong` / `delivery_ack` payloads.
+- PC receive events keep `hops` and also expose `reply_hops` for the return path.
+- Topology Flow `Msg` shows `req=... rep=...` when these fields are present.
+
 ```text
 pc_app/
   app.py                      # tkinter GUI

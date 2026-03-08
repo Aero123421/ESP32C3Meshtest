@@ -89,6 +89,19 @@ def _normalize_mac(value: Any) -> str:
     return ":".join(normalized)
 
 
+def _hop_note(payload: dict[str, Any], *, kind: str, observed_hops: int) -> str:
+    request_hops = _to_int(payload.get("request_hops"), -1)
+    reply_hops = _to_int(payload.get("reply_hops"), -1)
+    parts: list[str] = []
+    if request_hops >= 0:
+        parts.append(f"req={request_hops}")
+    if reply_hops >= 0:
+        parts.append(f"rep={reply_hops}")
+    elif kind in {"pong", "delivery_ack"} and observed_hops >= 0:
+        parts.append(f"rep={observed_hops}")
+    return " ".join(parts)
+
+
 @dataclass
 class TopologyEvent:
     ts_ms: int
@@ -105,6 +118,7 @@ class TopologyEvent:
     rssi: int | None
     msg_id: str
     e2e_id: str
+    hop_note: str
 
 
 @dataclass
@@ -216,7 +230,7 @@ class TopologyTracker:
             if not observer:
                 observer = local_label
 
-        hops = _to_int(payload.get("hops"), 0)
+        hops = _to_int(payload.get("reply_hops"), _to_int(payload.get("hops"), 0))
         retry_no = _to_int(payload.get("retry_no"), 0)
         bytes_size = _estimate_bytes(payload)
         rssi = payload.get("rssi")
@@ -235,6 +249,7 @@ class TopologyTracker:
             or ""
         ).strip()
         e2e_id = str(payload.get("e2e_id") or "").strip()
+        hop_note = _hop_note(payload, kind=kind, observed_hops=hops)
         self._events.append(
             TopologyEvent(
                 ts_ms=now_ms,
@@ -251,6 +266,7 @@ class TopologyTracker:
                 rssi=rssi_value_opt,
                 msg_id=msg_id,
                 e2e_id=e2e_id,
+                hop_note=hop_note,
             )
         )
 

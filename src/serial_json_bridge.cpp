@@ -1104,7 +1104,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
           return;
         }
 
-        DynamicJsonDocument ack(384);
+        DynamicJsonDocument ack(448);
         ack["app"] = "lpwa";
         ack["type"] = "delivery_ack";
         ack["src"] = selfNodeId;
@@ -1113,6 +1113,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         ack["e2e_id"] = e2eId;
         ack["msg_id"] = message.messageId;
         ack["status"] = "ok";
+        ack["request_hops"] = message.hops;
         if (appDoc.containsKey("image_id")) {
           ack["image_id"] = appDoc["image_id"] | "";
         }
@@ -1170,6 +1171,14 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         trace["dst"] = (dst[0] == '\0') ? "*" : dst;
         trace["msg_id"] = message.messageId;
         trace["hops"] = message.hops;
+        if (appDoc.containsKey("request_hops")) {
+          trace["request_hops"] = appDoc["request_hops"] | 0;
+        }
+        if (appDoc.containsKey("reply_hops")) {
+          trace["reply_hops"] = appDoc["reply_hops"] | 0;
+        } else if (std::strcmp(appType, "pong") == 0 || std::strcmp(appType, "delivery_ack") == 0) {
+          trace["reply_hops"] = message.hops;
+        }
         trace["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           trace["via_mac"] = viaMac;
@@ -1204,6 +1213,14 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         observed["dst"] = (dst[0] == '\0') ? "*" : dst;
         observed["msg_id"] = message.messageId;
         observed["hops"] = message.hops;
+        if (appDoc.containsKey("request_hops")) {
+          observed["request_hops"] = appDoc["request_hops"] | 0;
+        }
+        if (appDoc.containsKey("reply_hops")) {
+          observed["reply_hops"] = appDoc["reply_hops"] | 0;
+        } else if (std::strcmp(appType, "pong") == 0 || std::strcmp(appType, "delivery_ack") == 0) {
+          observed["reply_hops"] = message.hops;
+        }
         observed["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           observed["via_mac"] = viaMac;
@@ -1256,6 +1273,12 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         traceOut["dst"] = appDoc["dst"] | "*";
         traceOut["msg_id"] = appDoc["msg_id"] | 0;
         traceOut["hops"] = appDoc["hops"] | 0;
+        if (appDoc.containsKey("request_hops")) {
+          traceOut["request_hops"] = appDoc["request_hops"] | 0;
+        }
+        if (appDoc.containsKey("reply_hops")) {
+          traceOut["reply_hops"] = appDoc["reply_hops"] | 0;
+        }
         traceOut["rssi"] = appDoc["rssi"] | 0;
         traceOut["trace_msg_id"] = message.messageId;
         if (!viaMac.isEmpty()) {
@@ -1285,7 +1308,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (ackDst[0] == '\0' || isBroadcastTarget(ackDst) || !equalsIgnoreCase(selfNodeId, ackDst)) {
           return;
         }
-        DynamicJsonDocument out(384);
+        DynamicJsonDocument out(448);
         out["event"] = "delivery_ack";
         out["type"] = "delivery_ack";
         out["via"] = "wifi";
@@ -1297,6 +1320,10 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["rx_msg_id"] = message.messageId;
         out["status"] = appDoc["status"] | "ok";
         out["hops"] = message.hops;
+        out["reply_hops"] = message.hops;
+        if (appDoc.containsKey("request_hops")) {
+          out["request_hops"] = appDoc["request_hops"] | 0;
+        }
         out["rssi"] = rxRssi;
         if (!viaMac.isEmpty()) {
           out["via_mac"] = viaMac;
@@ -1329,7 +1356,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (accepted && mesh_ != nullptr) {
           const char* src = appDoc["src"] | "";
           if (src[0] != '\0' && !equalsIgnoreCase(selfNodeId, src)) {
-            StaticJsonDocument<256> pong;
+            StaticJsonDocument<320> pong;
             pong["app"] = "lpwa";
             pong["type"] = "pong";
             pong["src"] = selfNodeId;
@@ -1338,6 +1365,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
             pong["ping_id"] = appDoc["ping_id"] | "";
             const uint32_t ts = appDoc["ts_ms"] | 0;
             pong["latency_ms"] = (ts == 0) ? 0 : (millis() - ts);
+            pong["request_hops"] = message.hops;
 
             String response;
             serializeJson(pong, response);
@@ -1356,7 +1384,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (!accepted) {
           return;
         }
-        DynamicJsonDocument out(384);
+        DynamicJsonDocument out(448);
         out["event"] = "pong";
         out["type"] = "pong";
         out["src"] = appDoc["src"] | formatNodeId(message.originId);
@@ -1365,6 +1393,10 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         out["ping_id"] = appDoc["ping_id"] | "";
         out["msg_id"] = message.messageId;
         out["latency_ms"] = appDoc["latency_ms"] | 0;
+        out["reply_hops"] = message.hops;
+        if (appDoc.containsKey("request_hops")) {
+          out["request_hops"] = appDoc["request_hops"] | 0;
+        }
         if (appDoc.containsKey("probe_bytes")) {
           out["probe_bytes"] = appDoc["probe_bytes"] | 0;
         }
@@ -1777,7 +1809,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       const uint32_t gotHash = fnv1a32(probePayload, probe.payloadLen);
       const bool hashOk = (gotHash == probe.payloadHash);
       if (mesh_ != nullptr && message.originId != 0 && message.originId != mesh_->nodeId()) {
-        DynamicJsonDocument pong(320);
+        DynamicJsonDocument pong(384);
         pong["app"] = "lpwa";
         pong["type"] = "pong";
         pong["src"] = selfNodeId;
@@ -1788,6 +1820,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         pong["probe_bytes"] = probe.payloadLen;
         pong["probe_hash_ok"] = hashOk;
         pong["probe_hash"] = formatHex8(gotHash);
+        pong["request_hops"] = message.hops;
 
         String response;
         serializeJson(pong, response);
@@ -1797,7 +1830,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
     }
 
     if (probe.kind == kPingProbeKindPongOk || probe.kind == kPingProbeKindPongBad) {
-      DynamicJsonDocument out(384);
+      DynamicJsonDocument out(448);
       out["event"] = "pong";
       out["type"] = "pong";
       out["via"] = "wifi";
@@ -1811,6 +1844,7 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
       out["probe_hash_ok"] = (probe.kind == kPingProbeKindPongOk);
       out["probe_hash"] = formatHex8(probe.payloadHash);
       out["hops"] = message.hops;
+      out["reply_hops"] = message.hops;
       out["rssi"] = rxRssi;
       if (!viaMac.isEmpty()) {
         out["via_mac"] = viaMac;
