@@ -82,6 +82,8 @@ LOG_WIDGET_FLUSH_INTERVAL_MS = 60
 PING_PENDING_MAX_AGE_MS = 20000
 PING_BROADCAST_RESPONSE_WINDOW_MS = 2600
 PING_PROBE_BYTES = 1000
+ROUTE_REQUEST_MIN_INTERVAL_MS = 2500
+ROUTE_REQUEST_STALE_MS = 6000
 RELIABLE_MODE_CHOICES = ("normal", "reliable_1k")
 RELIABLE_PROFILE_CHOICES = ("auto", "25+8", "25+10")
 RELIABLE_PROFILE_NAME_TO_ID = {"25+8": 0, "25+10": 1}
@@ -214,6 +216,8 @@ class LPWAApp(tk.Tk):
         self.project_root = Path(__file__).resolve().parents[1]
         self.local_node_id: str | None = None
         self.last_node_list_rx_ms = 0
+        self.last_route_list_rx_ms = 0
+        self.last_routes_request_tx_ms = 0
         self.nodes_request_retry_after_id: str | None = None
         self.topology_tracker = TopologyTracker(max_events=20000)
         self.topology_dirty = False
@@ -914,6 +918,7 @@ class LPWAApp(tk.Tk):
             command=self._mark_topology_dirty,
         ).grid(row=0, column=8, padx=(8, 2), sticky="w")
         ttk.Button(ctrl, text="履歴クリア", command=self.clear_topology_history).grid(row=0, column=9, padx=(8, 2))
+        ttk.Button(ctrl, text="経路要求", command=self.request_routes).grid(row=0, column=10, padx=(8, 2))
         ttk.Label(ctrl, textvariable=self.topology_status_var).grid(row=0, column=14, padx=4, sticky="e")
 
         self.topology_canvas = tk.Canvas(
@@ -993,13 +998,14 @@ class LPWAApp(tk.Tk):
         route_tab.rowconfigure(0, weight=1)
         self.topology_route_tree = ttk.Treeview(
             route_tab,
-            columns=("dst", "next", "rank", "hops", "metric", "age"),
+            columns=("dst", "next", "path", "rank", "hops", "metric", "age"),
             show="headings",
             height=9,
         )
         for key, title, width in (
             ("dst", "Dst", 120),
             ("next", "NextHop", 120),
+            ("path", "Path", 250),
             ("rank", "Rank", 62),
             ("hops", "Hops", 62),
             ("metric", "Metric", 86),
@@ -1716,6 +1722,105 @@ class LPWAApp(tk.Tk):
     def _payload_type(self, payload: dict[str, Any]) -> str:
         return str(payload.get("type") or payload.get("event") or "payload").strip().lower()
 
+    def _payload_hops(self, payload: dict[str, Any]) -> int | None:
+        raw = payload.get("hops")
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw if raw > 0 else None
+        if isinstance(raw, float):
+            hops = int(raw)
+            return hops if hops > 0 else None
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text and (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
+                hops = int(text)
+                return hops if hops > 0 else None
+        return None
+
+    def _route_stats(self, routes: list[Any] | None = None) -> tuple[int, int]:
+        route_entries = routes if routes is not None else self.latest_routes
+        multi_hop = 0
+        max_hops = 0
+        for route in route_entries:
+            if not isinstance(route, dict):
+                continue
+            hops = _to_int(str(route.get("hops", 0)), 0)
+            if hops > 1:
+                multi_hop += 1
+            if hops > max_hops:
+                max_hops = hops
+        return multi_hop, max_hops
+
+    def _best_route_for_node(self, node_id: str) -> dict[str, Any] | None:
+        target = str(node_id or "").strip().lower()
+        if not target:
+            return None
+        candidates: list[dict[str, Any]] = []
+        for route in self.latest_routes:
+            if not isinstance(route, dict):
+                continue
+            dst = str(route.get("dst_node_id") or route.get("dst") or "").strip().lower()
+            if dst == target:
+                candidates.append(route)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda route: (
+                0 if _to_int(str(route.get("rank", 0)), 0) <= 0 else 1,
+                0 if _to_int(str(route.get("hops", 0)), 0) > 0 else 1,
+                _to_int(str(route.get("hops", 999)), 999),
+                _to_int(str(route.get("age_ms", 999999)), 999999),
+            )
+        )
+        return candidates[0]
+
+    def _route_hint_for_node(self, node_id: str) -> tuple[int | None, str | None]:
+        route = self._best_route_for_node(node_id)
+        if route is None:
+            return None, None
+        hops = _to_int(str(route.get("hops", 0)), 0)
+        next_hop = str(route.get("next_hop_node_id") or route.get("next_hop") or "").strip() or None
+        return (hops if hops > 0 else None), next_hop
+
+    def _hop_log_suffix(self, *, src_node: str, observed_hops: int | None) -> str:
+        route_hops, route_next = self._route_hint_for_node(src_node)
+        if observed_hops is not None:
+            parts = [f"hops={observed_hops}"]
+            if observed_hops > 1 and route_next:
+                parts.append(f"next={route_next}")
+            return " " + " ".join(parts)
+        if route_hops is not None:
+            parts = [f"route_hops={route_hops}"]
+            if route_hops > 1 and route_next:
+                parts.append(f"next={route_next}")
+            return " " + " ".join(parts)
+        return ""
+
+    def _effective_hops(self, *, src_node: str, observed_hops: int) -> tuple[int, bool]:
+        if observed_hops > 0:
+            return observed_hops, False
+        route_hops, _route_next = self._route_hint_for_node(src_node)
+        if route_hops is not None and route_hops > 0:
+            return route_hops, True
+        return 0, False
+
+    def _format_hops_label(self, *, src_node: str, observed_hops: int) -> str:
+        hops, inferred = self._effective_hops(src_node=src_node, observed_hops=observed_hops)
+        if inferred:
+            return f"~{hops}"
+        return str(hops)
+
+    def _format_route_path(self, *, dst: str, next_hop: str, hops: int) -> str:
+        self_label = self._short_node_id(self.local_node_id) if self.local_node_id else "SELF"
+        dst_label = self._short_node_id(dst)
+        next_label = self._short_node_id(next_hop) if next_hop else "?"
+        if hops <= 1 or not next_hop or next_hop.lower() == dst.lower():
+            return f"{self_label} -> {dst_label}"
+        if hops == 2:
+            return f"{self_label} -> {next_label} -> {dst_label}"
+        return f"{self_label} -> {next_label} -> ... -> {dst_label}"
+
     def _is_high_volume_message_type(self, kind: str) -> bool:
         return kind in HIGH_VOLUME_MESSAGE_TYPES
 
@@ -1740,6 +1845,10 @@ class LPWAApp(tk.Tk):
 
     def _summarize_payload(self, payload: dict[str, Any]) -> str:
         kind = self._payload_type(payload)
+        if kind == "nodes_request":
+            return "nodes_request"
+        if kind == "routes_request":
+            return "routes_request"
         if kind in {"nodes", "node_list"}:
             nodes = payload.get("nodes") or payload.get("items") or []
             count = len(nodes) if isinstance(nodes, list) else 0
@@ -1747,7 +1856,8 @@ class LPWAApp(tk.Tk):
         if kind in {"routes", "route_list"}:
             routes = payload.get("routes") or payload.get("items") or []
             count = len(routes) if isinstance(routes, list) else 0
-            return f"route_list count={count}"
+            multi_hop, max_hops = self._route_stats(routes if isinstance(routes, list) else [])
+            return f"route_list count={count} multi_hop={multi_hop} max_hops={max_hops}"
         if kind == "mesh_observed":
             return (
                 f"mesh_observed app={payload.get('app_type')} src={payload.get('src')} dst={payload.get('dst')} "
@@ -1776,17 +1886,23 @@ class LPWAApp(tk.Tk):
                 f"probe={payload.get('probe_bytes', '-')}B"
             )
         if kind == "pong":
-            return f"pong seq={payload.get('seq')} src={payload.get('src')} latency={payload.get('latency_ms')}ms"
+            src = str(payload.get("src") or payload.get("from") or "").strip()
+            return (
+                f"pong seq={payload.get('seq')} src={payload.get('src')} latency={payload.get('latency_ms')}ms"
+                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload))}"
+            )
         if kind == "ack":
             return (
                 f"ack cmd={payload.get('cmd')} ok={payload.get('ok')} "
                 f"via={payload.get('via')} msg_id={payload.get('msg_id')}"
             )
         if kind == "delivery_ack":
+            src = str(payload.get("src") or "").strip()
             return (
                 f"delivery_ack ack_for={payload.get('ack_for')} src={payload.get('src')} "
                 f"e2e_id={payload.get('e2e_id')} msg_id={payload.get('msg_id')} "
                 f"status={payload.get('status')} retry={payload.get('retry_no', 0)}"
+                f"{self._hop_log_suffix(src_node=src, observed_hops=self._payload_hops(payload))}"
             )
         if kind == "error":
             return f"fw_error code={payload.get('code')} detail={payload.get('detail')}"
@@ -1958,9 +2074,24 @@ class LPWAApp(tk.Tk):
             self.topology_kind_var.set("all")
             self.topology_dirty = True
 
+    def _is_topology_tab_selected(self) -> bool:
+        if not hasattr(self, "main_tabs") or not hasattr(self, "topology_tab"):
+            return True
+        try:
+            selected = str(self.main_tabs.select() or "")
+            topo_widget = str(self.topology_tab)
+            return selected == topo_widget
+        except Exception:
+            return True
+
     def refresh_topology_view(self) -> None:
         try:
+            topology_visible = self._is_topology_tab_selected()
+            if topology_visible:
+                self._request_routes_if_needed(force=False)
             if self.topology_dirty:
+                if not topology_visible:
+                    return
                 if hasattr(self, "main_tabs") and hasattr(self, "topology_tab"):
                     try:
                         selected = str(self.main_tabs.select() or "")
@@ -1986,6 +2117,10 @@ class LPWAApp(tk.Tk):
                 self._refresh_topology_route_table(snapshot)
                 self_label = self.local_node_id if self.local_node_id else "未取得"
                 mode = str(self.topology_view_var.get() or "tree").strip().lower() or "tree"
+                multi_hop_edges = sum(
+                    1 for edge in snapshot.edges if self._effective_hops(src_node=edge.src, observed_hops=edge.hops_max)[0] > 1
+                )
+                route_multi_hop, route_max_hops = self._route_stats()
                 self.topology_status_var.set(
                     " ".join(
                         [
@@ -1993,7 +2128,10 @@ class LPWAApp(tk.Tk):
                             f"self={self_label}",
                             f"nodes={len(snapshot.nodes)}",
                             f"flow_links={len(snapshot.edges)}",
+                            f"multi_hop={multi_hop_edges}",
                             f"relay_links={len(snapshot.relay_links)}",
+                            f"route_multi={route_multi_hop}",
+                            f"route_max={route_max_hops}",
                             f"events={snapshot.event_count}",
                         ]
                     )
@@ -2171,7 +2309,7 @@ class LPWAApp(tk.Tk):
         legend_x = 10
         legend_y = 10
         legend_w = min(580, width - 20)
-        legend_h = 64
+        legend_h = 82
         canvas.create_rectangle(
             legend_x,
             legend_y,
@@ -2206,12 +2344,21 @@ class LPWAApp(tk.Tk):
             fill="#cbd5e1",
             font=("Consolas", 9),
         )
+        route_multi_hop, route_max_hops = self._route_stats()
+        canvas.create_text(
+            legend_x + 10,
+            legend_y + 50,
+            anchor="w",
+            text=f"solid=observed / dash=route hint / ~Hops=inferred / multi_hop_routes={route_multi_hop} max={route_max_hops}",
+            fill="#cbd5e1",
+            font=("Consolas", 8),
+        )
         kind_counts: dict[str, int] = {}
         for edge in snapshot.edges:
             kind_counts[edge.kind] = kind_counts.get(edge.kind, 0) + edge.count
         top_kinds = sorted(kind_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
         legend_cursor_x = legend_x + 10
-        legend_cursor_y = legend_y + 52
+        legend_cursor_y = legend_y + 68
         for kind, count in top_kinds:
             palette = TOPOLOGY_EDGE_COLORS.get(kind, TOPOLOGY_EDGE_COLORS["unknown"])
             canvas.create_rectangle(
@@ -2302,9 +2449,14 @@ class LPWAApp(tk.Tk):
                     continue
                 dst = str(route.get("dst_node_id") or "").strip()
                 next_hop = str(route.get("next_hop_node_id") or "").strip()
-                if not dst or not next_hop:
+                hops = _to_int(str(route.get("hops", 0)), 0)
+                if not dst:
                     continue
-                if self.local_node_id not in positions or next_hop not in positions or dst not in positions:
+                if self.local_node_id not in positions or dst not in positions:
+                    continue
+                if not next_hop:
+                    next_hop = dst
+                if next_hop not in positions:
                     continue
                 x1, y1 = positions[self.local_node_id]
                 x2, y2 = positions[next_hop]
@@ -2313,28 +2465,58 @@ class LPWAApp(tk.Tk):
                 color = "#f59e0b" if rank <= 0 else "#a16207"
                 if selected_node and selected_node not in {self.local_node_id, next_hop, dst}:
                     color = "#374151"
-                canvas.create_line(
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    fill=color,
-                    width=1,
-                    dash=(4, 4),
-                    arrow=tk.LAST,
-                    arrowshape=(9, 10, 4),
-                )
-                canvas.create_line(
-                    x2,
-                    y2,
-                    x3,
-                    y3,
-                    fill=color,
-                    width=1,
-                    dash=(2, 4),
-                    arrow=tk.LAST,
-                    arrowshape=(9, 10, 4),
-                )
+                if hops <= 1 or next_hop == dst:
+                    canvas.create_line(
+                        x1,
+                        y1,
+                        x3,
+                        y3,
+                        fill=color,
+                        width=1,
+                        dash=(4, 4),
+                        arrow=tk.LAST,
+                        arrowshape=(9, 10, 4),
+                    )
+                    canvas.create_text(
+                        x1 + (x3 - x1) * 0.58,
+                        y1 + (y3 - y1) * 0.58 - 12,
+                        text="route 1 hop",
+                        fill=color,
+                        font=("Consolas", 8),
+                    )
+                else:
+                    canvas.create_line(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        fill=color,
+                        width=1,
+                        dash=(4, 4),
+                        arrow=tk.LAST,
+                        arrowshape=(9, 10, 4),
+                    )
+                    canvas.create_line(
+                        x2,
+                        y2,
+                        x3,
+                        y3,
+                        fill=color,
+                        width=1,
+                        dash=((2, 4) if hops == 2 else (1, 6)),
+                        arrow=tk.LAST,
+                        arrowshape=(9, 10, 4),
+                    )
+                    route_label = f"route {hops} hops"
+                    if hops > 2:
+                        route_label = f"route {hops} hops via {self._short_node_id(next_hop)} -> ..."
+                    canvas.create_text(
+                        x2 + (x3 - x2) * 0.56,
+                        y2 + (y3 - y2) * 0.56 - 12,
+                        text=route_label,
+                        fill=color,
+                        font=("Consolas", 8),
+                    )
 
         for node_id, (x, y) in positions.items():
             is_broadcast = node_id == BROADCAST_NODE
@@ -2389,6 +2571,7 @@ class LPWAApp(tk.Tk):
                 rssi_label = f"{edge.rssi_avg:.1f}"
             src_label = self._short_node_id(edge.src)
             dst_label = self._short_node_id(edge.dst)
+            hops_label = self._format_hops_label(src_node=edge.src, observed_hops=edge.hops_max)
             if self.local_node_id:
                 if edge.src == self.local_node_id:
                     src_label = f"★ {src_label}"
@@ -2405,7 +2588,7 @@ class LPWAApp(tk.Tk):
                     edge.kind,
                     edge.count,
                     edge.bytes_size,
-                    edge.hops_max,
+                    hops_label,
                     edge.retry_total,
                     rssi_label,
                     f"{age_ms}ms",
@@ -2421,6 +2604,7 @@ class LPWAApp(tk.Tk):
             dst_label = self._short_node_id(ev.dst)
             observer_label = self._short_node_id(ev.observer) if ev.observer else "-"
             via_node_label = self._short_node_id(ev.via_node) if ev.via_node else "-"
+            hops_label = self._format_hops_label(src_node=ev.src, observed_hops=ev.hops)
             if self.local_node_id:
                 if ev.src == self.local_node_id:
                     src_label = f"★ {src_label}"
@@ -2437,7 +2621,7 @@ class LPWAApp(tk.Tk):
                     dst_label,
                     observer_label,
                     via_node_label,
-                    ev.hops,
+                    hops_label,
                     self._shorten(msg_label, 24),
                 ),
             )
@@ -2463,6 +2647,7 @@ class LPWAApp(tk.Tk):
             age_ms = _to_int(route.get("age_ms"), max(0, snapshot.generated_ms - _to_int(route.get("learned_ms"), 0)))
             dst_label = self._short_node_id(dst)
             next_label = self._short_node_id(next_hop) if next_hop else "-"
+            path_label = self._format_route_path(dst=dst, next_hop=next_hop, hops=hops)
             if self.local_node_id:
                 if dst == self.local_node_id:
                     dst_label = f"★ {dst_label}"
@@ -2471,7 +2656,7 @@ class LPWAApp(tk.Tk):
             tree.insert(
                 "",
                 tk.END,
-                values=(dst_label, next_label, rank, hops, metric, f"{max(0, age_ms)}ms"),
+                values=(dst_label, next_label, path_label, rank, hops, metric, f"{max(0, age_ms)}ms"),
             )
 
     def refresh_ports(self) -> None:
@@ -2713,6 +2898,8 @@ class LPWAApp(tk.Tk):
         self.topology_tracker.clear()
         self.topology_status_var.set("未更新")
         self.local_node_id = None
+        self.last_route_list_rx_ms = 0
+        self.last_routes_request_tx_ms = 0
         self.self_node_var.set("未取得")
         self._mark_topology_dirty()
 
@@ -2903,6 +3090,7 @@ class LPWAApp(tk.Tk):
                 self.latest_routes = [r for r in routes if isinstance(r, dict)]
             else:
                 self.latest_routes = []
+            self.last_route_list_rx_ms = self._now_ms()
             self.topology_status_var.set(f"経路情報: {len(self.latest_routes)}")
             self._mark_topology_dirty()
             return
@@ -3036,13 +3224,17 @@ class LPWAApp(tk.Tk):
             return
         elapsed_ms = self._now_ms() - int(entry.get("created_ms") or self._now_ms())
         retry_count = int(entry.get("attempt") or 0)
+        hop_suffix = self._hop_log_suffix(
+            src_node=str(payload.get("src") or entry.get("dst") or "").strip(),
+            observed_hops=self._payload_hops(payload),
+        )
         expected_type = str(entry.get("type") or "").strip().lower()
         if self._is_high_volume_message_type(expected_type):
             return
         self.append_log(
             (
                 f"delivery ok: type={entry.get('type')} dst={entry.get('dst')} "
-                f"e2e_id={e2e_id} retries={retry_count} elapsed={elapsed_ms}ms"
+                f"e2e_id={e2e_id} retries={retry_count} elapsed={elapsed_ms}ms{hop_suffix}"
             ),
             level="SYSTEM",
             category="E2E",
@@ -3969,8 +4161,25 @@ class LPWAApp(tk.Tk):
             self.nodes_request_retry_after_id = None
         self.nodes_request_retry_after_id = self.after(retry_delay_ms, _retry_once)
 
+    def _request_routes_if_needed(self, *, force: bool, interactive: bool = False) -> bool:
+        worker = self.worker
+        if worker is None or not worker.is_running:
+            if interactive:
+                messagebox.showwarning("Not Connected", "Connect a COM port before requesting routes.")
+            return False
+        now_ms = self._now_ms()
+        if not force:
+            if (now_ms - self.last_routes_request_tx_ms) < ROUTE_REQUEST_MIN_INTERVAL_MS:
+                return False
+            if self.last_route_list_rx_ms > 0 and (now_ms - self.last_route_list_rx_ms) < ROUTE_REQUEST_STALE_MS:
+                return False
+        if not self.send_json(make_routes_request()):
+            return False
+        self.last_routes_request_tx_ms = now_ms
+        return True
+
     def request_routes(self) -> None:
-        self.send_json(make_routes_request())
+        self._request_routes_if_needed(force=True, interactive=True)
 
     def _send_ping_with_context(self, *, dst: str | None, ttl: int) -> bool:
         self.ping_seq += 1
@@ -4227,6 +4436,7 @@ class LPWAApp(tk.Tk):
         context = self.continuous_context or {}
         dst = context.get("dst")
         ttl = _to_int(str(context.get("ttl", self._current_ttl())), self._current_ttl())
+        self._request_routes_if_needed(force=False)
         if not self._send_ping_with_context(dst=dst, ttl=ttl):
             self.stop_continuous_ping()
             return

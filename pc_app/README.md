@@ -34,6 +34,12 @@
 
 ## ディレクトリ構成
 
+## 追加メモ
+
+- `Route` ボタンと自動 `routes_request` で `route_list` を定期取得
+- `pong` / `delivery_ack` に `route_hops` / `next` を補足表示
+- トポロジの `Hops` 列で `~2` は `route_list` 推定、`Path` 列で `SELF -> next -> ... -> dst` を表示
+
 ```text
 pc_app/
   app.py                      # tkinter GUI
