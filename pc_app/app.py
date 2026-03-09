@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from lpwa_gui.models import NodeInfo, NodeRegistry
@@ -26,7 +26,6 @@ from lpwa_gui.protocol import (
     RELIABLE_1K_BYTES,
     decode_reliable_1k_from_shards,
     make_chat_message,
-    make_image_messages,
     make_long_text_messages,
     make_nodes_request,
     make_ping_probe_command,
@@ -84,6 +83,8 @@ PING_BROADCAST_RESPONSE_WINDOW_MS = 2600
 PING_PROBE_BYTES = 1000
 ROUTE_REQUEST_MIN_INTERVAL_MS = 2500
 ROUTE_REQUEST_STALE_MS = 6000
+MESH_STATS_REQUEST_MIN_INTERVAL_MS = 1800
+MESH_STATS_STALE_MS = 5000
 RELIABLE_MODE_CHOICES = ("normal", "reliable_1k")
 RELIABLE_PROFILE_CHOICES = ("auto", "25+8", "25+10")
 RELIABLE_PROFILE_NAME_TO_ID = {"25+8": 0, "25+10": 1}
@@ -99,9 +100,6 @@ TOPOLOGY_KIND_CHOICES = (
     "long_text_start",
     "long_text_chunk",
     "long_text_end",
-    "image_start",
-    "image_chunk",
-    "image_end",
     "reliable_1k_start",
     "reliable_1k_chunk",
     "reliable_1k_end",
@@ -123,9 +121,6 @@ TOPOLOGY_TRACK_MESSAGE_TYPES = {
     "lt_s",
     "lt_c",
     "lt_e",
-    "image_start",
-    "image_chunk",
-    "image_end",
     "reliable_1k_start",
     "reliable_1k_chunk",
     "reliable_1k_end",
@@ -143,7 +138,6 @@ TOPOLOGY_TRACK_MESSAGE_TYPES = {
 HIGH_VOLUME_MESSAGE_TYPES = {
     "delivery_ack",
     "long_text_chunk",
-    "image_chunk",
     "reliable_1k_chunk",
     "reliable_1k_repair",
 }
@@ -155,9 +149,6 @@ TOPOLOGY_EDGE_COLORS: dict[str, tuple[str, str]] = {
     "long_text_start": ("#14b8a6", "#0f766e"),
     "long_text_chunk": ("#06b6d4", "#155e75"),
     "long_text_end": ("#22d3ee", "#0e7490"),
-    "image_start": ("#c084fc", "#6b21a8"),
-    "image_chunk": ("#a78bfa", "#5b21b6"),
-    "image_end": ("#8b5cf6", "#581c87"),
     "reliable_1k_start": ("#f97316", "#9a3412"),
     "reliable_1k_chunk": ("#fb7185", "#9f1239"),
     "reliable_1k_end": ("#f43f5e", "#881337"),
@@ -199,7 +190,6 @@ class LPWAApp(tk.Tk):
         self.max_log_lines = 3000
         self._log_widget_buffer: list[tuple[str, str]] = []
         self._log_flush_after_id: str | None = None
-        self.image_rx_sessions: dict[str, dict[str, Any]] = {}
         self.long_text_rx_sessions: dict[str, dict[str, Any]] = {}
         self.reliable_tx_sessions: dict[str, dict[str, Any]] = {}
         self.reliable_rx_sessions: dict[str, dict[str, Any]] = {}
@@ -218,6 +208,10 @@ class LPWAApp(tk.Tk):
         self.last_node_list_rx_ms = 0
         self.last_route_list_rx_ms = 0
         self.last_routes_request_tx_ms = 0
+        self.last_stats_rx_ms = 0
+        self.last_stats_request_tx_ms = 0
+        self.mesh_stats_snapshot: dict[str, int] = {}
+        self.mesh_stats_baseline: dict[str, int] | None = None
         self.nodes_request_retry_after_id: str | None = None
         self.topology_tracker = TopologyTracker(max_events=20000)
         self.topology_dirty = False
@@ -231,8 +225,6 @@ class LPWAApp(tk.Tk):
         self.pio_env_var = tk.StringVar(value="seeed_xiao_esp32c3")
         self.chat_target_var = tk.StringVar(value=BROADCAST_LABEL)
         self.chat_input_var = tk.StringVar()
-        self.image_target_var = tk.StringVar(value=BROADCAST_LABEL)
-        self.image_path_var = tk.StringVar()
         self.ping_target_var = tk.StringVar(value=BROADCAST_LABEL)
         self.reliable_mode_var = tk.StringVar(value="normal")
         self.reliable_profile_var = tk.StringVar(value="auto")
@@ -258,6 +250,7 @@ class LPWAApp(tk.Tk):
         self.min_var = tk.StringVar(value="0.0 ms")
         self.max_var = tk.StringVar(value="0.0 ms")
         self.p95_var = tk.StringVar(value="0.0 ms")
+        self.mesh_route_stats_var = tk.StringVar(value="経路統計: 未取得")
         self.reliable_restore_var = tk.StringVar(value="0.0%")
         self.reliable_retry_rate_var = tk.StringVar(value="0.0%")
         self.reliable_profile_used_var = tk.StringVar(value="n/a")
@@ -456,17 +449,6 @@ class LPWAApp(tk.Tk):
         chat_entry.grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
         chat_entry.bind("<Return>", lambda _: self.send_chat())
         ttk.Button(chat_frame, text="送信", command=self.send_chat).grid(row=2, column=4, padx=4, pady=4)
-
-        image_frame = ttk.LabelFrame(right, text="画像送信")
-        image_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
-        image_frame.columnconfigure(1, weight=1)
-        ttk.Label(image_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
-        self.image_target_combo = ttk.Combobox(image_frame, textvariable=self.image_target_var, width=18, state="readonly")
-        self.image_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Label(image_frame, text="ファイル").grid(row=1, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(image_frame, textvariable=self.image_path_var).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Button(image_frame, text="参照", command=self.browse_image).grid(row=1, column=2, padx=4, pady=4)
-        ttk.Button(image_frame, text="画像送信", command=self.send_image).grid(row=2, column=2, padx=4, pady=4, sticky="e")
 
         log_frame = ttk.LabelFrame(right, text="イベントログ")
         log_frame.grid(row=2, column=0, sticky="nsew")
@@ -700,22 +682,6 @@ class LPWAApp(tk.Tk):
         chat_entry.bind("<Return>", lambda _: self.send_chat())
         ttk.Button(chat_frame, text="送信", command=self.send_chat).grid(row=2, column=4, padx=4, pady=(0, 4))
 
-        image_frame = ttk.LabelFrame(right, text="画像送信")
-        image_frame.grid(row=1, column=0, sticky="nsew")
-        image_frame.columnconfigure(1, weight=1)
-        ttk.Label(image_frame, text="宛先").grid(row=0, column=0, padx=4, pady=4, sticky="w")
-        self.image_target_combo = ttk.Combobox(image_frame, textvariable=self.image_target_var, width=20, state="readonly")
-        self.image_target_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Label(image_frame, text="ファイル").grid(row=1, column=0, padx=4, pady=4, sticky="w")
-        ttk.Entry(image_frame, textvariable=self.image_path_var).grid(row=1, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Button(image_frame, text="参照", command=self.browse_image).grid(row=1, column=2, padx=4, pady=4)
-        ttk.Label(
-            image_frame,
-            text="大きい画像はメッシュ負荷が高くなります",
-            foreground="#4b5563",
-        ).grid(row=2, column=0, columnspan=2, padx=4, sticky="w")
-        ttk.Button(image_frame, text="画像送信", command=self.send_image).grid(row=2, column=2, padx=4, pady=4, sticky="e")
-
     def _build_test_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
@@ -751,8 +717,13 @@ class LPWAApp(tk.Tk):
         self.start_test_btn.grid(row=1, column=2, padx=4, pady=4)
         self.stop_test_btn = ttk.Button(ping_frame, text="停止", command=self.stop_continuous_ping, state=tk.DISABLED)
         self.stop_test_btn.grid(row=2, column=2, padx=4, pady=4)
+        ttk.Button(ping_frame, text="経路要求", command=self.request_routes).grid(row=0, column=3, padx=4, pady=4)
+        ttk.Button(ping_frame, text="統計更新", command=self.request_mesh_stats).grid(row=1, column=3, padx=4, pady=4)
         ttk.Label(ping_frame, text="(10ノード目安: 10-12)", foreground="#4b5563").grid(
             row=3, column=2, padx=4, pady=4, sticky="w"
+        )
+        ttk.Label(ping_frame, textvariable=self.mesh_route_stats_var, foreground="#4b5563").grid(
+            row=4, column=0, columnspan=4, padx=4, pady=(2, 0), sticky="w"
         )
 
         reliable_frame = ttk.LabelFrame(parent, text="Reliable 1KB")
@@ -971,7 +942,7 @@ class LPWAApp(tk.Tk):
         flow_tab.rowconfigure(0, weight=1)
         self.topology_flow_tree = ttk.Treeview(
             flow_tab,
-            columns=("time", "type", "src", "dst", "observer", "via_node", "hops", "msg"),
+            columns=("time", "type", "src", "dst", "observer", "via_node", "path", "hops", "msg"),
             show="headings",
             height=9,
         )
@@ -982,6 +953,7 @@ class LPWAApp(tk.Tk):
             ("dst", "Dst", 120),
             ("observer", "Observer", 120),
             ("via_node", "ViaNode", 120),
+            ("path", "Path", 220),
             ("hops", "Hops", 62),
             ("msg", "Msg", 160),
         ):
@@ -1479,19 +1451,6 @@ class LPWAApp(tk.Tk):
         reliable_cutoff = now - self.reliable_rx_session_timeout_ms
         reliable_stats_dirty = False
 
-        expired_images = [
-            image_id
-            for image_id, session in self.image_rx_sessions.items()
-            if int(session.get("last_update_ms") or session.get("started_ms") or 0) < cutoff
-        ]
-        for image_id in expired_images:
-            self.image_rx_sessions.pop(image_id, None)
-            self.append_log(
-                f"image session expired: id={image_id}",
-                level="WARN",
-                category="IMAGE",
-            )
-
         expired_texts = [
             text_id
             for text_id, session in self.long_text_rx_sessions.items()
@@ -1599,17 +1558,15 @@ class LPWAApp(tk.Tk):
             messagebox.showinfo("ノード未選択", "ノード一覧から宛先に使いたいノードを選択してください。")
             return
         self.chat_target_var.set(node_id)
-        self.image_target_var.set(node_id)
         self.ping_target_var.set(node_id)
         self.refresh_destination_choices()
-        self.append_log(f"選択ノード {node_id} をチャット/画像/Ping の宛先に設定しました。", level="SYSTEM", category="UI")
+        self.append_log(f"選択ノード {node_id} をチャット/Ping の宛先に設定しました。", level="SYSTEM", category="UI")
 
     def set_broadcast_targets(self) -> None:
         if self._is_hardened_mode_enabled():
             messagebox.showwarning("モード制約", "mode=reliable_1k では Broadcast 宛先は使用できません。")
             return
         self.chat_target_var.set(BROADCAST_LABEL)
-        self.image_target_var.set(BROADCAST_LABEL)
         self.ping_target_var.set(BROADCAST_LABEL)
         self.refresh_destination_choices()
         self.append_log("宛先を Broadcast に戻しました。", level="SYSTEM", category="UI")
@@ -1683,7 +1640,7 @@ class LPWAApp(tk.Tk):
         fallback_directed = self._preferred_directed_target()
         if fallback_directed and fallback_directed not in choices:
             choices.append(fallback_directed)
-        for var in (self.chat_target_var, self.image_target_var, self.ping_target_var):
+        for var in (self.chat_target_var, self.ping_target_var):
             current = var.get().strip()
             if current and current != BROADCAST_LABEL and not NODE_ID_PATTERN.match(current):
                 current = ""
@@ -1698,7 +1655,6 @@ class LPWAApp(tk.Tk):
                 var.set(BROADCAST_LABEL)
 
         self.chat_target_combo["values"] = choices
-        self.image_target_combo["values"] = choices
         self.ping_target_combo["values"] = choices
         self.refresh_quality_target_choices()
 
@@ -1851,6 +1807,83 @@ class LPWAApp(tk.Tk):
             return f"{self_label} -> {next_label} -> {dst_label}"
         return f"{self_label} -> {next_label} -> ... -> {dst_label}"
 
+    def _format_observed_event_path(self, ev: Any) -> str:
+        parts: list[str] = []
+        for raw_node in (ev.src, ev.via_node, ev.observer):
+            node = str(raw_node or "").strip()
+            if not node:
+                continue
+            if parts and node == parts[-1]:
+                continue
+            parts.append(node)
+        dst = str(ev.dst or "").strip()
+        if dst and dst != BROADCAST_NODE and (not parts or dst != parts[-1]):
+            parts.append(dst)
+        if not parts and dst:
+            parts = [dst]
+        if len(parts) <= 1:
+            return "-"
+        return " -> ".join(self._short_node_id(node_id) for node_id in parts)
+
+    def _mesh_stats_ratio(self, numerator: int, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return (float(numerator) * 100.0) / float(denominator)
+
+    def _mesh_stats_delta(self) -> dict[str, int]:
+        current = self.mesh_stats_snapshot if isinstance(self.mesh_stats_snapshot, dict) else {}
+        baseline = self.mesh_stats_baseline if isinstance(self.mesh_stats_baseline, dict) else {}
+        keys = {
+            "route_lookup_hit",
+            "route_lookup_miss",
+            "route_learned",
+            "route_promoted",
+            "route_expired",
+            "routed_unicast_attempts",
+            "routed_unicast_success",
+            "routed_unicast_fail",
+            "routed_fallback_flood",
+        }
+        delta: dict[str, int] = {}
+        for key in keys:
+            delta[key] = max(0, _to_int(str(current.get(key, 0)), 0) - _to_int(str(baseline.get(key, 0)), 0))
+        return delta
+
+    def _update_mesh_route_stats_view(self) -> None:
+        if not self.mesh_stats_snapshot:
+            self.mesh_route_stats_var.set("経路統計: 未取得")
+            return
+
+        now = self._now_ms()
+        age_ms = max(0, now - int(self.last_stats_rx_ms or 0))
+        delta = self._mesh_stats_delta()
+        has_baseline = isinstance(self.mesh_stats_baseline, dict)
+        source = delta if has_baseline else self.mesh_stats_snapshot
+        label = "連続Ping" if has_baseline else "累積"
+
+        route_hit = _to_int(str(source.get("route_lookup_hit", 0)), 0)
+        route_miss = _to_int(str(source.get("route_lookup_miss", 0)), 0)
+        route_total = route_hit + route_miss
+        route_hit_rate = self._mesh_stats_ratio(route_hit, route_total)
+        routed_attempts = _to_int(str(source.get("routed_unicast_attempts", 0)), 0)
+        routed_success = _to_int(str(source.get("routed_unicast_success", 0)), 0)
+        routed_fail = _to_int(str(source.get("routed_unicast_fail", 0)), 0)
+        fallback = _to_int(str(source.get("routed_fallback_flood", 0)), 0)
+        fallback_ratio = self._mesh_stats_ratio(fallback, routed_attempts + fallback)
+        learned = _to_int(str(source.get("route_learned", 0)), 0)
+        promoted = _to_int(str(source.get("route_promoted", 0)), 0)
+        expired = _to_int(str(source.get("route_expired", 0)), 0)
+        age_label = f"{age_ms / 1000.0:.1f}s" if age_ms >= 1000 else f"{age_ms}ms"
+
+        self.mesh_route_stats_var.set(
+            (
+                f"経路統計[{label}] hit={route_hit}/{route_total} ({route_hit_rate:.1f}%) "
+                f"fallback={fallback} ({fallback_ratio:.1f}%) "
+                f"unicast={routed_success}/{max(routed_attempts, 0)} fail={routed_fail} "
+                f"learned={learned} promoted={promoted} expired={expired} age={age_label}"
+            )
+        )
+
     def _is_high_volume_message_type(self, kind: str) -> bool:
         return kind in HIGH_VOLUME_MESSAGE_TYPES
 
@@ -1938,24 +1971,6 @@ class LPWAApp(tk.Tk):
             )
         if kind == "error":
             return f"fw_error code={payload.get('code')} detail={payload.get('detail')}"
-        if kind == "image_start":
-            return (
-                f"image_start id={payload.get('image_id')} name={payload.get('name')} "
-                f"size={payload.get('size')} chunks={payload.get('chunks')} "
-                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
-            )
-        if kind == "image_chunk":
-            data_b64 = payload.get("data_b64")
-            chunk_len = len(data_b64) if isinstance(data_b64, str) else 0
-            return (
-                f"image_chunk id={payload.get('image_id')} idx={payload.get('index')} "
-                f"b64={chunk_len} e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
-            )
-        if kind == "image_end":
-            return (
-                f"image_end id={payload.get('image_id')} "
-                f"e2e_id={payload.get('e2e_id')} retry={payload.get('retry_no', 0)}"
-            )
         if kind == "long_text_start":
             return (
                 f"long_text_start id={payload.get('text_id')} size={payload.get('size')} "
@@ -2121,6 +2136,7 @@ class LPWAApp(tk.Tk):
             topology_visible = self._is_topology_tab_selected()
             if topology_visible:
                 self._request_routes_if_needed(force=False)
+                self._request_mesh_stats_if_needed(force=False)
             if self.topology_dirty:
                 if not topology_visible:
                     return
@@ -2636,6 +2652,7 @@ class LPWAApp(tk.Tk):
             dst_label = self._short_node_id(ev.dst)
             observer_label = self._short_node_id(ev.observer) if ev.observer else "-"
             via_node_label = self._short_node_id(ev.via_node) if ev.via_node else "-"
+            path_label = self._format_observed_event_path(ev)
             hops_label = self._format_hops_label(src_node=ev.src, observed_hops=ev.hops)
             if self.local_node_id:
                 if ev.src == self.local_node_id:
@@ -2655,6 +2672,7 @@ class LPWAApp(tk.Tk):
                     dst_label,
                     observer_label,
                     via_node_label,
+                    self._shorten(path_label, 36),
                     hops_label,
                     self._shorten(msg_label, 24),
                 ),
@@ -2923,17 +2941,21 @@ class LPWAApp(tk.Tk):
         self.pending_ping_rounds.clear()
         self.pending_e2e.clear()
         self.long_text_seen.clear()
-        self.image_rx_sessions.clear()
         self.long_text_rx_sessions.clear()
         self.reliable_tx_sessions.clear()
         self.reliable_rx_sessions.clear()
         self.reliable_auto_state_by_dst.clear()
         self.latest_routes.clear()
+        self.mesh_stats_snapshot.clear()
+        self.mesh_stats_baseline = None
         self.topology_tracker.clear()
         self.topology_status_var.set("未更新")
+        self.mesh_route_stats_var.set("経路統計: 未取得")
         self.local_node_id = None
         self.last_route_list_rx_ms = 0
         self.last_routes_request_tx_ms = 0
+        self.last_stats_rx_ms = 0
+        self.last_stats_request_tx_ms = 0
         self.self_node_var.set("未取得")
         self._mark_topology_dirty()
 
@@ -3129,11 +3151,25 @@ class LPWAApp(tk.Tk):
             self._mark_topology_dirty()
             return
 
+        if message_type == "stats":
+            now = self._now_ms()
+            mesh_raw = payload.get("mesh")
+            if isinstance(mesh_raw, dict):
+                self.mesh_stats_snapshot = {
+                    str(key): _to_int(str(value), 0)
+                    for key, value in mesh_raw.items()
+                }
+                self.last_stats_rx_ms = now
+                if self.continuous_after_id is not None and self.mesh_stats_baseline is None:
+                    self.mesh_stats_baseline = dict(self.mesh_stats_snapshot)
+                if self.continuous_after_id is None:
+                    self.mesh_stats_baseline = None
+                self._update_mesh_route_stats_view()
+            return
+
         skip_node_refresh = message_type in {
             "long_text_chunk",
             "long_text_end",
-            "image_chunk",
-            "image_end",
             "reliable_1k_start",
             "reliable_1k_chunk",
             "reliable_1k_repair",
@@ -3166,10 +3202,6 @@ class LPWAApp(tk.Tk):
 
         if message_type in {"pong", "ping_reply"}:
             self.handle_pong(payload)
-            return
-
-        if message_type in {"image_start", "image_chunk", "image_end"}:
-            self.handle_image_payload(payload)
             return
 
         if message_type in {"long_text_start", "long_text_chunk", "long_text_end"}:
@@ -3764,130 +3796,6 @@ class LPWAApp(tk.Tk):
             self.update_stats_view()
             return
 
-    def handle_image_payload(self, payload: dict[str, Any]) -> None:
-        kind = str(payload.get("type", "")).strip().lower()
-        image_id = str(payload.get("image_id", "")).strip()
-        if not image_id:
-            return
-
-        if kind == "image_start":
-            if image_id not in self.image_rx_sessions:
-                now = self._now_ms()
-                self._ensure_session_capacity(self.image_rx_sessions, "image", image_id)
-                self.image_rx_sessions[image_id] = {
-                    "name": str(payload.get("name") or f"{image_id}.bin"),
-                    "chunks": _to_int(str(payload.get("chunks", "0")), 0),
-                    "size": _to_int(str(payload.get("size", "0")), 0),
-                    "sha256": str(payload.get("sha256", "")).strip().lower(),
-                    "parts": {},
-                    "src": str(payload.get("src", "?")),
-                    "started_ms": now,
-                    "last_update_ms": now,
-                }
-                self.append_log(
-                    f"画像受信開始: id={image_id} name={self.image_rx_sessions[image_id]['name']}",
-                    level="SYSTEM",
-                    category="IMAGE",
-                )
-            return
-
-        if kind == "image_chunk":
-            session = self.image_rx_sessions.get(image_id)
-            if session is None:
-                self.append_log(f"image_chunk dropped (missing start): id={image_id}", level="WARN", category="IMAGE")
-                return
-            idx = payload.get("index")
-            if not isinstance(idx, int):
-                idx = _to_int(str(idx), -1)
-            if idx < 0:
-                return
-            expected_chunks = _to_int(str(session.get("chunks", "0")), 0)
-            if expected_chunks > 0 and idx >= expected_chunks:
-                self.append_log(
-                    f"image_chunk out of range: id={image_id} index={idx} expected<={expected_chunks - 1}",
-                    level="WARN",
-                    category="IMAGE",
-                )
-                return
-            chunk_b64 = payload.get("data_b64")
-            if not isinstance(chunk_b64, str) or not chunk_b64:
-                return
-            try:
-                chunk = base64.b64decode(chunk_b64, validate=True)
-            except Exception:
-                self.append_log(f"画像チャンク破損: id={image_id} index={idx}", level="WARN", category="IMAGE")
-                return
-            session["parts"][idx] = chunk
-            session["last_update_ms"] = self._now_ms()
-            return
-
-        if kind == "image_end":
-            session = self.image_rx_sessions.get(image_id)
-            if session is None:
-                return
-            parts: dict[int, bytes] = session.get("parts", {})
-            if not parts:
-                self.append_log(f"画像受信終了(空): id={image_id}", level="WARN", category="IMAGE")
-                return
-
-            expected_chunks = _to_int(str(session.get("chunks", "0")), 0)
-            if expected_chunks > 0:
-                missing = [i for i in range(expected_chunks) if i not in parts]
-                if missing:
-                    self.append_log(
-                        f"image_end rejected: id={image_id} missing_chunks={missing[:10]} total_missing={len(missing)}",
-                        level="ERROR",
-                        category="IMAGE",
-                    )
-                    return
-
-            ordered = [parts[i] for i in sorted(parts.keys())]
-            merged = b"".join(ordered)
-
-            expected_size = _to_int(str(session.get("size", "0")), 0)
-            if expected_size > 0 and expected_size != len(merged):
-                self.append_log(
-                    f"image_end rejected: id={image_id} size_mismatch expected={expected_size} got={len(merged)}",
-                    level="ERROR",
-                    category="IMAGE",
-                )
-                return
-
-            expected_hash = str(session.get("sha256", "")).strip().lower()
-            actual_hash = hashlib.sha256(merged).hexdigest()
-            hash_ok = (not expected_hash) or (expected_hash == actual_hash)
-            if not hash_ok:
-                self.append_log(
-                    f"image_end rejected: id={image_id} sha256 mismatch expected={expected_hash} got={actual_hash}",
-                    level="ERROR",
-                    category="IMAGE",
-                )
-                return
-
-            recv_dir = Path.cwd() / "received_images"
-            recv_dir.mkdir(parents=True, exist_ok=True)
-            name = str(session.get("name", f"{image_id}.bin")).strip() or f"{image_id}.bin"
-            safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}"
-            out_path = recv_dir / safe_name
-            try:
-                out_path.write_bytes(merged)
-            except OSError as exc:
-                self.append_log(
-                    f"image save failed: id={image_id} path={out_path} error={exc}",
-                    level="ERROR",
-                    category="IMAGE",
-                )
-                self.image_rx_sessions.pop(image_id, None)
-                return
-
-            self.append_log(
-                f"画像保存: {out_path} bytes={len(merged)} chunks={len(parts)} hash_ok={hash_ok} src={session.get('src')}",
-                level="SYSTEM",
-                category="IMAGE",
-            )
-            self.image_rx_sessions.pop(image_id, None)
-            return
-
     def refresh_node_table(self) -> None:
         selected_before = self._selected_node_id()
         selected_iid: str | None = None
@@ -3983,74 +3891,6 @@ class LPWAApp(tk.Tk):
         shown_dst = self._target_label(dst)
         self.append_chat(f"me({via}) -> {shown_dst}: {text}")
         self.chat_input_var.set("")
-
-    def browse_image(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="送信する画像を選択",
-            filetypes=[
-                ("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"),
-                ("All files", "*.*"),
-            ],
-        )
-        if selected:
-            self.image_path_var.set(selected)
-
-    def send_image(self) -> None:
-        raw_path = self.image_path_var.get().strip()
-        if not raw_path:
-            messagebox.showwarning("入力不足", "画像ファイルを指定してください。")
-            return
-        path = Path(raw_path)
-        if not path.exists():
-            messagebox.showerror("ファイルなし", f"ファイルが存在しません: {path}")
-            return
-
-        try:
-            dst = self._normalize_target(self.image_target_var.get(), context="画像宛先", show_error=True)
-        except ValueError:
-            return
-        if not self._ensure_directed_target(dst, operation="画像送信"):
-            return
-        ttl = self._current_ttl()
-        reliable = self._is_reliable_target(via="wifi", dst=dst)
-        file_size = path.stat().st_size
-        if dst is None:
-            do_broadcast = messagebox.askyesno(
-                "Broadcast画像送信",
-                "宛先が Broadcast です。複数ノードへ画像を送るため通信負荷が高くなります。\n"
-                "このまま送信しますか？",
-            )
-            if not do_broadcast:
-                return
-        if file_size > 512 * 1024:
-            proceed_large = messagebox.askyesno(
-                "大きい画像ファイル",
-                f"ファイルサイズが {file_size} bytes です。\n"
-                "送信キューとメッシュ負荷が高くなる可能性があります。続行しますか？",
-            )
-            if not proceed_large:
-                return
-        try:
-            messages = make_image_messages(path=path, dst=dst, via="wifi", ttl=ttl, require_ack=reliable)
-        except Exception as exc:
-            messagebox.showerror("画像送信エラー", str(exc))
-            return
-
-        for payload in messages:
-            if not self.send_json(payload):
-                return
-            if reliable:
-                self._register_pending_e2e(payload)
-
-        chunk_count = max(0, len(messages) - 2)
-        self.append_log(
-            (
-                f"画像送信キュー投入: {path.name} ({chunk_count} chunk) dst={self._target_label(dst)} "
-                f"reliable={'on' if reliable else 'off'}"
-            ),
-            level="SYSTEM",
-            category="IMAGE",
-        )
 
     def send_reliable_1k(self) -> None:
         mode = (self.reliable_mode_var.get() or "").strip().lower()
@@ -4215,6 +4055,26 @@ class LPWAApp(tk.Tk):
 
     def request_routes(self) -> None:
         self._request_routes_if_needed(force=True, interactive=True)
+
+    def _request_mesh_stats_if_needed(self, *, force: bool, interactive: bool = False) -> bool:
+        worker = self.worker
+        if worker is None or not worker.is_running:
+            if interactive:
+                messagebox.showwarning("未接続", "先にCOMポートへ接続してください。")
+            return False
+        now_ms = self._now_ms()
+        if not force:
+            if (now_ms - self.last_stats_request_tx_ms) < MESH_STATS_REQUEST_MIN_INTERVAL_MS:
+                return False
+            if self.last_stats_rx_ms > 0 and (now_ms - self.last_stats_rx_ms) < MESH_STATS_REQUEST_MIN_INTERVAL_MS:
+                return False
+        if not self.send_json({"cmd": "get_stats"}):
+            return False
+        self.last_stats_request_tx_ms = now_ms
+        return True
+
+    def request_mesh_stats(self) -> None:
+        self._request_mesh_stats_if_needed(force=True, interactive=True)
 
     def _send_ping_with_context(self, *, dst: str | None, ttl: int) -> bool:
         self.ping_seq += 1
@@ -4381,6 +4241,7 @@ class LPWAApp(tk.Tk):
         self.continuous_dynamic_interval_ms = interval_ms
         self.continuous_context = {"dst": dst, "ttl": ttl}
         self.continuous_interval_last_log_ms = self._now_ms()
+        self.mesh_stats_baseline = dict(self.mesh_stats_snapshot) if self.mesh_stats_snapshot else None
         self.start_test_btn.configure(state=tk.DISABLED)
         self.stop_test_btn.configure(state=tk.NORMAL)
         self._set_continuous_controls_enabled(False)
@@ -4393,6 +4254,7 @@ class LPWAApp(tk.Tk):
             level="SYSTEM",
             category="PING",
         )
+        self._request_mesh_stats_if_needed(force=True)
         self._run_continuous_ping(interval_ms)
 
     def _clamp_continuous_interval_ms(self, interval_ms: int, *, apply_to_ui: bool = False) -> int:
@@ -4472,6 +4334,7 @@ class LPWAApp(tk.Tk):
         dst = context.get("dst")
         ttl = _to_int(str(context.get("ttl", self._current_ttl())), self._current_ttl())
         self._request_routes_if_needed(force=False)
+        self._request_mesh_stats_if_needed(force=False)
         if not self._send_ping_with_context(dst=dst, ttl=ttl):
             self.stop_continuous_ping()
             return
@@ -4492,6 +4355,8 @@ class LPWAApp(tk.Tk):
         self.continuous_remaining = None
         self.continuous_dynamic_interval_ms = None
         self.continuous_context = None
+        self.mesh_stats_baseline = None
+        self._update_mesh_route_stats_view()
         self._set_continuous_controls_enabled(True)
         self._sync_reliable_controls()
 

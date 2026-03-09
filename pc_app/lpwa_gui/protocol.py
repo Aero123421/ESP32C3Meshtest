@@ -6,7 +6,6 @@ import json
 import time
 import uuid
 import zlib
-from pathlib import Path
 from typing import Any, Mapping
 
 from .reliable_codec import (
@@ -18,7 +17,6 @@ from .reliable_codec import (
     missing_shard_indexes,
 )
 
-MAX_IMAGE_CHUNK_BYTES = 320
 MAX_LONG_TEXT_CHUNK_BYTES = 32
 PING_PROBE_BYTES = 1000
 RELIABLE_1K_BYTES = 1000
@@ -149,84 +147,6 @@ def make_ping_probe_command(
     if ttl is not None:
         payload["ttl"] = max(1, min(255, int(ttl)))
     return payload
-
-
-def make_image_messages(
-    path: Path,
-    dst: str | None = None,
-    *,
-    src: str = "pc",
-    via: str = "wifi",
-    chunk_size: int = MAX_IMAGE_CHUNK_BYTES,
-    ttl: int | None = None,
-    require_ack: bool = False,
-) -> list[dict[str, Any]]:
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
-    if not path.exists():
-        raise FileNotFoundError(str(path))
-
-    raw = path.read_bytes()
-    image_id = uuid.uuid4().hex
-    ts = now_ms()
-    total_chunks = 0 if len(raw) == 0 else ((len(raw) - 1) // chunk_size) + 1
-
-    start: dict[str, Any] = {
-        "type": "image_start",
-        "src": src,
-        "via": via,
-        "image_id": image_id,
-        "name": path.name,
-        "size": len(raw),
-        "chunks": total_chunks,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "ts_ms": ts,
-    }
-    if dst:
-        start["dst"] = dst
-    if ttl is not None:
-        start["ttl"] = max(1, min(255, int(ttl)))
-    if require_ack and dst and via == "wifi":
-        start["need_ack"] = True
-        start["e2e_id"] = f"{image_id}:s"
-
-    messages: list[dict[str, Any]] = [start]
-    for idx, offset in enumerate(range(0, len(raw), chunk_size)):
-        chunk = raw[offset : offset + chunk_size]
-        packet: dict[str, Any] = {
-            "type": "image_chunk",
-            "src": src,
-            "via": via,
-            "image_id": image_id,
-            "index": idx,
-            "data_b64": base64.b64encode(chunk).decode("ascii"),
-            "ts_ms": now_ms(),
-        }
-        if dst:
-            packet["dst"] = dst
-        if ttl is not None:
-            packet["ttl"] = max(1, min(255, int(ttl)))
-        if require_ack and dst and via == "wifi":
-            packet["need_ack"] = True
-            packet["e2e_id"] = f"{image_id}:c:{idx}"
-        messages.append(packet)
-
-    end: dict[str, Any] = {
-        "type": "image_end",
-        "src": src,
-        "via": via,
-        "image_id": image_id,
-        "ts_ms": now_ms(),
-    }
-    if dst:
-        end["dst"] = dst
-    if ttl is not None:
-        end["ttl"] = max(1, min(255, int(ttl)))
-    if require_ack and dst and via == "wifi":
-        end["need_ack"] = True
-        end["e2e_id"] = f"{image_id}:e"
-    messages.append(end)
-    return messages
 
 
 def make_long_text_messages(

@@ -1,7 +1,7 @@
 # test_plan.md
 
 ## 1. 目的
-- 10台のESP32-C3でメッシュ中継を構成し、3台のPC直結ノード間で `text` / `image` 通信が成立するかを評価する。
+- 10台のESP32-C3でメッシュ中継を構成し、3台のPC直結ノード間で `text` / `long_text` / `ping_probe` 通信が成立するかを評価する。
 - ノード再起動や輻輳時でも、通信品質が運用可能な範囲に収まるかを確認する。
 
 ## 2. 想定ユースケース
@@ -9,9 +9,9 @@
 - PC直結ノード: 3台（例: `GW-A`, `GW-B`, `GW-C`）
 - 残り7台: 中継専用（USB給電のみ）
 - 通信:
-  - PC-A <-> PC-B: text / long_text(1000文字級) / image
-  - PC-B <-> PC-C: text / long_text(1000文字級) / image
-  - PC-A <-> PC-C: text / long_text(1000文字級) / image
+  - PC-A <-> PC-B: text / long_text(1000文字級) / ping_probe
+  - PC-B <-> PC-C: text / long_text(1000文字級) / ping_probe
+  - PC-A <-> PC-C: text / long_text(1000文字級) / ping_probe
 
 ## 2.1 Phase定義（1〜5）
 
@@ -48,10 +48,9 @@
 ## 5. 評価KPI（初期値）
 - Text E2E PDR（1KB未満短文）: `>= 98%`
 - LongText E2E PDR（1000文字級、宛先指定）: `>= 95%`
-- Directed delivery_ack 成功率（text / image packet）: `>= 98%`
+- Directed delivery_ack 成功率（text / long_text / reliable制御packet）: `>= 98%`
 - 再送発生率（retry_no > 0）: `<= 15%`（初期目安）
 - 経路学習有効率（Phase2）: `route_lookup_hit / (hit+miss) >= 70%`（安定区間の目安）
-- Image転送成功率（64KB〜256KB）: `>= 95%`
 - Ping RTT: `p95 <= 1500ms`（10ノード試験時）
 - ノード再起動後の復帰時間: `<= 30s`
 - 連続運転時の異常:
@@ -69,7 +68,7 @@
 | U03 | PC-B↔PC-C text | E2E text成立 | 双方向PDRがKPIを満たす |
 | U04 | 3PC同時text | 輻輳下の成立性 | 全ペアでKPI内 |
 | U04b | 3PC同時long_text | 1000文字級の同時成立性 | 全ペアでLongText KPI内 |
-| U05 | PC間image転送 | 分割再構成の成立性 | 破損なしで成功率KPI内 |
+| U05 | directed ping_probe | マルチホップ応答とRTT確認 | PDR/RTTがKPIを満たす |
 | U06 | 中継品質 | マルチホップ性能確認 | hop数・遅延・損失を記録し閾値内 |
 | U07 | delivery_ack/再送 | 宛先指定通信の信頼性確認 | `delivery_ack` 成功率と再送率がKPI内 |
 | U07b | Phase2経路検証 | 次ホップ転送の有効性確認 | `get_stats` の `route_lookup_hit` が増加し、`routed_fallback_flood` が抑制される |
@@ -80,7 +79,6 @@
 
 ## 7. 実施時の注意
 - 1セッション内ではファーム差分を混在させない。
-- 画像送信は衝突を避けるため、並列数を制御して段階的に増やす。
 - Broadcast送信は試験目的がある場合のみ実施し、通常は宛先指定で評価する。
 - 失敗時は以下を必ず保存:
   - 失敗時刻
@@ -119,7 +117,6 @@ py -3 .\tools\mesh_smoke_test.py `
 
 ## 9. 未解決事項
 - 最終KPI（本番運用値）の確定
-- 画像サイズ別の許容遅延の確定
 - 10ノード実測に基づく `delivery_ack` 成功率/再送率しきい値の再基準化
 
 ## 10. reliable_1k 詳細設計

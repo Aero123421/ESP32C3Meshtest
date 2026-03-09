@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import tempfile
-from pathlib import Path
 
 from lpwa_gui.protocol import (
     MAX_LONG_TEXT_CHUNK_BYTES,
@@ -12,7 +10,6 @@ from lpwa_gui.protocol import (
     decode_json_line,
     encode_json_line,
     make_chat_message,
-    make_image_messages,
     make_long_text_messages,
     make_ping_probe_command,
     make_reliable_1k_messages,
@@ -29,20 +26,6 @@ def check_json_roundtrip() -> None:
     assert decoded == payload, "JSON Lines roundtrip failed"
 
 
-def check_image_chunking() -> None:
-    content = bytes(range(256)) * 4
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "sample.bin"
-        path.write_bytes(content)
-        messages = make_image_messages(path=path, dst="node-1", chunk_size=100)
-        assert messages[0]["type"] == "image_start", "missing image_start"
-        assert messages[-1]["type"] == "image_end", "missing image_end"
-
-        chunks = [m for m in messages if m.get("type") == "image_chunk"]
-        restored = b"".join(base64.b64decode(m["data_b64"]) for m in chunks)
-        assert restored == content, "image chunk reconstruction failed"
-
-
 def check_chat_e2e_fields() -> None:
     payload = make_chat_message(
         text="hello",
@@ -55,17 +38,6 @@ def check_chat_e2e_fields() -> None:
     assert payload.get("need_ack") is True, "need_ack missing in chat payload"
     assert payload.get("e2e_id") == "chat-fixed-id", "e2e_id mismatch in chat payload"
     assert payload.get("retry_no") == 2, "retry_no mismatch in chat payload"
-
-
-def check_image_e2e_fields() -> None:
-    content = b"mesh-image-payload" * 16
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "sample.bin"
-        path.write_bytes(content)
-        messages = make_image_messages(path=path, dst="0x0099AABB", require_ack=True)
-        for payload in messages:
-            assert payload.get("need_ack") is True, "need_ack missing in image payload"
-            assert isinstance(payload.get("e2e_id"), str) and payload["e2e_id"], "e2e_id missing in image payload"
 
 
 def check_retry_id_stability() -> None:
@@ -184,9 +156,7 @@ def check_reliable_stats() -> None:
 
 def main() -> None:
     check_json_roundtrip()
-    check_image_chunking()
     check_chat_e2e_fields()
-    check_image_e2e_fields()
     check_retry_id_stability()
     check_long_text_chunking()
     check_ping_stats()

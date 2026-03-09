@@ -9,7 +9,7 @@
 - 画面を用途別タブに分割（通信 / 試験 / トポロジ / ログ / FW書込）
 - GUIからのBuild / ファーム書き込み（選択COM / 全COM）
 - ノード一覧表示（ID / RSSI / 最終受信時刻 / 最終メッセージ / 最新Ping）
-- ノード一覧の選択ノードをチャット/画像/Pingの宛先へ一括反映
+- ノード一覧の選択ノードをチャット/Pingの宛先へ一括反映
 - 宛先コンボボックス（既知ノード候補 + Broadcast）
 - TTL設定（10ノード向けにGUIから調整可能）
 - チャット送信
@@ -17,12 +17,11 @@
 - 宛先指定Wi-Fi送信のE2E配達確認（`delivery_ack`）と自動再送
 - 長文テキスト送信（大きいメッセージを `long_text_start/chunk/end` に自動分割）
 - 長文テキスト受信再構成（欠損/サイズ不一致/ハッシュ不一致は破棄）
-- 画像ファイル送信（`image_start` / `image_chunk` / `image_end`）
-- 受信画像の再構成保存（欠損chunk/サイズ不一致/ハッシュ不一致は保存しない）
 - Ping単発送信 / 連続テスト
 - Ping単発送信 / 連続テストは `ping_probe`（既定1KB）を使用
 - Broadcast Pingの複数応答を1ラウンドとして扱い、遅延Pongを誤警告しにくい集計
 - PDR / 遅延統計（sent, received, lost, pdr, avg, min, max, p95）
+- 連続Ping中の `route_lookup_hit/miss` / `routed_fallback_flood` 可視化
 - 試験タブ下部に通信品質グラフ（PDR / Avg / P95 / Loss）をリアルタイム表示
 - イベントログ表示と保存（レベル別色分け、横スクロール対応）
 - トポロジ専用タブで大型キャンバス表示（リアルタイム更新）
@@ -38,7 +37,7 @@
 
 - `Route` ボタンと自動 `routes_request` で `route_list` を定期取得
 - `pong` / `delivery_ack` に `route_hops` / `next` を補足表示
-- トポロジの `Hops` 列で `~2` は `route_list` 推定、`Path` 列で `SELF -> next -> ... -> dst` を表示
+- トポロジの `Hops` 列で `~2` は `route_list` 推定、`Path` 列で実観測経路を表示
 
 ### Hop Telemetry
 
@@ -106,7 +105,6 @@ python self_check.py
 `self_check.py` は以下を検証します。
 
 - JSON Lines encode/decode roundtrip
-- 画像チャンク生成と再構築
 - 長文チャンク生成と再構築
 - E2E ACK関連フィールド（`need_ack` / `e2e_id` / `retry_no`）
 - Ping統計の基本計算
@@ -121,9 +119,6 @@ python self_check.py
 {"cmd":"ping_probe","type":"ping","src":"pc","via":"wifi","dst":"0x00A1B2C3","seq":12,"ping_id":"a1b2c3d4","probe_bytes":1000,"ts_ms":1710000000100}
 {"type":"chat","src":"pc","via":"wifi","dst":"0x00A1B2C3","text":"hello","need_ack":true,"e2e_id":"chat-abc","ts_ms":1710000000001}
 {"type":"ping","src":"pc","dst":"0x00A1B2C3","seq":12,"ping_id":"a1b2c3d4","ts_ms":1710000000100}
-{"type":"image_start","src":"pc","dst":"0x00A1B2C3","image_id":"...","name":"photo.jpg","size":12345,"chunks":18,"sha256":"...","ts_ms":1710000000200}
-{"type":"image_chunk","src":"pc","dst":"0x00A1B2C3","image_id":"...","index":0,"data_b64":"...","ts_ms":1710000000201}
-{"type":"image_end","src":"pc","dst":"0x00A1B2C3","image_id":"...","ts_ms":1710000000300}
 {"type":"long_text_start","src":"pc","dst":"0x00A1B2C3","text_id":"...","encoding":"utf-8","size":1024,"chunks":6,"sha256":"...","need_ack":true,"e2e_id":"...:s","ts_ms":1710000000400}
 {"type":"long_text_chunk","src":"pc","dst":"0x00A1B2C3","text_id":"...","index":0,"data_b64":"...","need_ack":true,"e2e_id":"...:c:0","ts_ms":1710000000401}
 {"type":"long_text_end","src":"pc","dst":"0x00A1B2C3","text_id":"...","need_ack":true,"e2e_id":"...:e","ts_ms":1710000000402}
@@ -144,6 +139,5 @@ python self_check.py
 注意:
 - Directed宛先 `dst` は `0xXXXXXXXX` 形式のみ受け付けます（不正形式は `invalid_field`）。
 - BLE経路は広告メッシュのため短文用途です（実装上の文字数上限あり）。
-- 画像送信は `wifi` 前提です。
 - 長文テキストは既定で小さめチャンク（32 bytes）に分割し、宛先指定時は `delivery_ack` 再送を使って到達率を優先します。
 - GUIから書き込みする場合、対象ポートを開いているシリアル接続は切断してから実行してください（アプリ側でも確認ダイアログを表示します）。

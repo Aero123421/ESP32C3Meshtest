@@ -64,7 +64,7 @@
   - `ttl > 0` のときのみ転送
   - 受信時に `ttl--`、`hop++`
 - ACK/再送:
-  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `long_text_*` / `image_*` は `need_ack=true` + `e2e_id` を付与
+  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `long_text_*` / `reliable_1k_*` 制御パケットは `need_ack=true` + `e2e_id` を付与
   - 受信ノードは `delivery_ack` を送信元へ返し、PC GUIは `e2e_id` で照合して完了判定する
   - GUI再送ポリシー:
     - timeout: 2200ms

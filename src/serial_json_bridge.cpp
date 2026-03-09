@@ -354,8 +354,7 @@ void SerialJsonBridge::handleLine(const char* line) {
       cmd = "get_nodes";
     } else if (type == "routes_request") {
       cmd = "get_routes";
-    } else if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
-               type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
+    } else if (type == "chat" || type == "ping" || type == "long_text_start" || type == "long_text_chunk" ||
                type == "long_text_end" || type == "reliable_1k_start" || type == "reliable_1k_chunk" ||
                type == "reliable_1k_end" || type == "reliable_1k_nack" || type == "reliable_1k_repair" ||
                type == "reliable_1k_result") {
@@ -430,18 +429,6 @@ void SerialJsonBridge::handleLine(const char* line) {
         envelope["seq"] = request["seq"] | 0;
         envelope["ping_id"] = request["ping_id"] | "";
         envelope["ts_ms"] = request["ts_ms"] | millis();
-      } else if (type == "image_start") {
-        envelope["image_id"] = request["image_id"] | "";
-        envelope["name"] = request["name"] | "";
-        envelope["size"] = request["size"] | 0;
-        envelope["chunks"] = request["chunks"] | 0;
-        envelope["sha256"] = request["sha256"] | "";
-      } else if (type == "image_chunk") {
-        envelope["image_id"] = request["image_id"] | "";
-        envelope["index"] = request["index"] | 0;
-        envelope["data_b64"] = request["data_b64"] | "";
-      } else if (type == "image_end") {
-        envelope["image_id"] = request["image_id"] | "";
       } else if (type == "long_text_start") {
         const String textId = request["text_id"] | "";
         const int size = request["size"] | -1;
@@ -625,8 +612,7 @@ void SerialJsonBridge::handleLine(const char* line) {
       }
 
       if (ok) {
-        if (type == "chat" || type == "ping" || type == "image_start" || type == "image_chunk" ||
-            type == "image_end" || type == "long_text_start" || type == "long_text_chunk" ||
+        if (type == "chat" || type == "ping" || type == "long_text_start" || type == "long_text_chunk" ||
             type == "long_text_end" || type == "reliable_1k_start" || type == "reliable_1k_chunk" ||
             type == "reliable_1k_end" || type == "reliable_1k_nack" || type == "reliable_1k_repair" ||
             type == "reliable_1k_result") {
@@ -1114,9 +1100,6 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         ack["msg_id"] = message.messageId;
         ack["status"] = "ok";
         ack["request_hops"] = message.hops;
-        if (appDoc.containsKey("image_id")) {
-          ack["image_id"] = appDoc["image_id"] | "";
-        }
         if (appDoc.containsKey("text_id")) {
           ack["text_id"] = appDoc["text_id"] | "";
         } else if (appDoc.containsKey("id")) {
@@ -1151,8 +1134,8 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         if (std::strcmp(appType, "delivery_ack") == 0) {
           return;
         }
-        if (std::strcmp(appType, "image_chunk") == 0 || std::strcmp(appType, "long_text_chunk") == 0 ||
-            std::strcmp(appType, "r1k_d") == 0 || std::strcmp(appType, "r1k_r") == 0 ||
+        if (std::strcmp(appType, "long_text_chunk") == 0 || std::strcmp(appType, "r1k_d") == 0 ||
+            std::strcmp(appType, "r1k_r") == 0 ||
             std::strcmp(appType, "reliable_1k_chunk") == 0 || std::strcmp(appType, "reliable_1k_repair") == 0) {
           // 高頻度チャンクはトレース配信を抑制し、テレメトリ過負荷を避ける。
           return;
@@ -1249,9 +1232,6 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         } else if (appDoc.containsKey("pf")) {
           observed["profile_id"] = appDoc["pf"] | 0;
         }
-        if (appDoc.containsKey("image_id")) {
-          observed["image_id"] = appDoc["image_id"] | "";
-        }
         if (appDoc.containsKey("index")) {
           observed["index"] = appDoc["index"] | 0;
         } else if (appDoc.containsKey("i")) {
@@ -1330,9 +1310,6 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         }
         if (!viaNodeId.isEmpty()) {
           out["via_node"] = viaNodeId;
-        }
-        if (appDoc.containsKey("image_id")) {
-          out["image_id"] = appDoc["image_id"] | "";
         }
         if (appDoc.containsKey("text_id")) {
           out["text_id"] = appDoc["text_id"] | "";
@@ -1738,48 +1715,6 @@ void SerialJsonBridge::emitMeshMessage(const ReassembledMessage& message) {
         return;
       }
 
-      if (std::strcmp(appType, "image_start") == 0 || std::strcmp(appType, "image_chunk") == 0 ||
-          std::strcmp(appType, "image_end") == 0) {
-        if (!accepted) {
-          return;
-        }
-
-        DynamicJsonDocument out(1400);
-        out["event"] = "mesh_rx";
-        out["type"] = appType;
-        out["via"] = "wifi";
-        out["src"] = appDoc["src"] | formatNodeId(message.originId);
-        out["dst"] = appDoc["dst"] | "";
-        out["msg_id"] = message.messageId;
-        out["hops"] = message.hops;
-        out["rssi"] = rxRssi;
-        if (!viaMac.isEmpty()) {
-          out["via_mac"] = viaMac;
-        }
-        if (!viaNodeId.isEmpty()) {
-          out["via_node"] = viaNodeId;
-        }
-        out["image_id"] = appDoc["image_id"] | "";
-        if (appDoc.containsKey("e2e_id")) {
-          out["e2e_id"] = appDoc["e2e_id"] | "";
-        }
-        if (appDoc.containsKey("retry_no")) {
-          out["retry_no"] = appDoc["retry_no"] | 0;
-        }
-        if (std::strcmp(appType, "image_start") == 0) {
-          out["name"] = appDoc["name"] | "";
-          out["size"] = appDoc["size"] | 0;
-          out["chunks"] = appDoc["chunks"] | 0;
-          out["sha256"] = appDoc["sha256"] | "";
-        } else if (std::strcmp(appType, "image_chunk") == 0) {
-          out["index"] = appDoc["index"] | 0;
-          out["data_b64"] = appDoc["data_b64"] | "";
-        }
-        serializeJson(out, *serial_);
-        serial_->println();
-        maybeSendDeliveryAck(appType);
-        return;
-      }
     }
 
     DynamicJsonDocument out(900);

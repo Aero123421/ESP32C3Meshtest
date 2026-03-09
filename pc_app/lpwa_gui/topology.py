@@ -46,8 +46,6 @@ def _normalize_type(payload: dict[str, Any]) -> str:
         return "reliable_1k_repair"
     if kind in {"r1k_o", "reliable_1k_result"}:
         return "reliable_1k_result"
-    if kind.startswith("image"):
-        return kind
     if kind.startswith("long_text"):
         return kind
     if kind.startswith("reliable_1k"):
@@ -245,7 +243,6 @@ class TopologyTracker:
             or payload.get("e2e_id")
             or payload.get("ping_id")
             or payload.get("text_id")
-            or payload.get("image_id")
             or ""
         ).strip()
         e2e_id = str(payload.get("e2e_id") or "").strip()
