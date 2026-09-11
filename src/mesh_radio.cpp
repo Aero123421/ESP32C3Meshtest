@@ -1,7 +1,6 @@
 #include "espnow_mesh.h"
 #include <ArduinoJson.h>
 #include <esp_wifi.h>
-#include <esp_wifi_internal.h>
 #include <esp_idf_version.h>
 #include <esp_system.h>
 #include <inttypes.h>

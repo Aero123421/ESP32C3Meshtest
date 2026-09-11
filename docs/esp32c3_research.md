@@ -1,105 +1,24 @@
-# esp32c3_research.md
+# C3/S3 RF設定と認証上の注意
 
-## 1. 調査目的
-- XIAO ESP32C3で「長距離化」と「メッシュ運用」を現実的に進めるため、仕様・制約・設計注意点を整理する。
+旧調査書の「現行ファームはLRが既定ON」という説明は、当時のBLE共存ビルド条件と矛盾していました。本書を現在の仕様に置き換えます。
 
-## 2. 主要仕様サマリ
+C3とS3は同じESP-NOW wire形式で試験可能ですが、同一binや同一GPIO番号では動きません。ファームウェアはSoC別にビルドし、チャンネル、PHYプロファイル、アンテナ、電源、設置高さ、送信内容を揃えて比較します。CPU性能とRF到達距離を混同しません。
 
-### 2.1 ボード（Seeed XIAO ESP32C3）
-- MCU: ESP32-C3（RISC-V, 最大160MHz）
-- メモリ: SRAM 400KB
-- Flash: 4MB
-- 無線: 2.4GHz Wi-Fi（802.11 b/g/n）+ BLE 5
-- 形状: 小型基板、外部アンテナ（U.FL/IPEX）接続可
-- 電源: USB給電、LiPoバッテリ入力（充電回路搭載）
+通常ビルドは1Mbpsを明示設定し、BLEを無効化します。LRビルドは `WIFI_PROTOCOL_LR` と `WIFI_PHY_RATE_LORA_250K` を設定します。protocol maskだけでは送信レートがLRになることを保証できないため、rate APIの成功も確認します。`LORA_250K` はこのSDKにおけるWi-Fi LR PHYの列挙名で、SX1262等のSub-GHz LoRa無線ではありません。
 
-### 2.2 チップ（ESP32-C3）
-- Wi-Fi: STA/SoftAP/STA+SoftAP
-- BLE: LE（拡張アドバタイズ対応）
-- 送信出力目安:
-  - 802.11bで最大+21dBm級
-  - 802.11nで最大+20dBm級
-- BLE受信感度目安:
-  - 低レート時に高感度（代表値として-105dBm級の記載あり）
+日本向けcountry設定はJP、既定channel1、20MHz、送信出力要求72 quarter-dBmです。`esp_wifi_set_max_tx_power()` の指定は上限設定であり、チップのデータシート最大値やEIRPそのものではありません。SDKの段階化・PHY・地域制約があるため、84指定を21dBm実出力とみなしません。出力要求、ドライバー読み戻し、アンテナ利得、実測値は区別します。
 
-注記:
-- 数値はデータシート条件やレート設定で変動する。最終判断は対象SDK版の公式ドキュメントと実測で行う。
+技適対象はアンテナを含む構成と無線方式の条件に依存します。ボードのマークだけから、LRや任意の高利得アンテナを含む全設定が認証済みと推定しません。現物の技適番号とSeeedの指定アンテナ一覧を確認し、不明な組み合わせ・方式はメーカーへ確認します。高利得アンテナ/ブースターを無条件に推奨しません。
 
-## 3. 長距離設計の考え方
+固定SDKの受信コールバックにRSSIがないため、本版はRSSI不明として扱います。PDRはパケット到達率、RSSIは受信電力で、互いの代用値ではありません。数値が不明な場合に0dBmを表示したり、RSSIから距離を推定したりしません。
 
-### 3.1 リンクバジェットの基本
-- 受信余裕（概念）:
-  - `受信余裕[dB] = 送信電力 + 送受アンテナ利得 - 伝搬損失 - 受信必要感度`
-- 2.4GHzは障害物や人体の影響が大きく、見通し環境と屋内で結果が大きく変わる。
+## 一次資料
 
-### 3.2 実装面で効く施策
-- 外部アンテナを正しく接続し、向きと高さを揃える
-- チャンネル固定で干渉条件を安定化する
-- 送信間隔を調整し、衝突確率を下げる
-- ACK/再送/重複排除を実装し、実効到達率を改善する
-- 1ホップで無理をしない。中継ノードで多段化する
+- [ESP-IDF v4.4.7 ESP-NOW API / C3](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32c3/api-reference/network/esp_now.html)
+- [同SDKのesp_now.h（送信rate APIとcallback定義）](https://github.com/espressif/esp-idf/blob/v4.4.7/components/esp_wifi/include/esp_now.h)
+- [同SDKのWi-Fi API / C3](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32c3/api-reference/network/esp_wifi.html)
+- [Seeed K.K. 指定アンテナ一覧（2024年公開）](https://lab.seeed.co.jp/entry/2024/06/19/120000)
+- [XIAO C3](https://wiki.seeedstudio.com/XIAO_ESP32C3_Getting_Started/)
+- [XIAO S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/)
 
-### 3.3 LR（Long Range）モードの注意
-- ESP系同士の専用運用に近い特性がある
-- 通常Wi-Fi機器との互換性を失う可能性がある
-- PHYレート低下と引き換えに到達距離を狙うモード
-- 実運用前に「互換性」「スループット」「遅延」を別々に評価する
-
-現行ファームでは、ノード個別設定なしで
-`高出力 + Wi-Fi省電力OFF + オリジン側重複送信 + 送信ジッタ + WIFI_PROTOCOL_LR`
-を既定適用している。環境差分検証のため、build flag で切替可能とする。
-
-## 4. メッシュ運用での注意点
-- トラフィック制御:
-  - フラッディング過多を避けるため、TTLと重複排除は必須
-- アドレス設計:
-  - ノードIDを固定し、ログと対応付けできる運用にする
-- ルーティング:
-  - 3台段階では静的で十分
-  - 台数増加時はリンク品質ベースに拡張
-
-## 5. ハードウェア上の注意点
-- ストラップピン（例: GPIO2/GPIO8/GPIO9）により起動挙動が変わるため、起動時状態に注意する
-- 電源品質が不安定だと、書き込み失敗やランダム再起動が発生しやすい
-- 高出力送信やSoftAP連続運用では発熱管理を行う
-
-## 6. 法規・運用上の注意点
-- 使用地域の認証範囲（技適/FCCなど）を確認する
-- アンテナを変更する場合は、認証条件やEIRP上限への影響を確認する
-- 公共空間試験では周辺Wi-Fiへの干渉に配慮する
-
-## 7. 開発時の落とし穴
-- USBケーブルが充電専用で書き込み不可
-- ポート入れ替わりで誤書き込み
-- 3台同時運用時にログが混ざり、原因切り分け不能
-- ノードごとのファーム差分管理漏れ
-
-## 8. 推奨する最小検証順序
-1. 1台で書き込み・シリアルログ確認
-2. 3台で同一ビルド書き込み
-3. 1ホップP2Pの疎通確認
-4. 2ホップ中継（A→B→C）確認
-5. 距離・障害物・電源条件を変えて再試験
-
-## 9. 未確定事項
-- 最終運用でWi-Fiメッシュを使うか、ESP-NOW自作メッシュに寄せるか
-- 電池駆動時の目標稼働時間と送信Duty
-- 鍵配布とノード追加の運用ポリシー
-
-## 10. 参考リンク（一次情報）
-- Espressif ESP-IDF v5.5.3（最新安定系）
-  - https://github.com/espressif/esp-idf/releases
-- ESP32-C3 Wi-Fi API Guide
-  - https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-guides/wifi.html
-- ESP-NOW API Reference（ESP32-C3）
-  - https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-reference/network/esp_now.html
-- RF Coexistence Guide
-  - https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-guides/coexist.html
-- ESP-WIFI-MESH
-  - https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-reference/network/esp-wifi-mesh.html
-- ESP-BLE-MESH
-  - https://docs.espressif.com/projects/esp-idf/en/stable/esp32c3/api-guides/esp-ble-mesh/ble-mesh-index.html
-- Seeed XIAO ESP32C3 Wiki
-  - https://wiki.seeedstudio.com/XIAO_ESP32C3_Getting_Started/
-- PlatformIO board: `seeed_xiao_esp32c3`
-  - https://docs.platformio.org/en/stable/boards/espressif32/seeed_xiao_esp32c3.html
+距離や屋外環境の成功を主張するには [field_validation.md](field_validation.md) の実測結果が必要です。
