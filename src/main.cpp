@@ -44,12 +44,13 @@ void setup() {
   Serial.print(",\"mesh_channel\":");
   Serial.print(lpwa::kMeshChannel);
   Serial.print(",\"wifi_lr\":");
-  Serial.print(lpwa::kWifiLongRangeDefault ? "true" : "false");
+  Serial.print((meshReady && gMesh.radioProfile() == lpwa::EspNowMesh::RadioProfile::LongRange) ? "true" : "false");
   Serial.print(",\"tx_power_qdbm\":");
   Serial.print(lpwa::kMeshTxPowerQuarterDbm);
   Serial.print(",\"node_id\":\"");
   Serial.print(nodeIdBuf);
   Serial.println("\"}");
+  gMesh.writeRadioStatus(Serial);
 }
 
 void loop() {
