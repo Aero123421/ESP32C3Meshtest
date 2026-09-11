@@ -104,6 +104,45 @@ def no_overflow(page):
     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Horizontal page overflow'
 
 
+def screenshot(page, path, engine, errors, tool_warnings):
+    """Keep strict app CSP; attribute only the proven Playwright WebKit injection.
+
+    Playwright 1.57 screenshotter.inPagePrepareForScreenshots(syncAnimations)
+    temporarily inserts <style>body {}</style> in WebKit. Our CSP correctly blocks
+    it. Observe that exact DOM insertion, require exactly its known warning during
+    this screenshot, and report it separately. Other console errors still fail.
+    No bypass_csp, unsafe-inline, blanket warning filter or production change.
+    """
+    assert not errors, '\n'.join(errors)
+    page.evaluate("""() => {
+      window.__screenshotStyles = [];
+      window.__screenshotObserver = new MutationObserver(records => {
+        for (const record of records) for (const node of record.addedNodes)
+          if (node.nodeName === 'STYLE') window.__screenshotStyles.push(node.textContent);
+      });
+      window.__screenshotObserver.observe(document.head, {childList:true});
+    }""")
+    start = len(errors)
+    try:
+        page.screenshot(path=str(path), full_page=True, caret='initial')
+    finally:
+        styles = page.evaluate("""() => {
+          window.__screenshotObserver.disconnect();
+          const result = window.__screenshotStyles;
+          delete window.__screenshotObserver;
+          delete window.__screenshotStyles;
+          return result;
+        }""")
+    known = ("Refused to apply a stylesheet because its hash, its nonce, or 'unsafe-inline' "
+             "does not appear in the style-src directive of the Content Security Policy.")
+    if engine == 'webkit' and styles == ['body {}'] and errors[start:] == [known]:
+        tool_warnings.append({'screenshot': path.name, 'message': known,
+                              'source': 'Playwright 1.57 WebKit screenshot animation synchronization',
+                              'observed_injected_style': styles[0], 'app_csp': 'unchanged; injection blocked'})
+        del errors[start:]
+    assert not errors, '\n'.join(errors)
+
+
 def main():
     from playwright.sync_api import sync_playwright, expect
     parser = argparse.ArgumentParser(description=__doc__)
@@ -111,7 +150,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT / 'browser-artifacts')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    errors, checks = [], []
+    errors, checks, tool_warnings = [], [], []
     with sync_playwright() as playwright:
         browser = getattr(playwright, args.browser).launch(headless=True)
         context = browser.new_context(viewport={'width': 1440, 'height': 1000}, accept_downloads=True)
@@ -126,7 +165,7 @@ def main():
                 expect(page.locator('#demo-banner')).to_be_visible()
                 expect(page.locator('#connect')).to_be_disabled()
                 no_overflow(page)
-                page.screenshot(path=str(args.output / 'demo-desktop.png'), full_page=True)
+                screenshot(page, args.output / 'demo-desktop.png', args.browser, errors, tool_warnings)
                 for name in ('tests', 'messages', 'firmware', 'logs', 'topology'):
                     page.locator(f'[data-page="{name}"]').click()
                     expect(page.locator(f'#page-{name}')).to_be_visible()
@@ -140,9 +179,9 @@ def main():
                 assert page.locator('#map-content').get_attribute('transform') == before
                 page.set_viewport_size({'width': 390, 'height': 844})
                 no_overflow(page)
-                page.screenshot(path=str(args.output / 'demo-mobile.png'), full_page=True)
+                screenshot(page, args.output / 'demo-mobile.png', args.browser, errors, tool_warnings)
                 checks += ['demo isolation', 'five screens', 'node selection', 'zoom/fit', 'desktop/mobile overflow']
-                page.goto('about:blank')  # stop polling before the demo server is closed
+                page.goto('about:blank')
 
             page.set_viewport_size({'width': 1440, 'height': 1000})
             with running_app() as (controller, url):
@@ -164,7 +203,7 @@ def main():
                 expect(page.locator('#test-pdr')).to_have_text('66.67%')
                 result = controller.snapshot()['test']
                 assert (result['received'], result['lost'], result['pending']) == (2, 1, 0)
-                page.screenshot(path=str(args.output / 'simulated-ping.png'), full_page=True)
+                screenshot(page, args.output / 'simulated-ping.png', args.browser, errors, tool_warnings)
                 page.locator('[data-page="messages"]').click()
                 message = '<img src=x onerror="window.__meshXss=1"> 日本語🙂'
                 form = page.locator('#message-form')
@@ -192,17 +231,20 @@ def main():
                 page.goto('about:blank')
             assert not errors, '\n'.join(errors)
         except Exception:
-            page.screenshot(path=str(args.output / 'failure.png'), full_page=True)
+            page.screenshot(path=str(args.output / 'failure.png'), full_page=True, caret='initial')
             raise
         finally:
             (args.output / 'summary.json').write_text(json.dumps({
                 'browser': args.browser, 'checks': checks, 'page_errors': errors,
+                'screenshot_tool_warnings': tool_warnings,
                 'hardware': 'SIMULATED ONLY; not RF range or real USB validation',
                 'viewports': ['1440x1000', '390x844'],
             }, ensure_ascii=False, indent=2), encoding='utf-8')
             context.close()
             browser.close()
     print(f'{args.browser}: {len(checks)} browser checks passed; radio hardware was simulated.')
+    if tool_warnings:
+        print(f'{len(tool_warnings)} WebKit screenshot-tool CSP rejections recorded separately; app policy unchanged.')
 
 
 if __name__ == '__main__':
