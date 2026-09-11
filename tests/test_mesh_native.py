@@ -26,7 +26,6 @@ def test_firmware_geometry_and_actual_send_callback_path(tmp_path):
 using namespace lpwa;
 using esp_err_t = int;
 constexpr int ESP_OK = 0, ESP_ERR_ESPNOW_NO_MEM = 1, pdTRUE = 1;
-constexpr int ESP_FAIL = 2;
 uint32_t timeNow=0;
 uint32_t millis(){return timeNow;}
 void delay(int ms){timeNow+=ms;}
