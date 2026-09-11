@@ -283,3 +283,32 @@ def test_real_http_server_auth_validation_and_static_assets():
         server.server_close()
         c.close()
         thread.join(timeout=2)
+
+
+def test_observed_edges_expire_without_new_device_events():
+    n = Network()
+    n.receive({'type': 'mesh_observed', 'observer': A, 'via_node': B}, 0)
+    assert n.snapshot(1)['edges']
+    assert n.snapshot(121)['edges'] == []
+
+
+def test_completed_delivery_survives_disconnect_and_stop():
+    c = Controller()
+    c.transfer = {'status': 'delivered'}
+    c.disconnect()
+    assert c.transfer['status'] == 'delivered'
+    c.command({'action': 'stop'})
+    assert c.transfer['status'] == 'delivered'
+
+
+def test_not_ready_radio_cannot_start_measurement():
+    c = Controller()
+    c.connection = 'connected'
+    c.network.radio = {'ready': False}
+    with pytest.raises(ValueError, match='not ready'):
+        c.command({'action': 'test', 'destination': B})
+
+
+def test_non_ascii_token_is_rejected_without_crash():
+    assert not authorized({'Host': '127.0.0.1:1234', 'X-Mesh-Token': 'é'},
+                          '127.0.0.1:1234', 'secret')

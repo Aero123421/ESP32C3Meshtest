@@ -179,7 +179,7 @@ class Network:
         nodes = [{k: v for k, v in n.items() if k != 'seen'} |
                  {'age_s': max(0, round(now - n['seen'], 1)), 'online': now - n['seen'] < 60}
                  for n in self.nodes.values()]
-        edges = [{k: v for k, v in e.items() if k != 'seen'} for e in self.edges.values()]
+        edges = [{k: v for k, v in e.items() if k != 'seen'} for e in self.edges.values() if now - e['seen'] < 120]
         routes = []
         for r in self.routes:
             age = r.get('age_ms', 0)

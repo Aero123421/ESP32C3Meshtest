@@ -29,7 +29,7 @@ def authorized(headers, authority: str, token: str) -> bool:
     if headers.get('Sec-Fetch-Site') == 'cross-site':
         return False
     supplied = headers.get('X-Mesh-Token', '')
-    return isinstance(supplied, str) and hmac.compare_digest(supplied, token)
+    return isinstance(supplied, str) and hmac.compare_digest(supplied.encode('utf-8'), token.encode('utf-8'))
 
 
 class Server(ThreadingHTTPServer):

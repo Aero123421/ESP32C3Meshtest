@@ -92,7 +92,7 @@ class Controller:
     def disconnect(self) -> None:
         if self.run and self.run.status == 'running':
             self.run.cancel()
-        if self.transfer:
+        if self.transfer and self.transfer['status'] == 'sending':
             self.transfer['status'] = 'cancelled'
         if self.link:
             self.link.close()
@@ -207,11 +207,13 @@ class Controller:
             elif action == 'stop':
                 if self.run and self.run.status == 'running':
                     self.run.cancel()
-                if self.transfer:
+                if self.transfer and self.transfer['status'] == 'sending':
                     self.transfer['status'] = 'cancelled'
             elif action in ('test', 'message'):
                 if self.connection != 'connected':
                     raise ValueError('Connect a board first')
+                if self.network.radio.get('ready') is False:
+                    raise ValueError('The connected firmware reports that its radio is not ready')
                 if self.run and self.run.status == 'running' or self.transfer and self.transfer['status'] == 'sending':
                     raise ValueError('Stop the current test or transfer first')
                 dst = node_id(data.get('destination'))
