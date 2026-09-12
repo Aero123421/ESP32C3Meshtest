@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [seeed_xiao_esp32c3, seeed_xiao_esp32s3, seeed_xiao_esp32c3_lr, seeed_xiao_esp32s3_lr, seeed_xiao_esp32c3_coexist, seeed_xiao_esp32s3_coexist]
+        environment: [seeed_xiao_esp32c3, seeed_xiao_esp32s3, seeed_xiao_esp32c6, seeed_xiao_esp32c3_lr, seeed_xiao_esp32s3_lr, seeed_xiao_esp32c6_lr, seeed_xiao_esp32c3_coexist, seeed_xiao_esp32s3_coexist, seeed_xiao_esp32c6_coexist]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
