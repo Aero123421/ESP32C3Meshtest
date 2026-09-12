@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include <cstdio>
 #include <inttypes.h>
 
 #include "ble_relay.h"
