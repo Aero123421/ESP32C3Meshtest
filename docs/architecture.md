@@ -1,6 +1,6 @@
 # 現在の設計 — Mesh Lab
 
-本書はC3/S3対応・Mesh Lab UIへの変更後の設計です。旧版の「LRが既定ON」「省電力OFFをBLEと無条件併用」「送信API受付=配達成功」という説明は使用しません。
+本書はC3/S3/C6対応・Mesh Lab UIへの変更後の設計です。旧版の「LRが既定ON」「省電力OFFをBLEと無条件併用」「送信API受付=配達成功」という説明は使用しません。
 
 ## データ経路
 
@@ -10,9 +10,9 @@ Windows/macOS/LinuxのUIは同じPythonパッケージ `pc_app/mesh_lab` とロ�
 
 ## 無線
 
-`platformio.ini` に通常/LR/BLE共存×C3/S3の6環境を定義します。通常は1Mbps、LRは250kbpsをESP-NOW送信レートAPIへ明示設定します。通常/LRはBLE停止、20MHz、省電力OFF。LRは認証確認を必要とする実験用の別構成です。電力の要求値は72 quarter-dBmで、読み戻しと要求を別フィールドに出します。実測電力は取得していません。
+`platformio.ini` に通常/LR/BLE共存×C3/S3/C6の9環境を定義します。通常は1Mbps、LRは250kbpsをESP-NOW送信レートAPIへ明示設定します。通常/LRはBLE停止、20MHz、省電力OFF。LRは認証確認を必要とする実験用の別構成です。電力の要求値は72 quarter-dBmで、読み戻しと要求を別フィールドに出します。実測電力は取得していません。
 
-SoC別のbinが必要ですが、固定幅整数・packed構造体・最大250bytesの既存wire形式を共有します。同一チャンネル/プロファイルを揃えます。SDKを変更する場合は、受信/送信コールバック型・rate API・peer APIを含めて6環境すべてを再検証します。
+C3/S3/C6それぞれSoC別のbinが必要ですが、固定幅整数・packed構造体・最大250bytesの既存wire形式を共有します。同一チャンネル/プロファイルを揃えます。SDKを変更する場合は、受信/送信コールバック型・rate API・peer APIを含めて6環境すべてを再検証します。
 
 ## 中継と送信結果
 

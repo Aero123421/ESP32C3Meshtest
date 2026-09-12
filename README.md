@@ -1,8 +1,8 @@
-# Mesh Lab — XIAO ESP32-C3 / ESP32-S3
+# Mesh Lab — XIAO ESP32-C3 / ESP32-S3 / ESP32-C6
 
 ESP-NOWの1ホップ・多段中継を比較するためのファームウェアと、Windows / macOS / Linux用ローカル試験アプリです。APへの接続を前提にする通常のWi-Fiアプリではなく、**ESP-NOW上の独自Hybrid Mesh**です。リポジトリの旧名・ログ内の `LPWAtestESP32` / `lpwa` は互換性のため一部残っています。
 
-> **ビルド成功は、長距離通信成功や技適への適合を証明しません。** この変更でC3/S3の無線設定と中継の不具合を修正し、実測用の道具を整備しています。実際の到達距離、C3⇄S3混在通信、障害時の復旧性能は [実機受入試験](docs/field_validation.md) で別途確認してください。既存レポートには距離・設置条件が記録されておらず、100m/数百mの実証として扱えません。
+> **ビルド成功は、長距離通信成功や技適への適合を証明しません。** この変更でC3/S3/C6の無線設定と中継の不具合を修正し、実測用の道具を整備しています。実際の到達距離、C3⇄S3混在通信、障害時の復旧性能は [実機受入試験](docs/field_validation.md) で別途確認してください。既存レポートには距離・設置条件が記録されておらず、100m/数百mの実証として扱えません。
 
 ## 何が変わったか
 
@@ -43,24 +43,29 @@ python pc_app/app.py --help
 
 macOSは `/dev/cu.usbmodem...` / `/dev/cu.usbserial...` を選択します。Windowsは `COM...`、Linuxは `/dev/ttyACM...` / `/dev/ttyUSB...`。Linuxで権限エラーになる場合はディストリビューションのシリアルポート権限を設定してください。別のシリアルモニターと同じポートを同時に開かないでください。
 
-## 2. C3/S3のビルドは別々
+## 2. C3/S3/C6のビルドは別々
 
-**C3とS3で同じ `.bin` は使えません。** C3はRISC-V、S3はXtensaです。同じソースを、対象ボードに応じてビルドします。CPUの違いは無線互換性を妨げませんが、GPIO・USB・メモリ設定の違いは残ります。
+**C3/S3/C6で同じ `.bin` は使えません。** C3/C6はRISC-V、S3はXtensaです。C6はESP-IDF 5.1+が必要なため、このrepoではSeeedのPlatformIO platformをcommit固定してArduino 3.xでビルドします。同じソースを、対象ボードに応じてビルドします。CPUの違いは無線互換性を妨げませんが、GPIO・USB・メモリ設定の違いは残ります。
 
 | ビルド環境 `-e` | ボード | 無線プロファイル | BLE |
 |---|---|---|---|
 | `seeed_xiao_esp32c3` | XIAO C3 | 通常 / 1Mbps | OFF |
 | `seeed_xiao_esp32s3` | XIAO S3 | 通常 / 1Mbps | OFF |
+| `seeed_xiao_esp32c6` | XIAO C6 | 通常 / 1Mbps | OFF |
 | `seeed_xiao_esp32c3_lr` | XIAO C3 | LR / 250kbps（実験用） | OFF |
 | `seeed_xiao_esp32s3_lr` | XIAO S3 | LR / 250kbps（実験用） | OFF |
+| `seeed_xiao_esp32c6_lr` | XIAO C6 | LR / 250kbps（実験用） | OFF |
 | `seeed_xiao_esp32c3_coexist` | XIAO C3 | 通常 / BLE共存 | ON |
 | `seeed_xiao_esp32s3_coexist` | XIAO S3 | 通常 / BLE共存 | ON |
+| `seeed_xiao_esp32c6_coexist` | XIAO C6 | 通常 / BLE共存 | ON |
 
 ```sh
 python -m platformio run -e seeed_xiao_esp32c3
 python -m platformio run -e seeed_xiao_esp32s3
+python -m platformio run -e seeed_xiao_esp32c6
 python -m platformio run -e seeed_xiao_esp32c3_lr
 python -m platformio run -e seeed_xiao_esp32s3_lr
+python -m platformio run -e seeed_xiao_esp32c6_lr
 ```
 
 書き込み（ポートを現物に合わせて変更）:
@@ -78,25 +83,29 @@ S3でポートが見えない/書き込めない場合は、データ対応USB�
 
 成果物は `.pio/build/<環境>/firmware.bin`。これはアプリ領域のbinで、単独では初回書き込みに必要なbootloader/partition tableを含みません。原則PlatformIOのuploadを使ってください。CIのファームウェアビルドはUbuntuで実施し、macOS実機でのUSB書き込み・ローカルコンパイルは別途検証対象です。
 
-## 3. C3とS3はGPIO番号が違う
+## 3. C3/S3/C6はGPIO番号が違う
 
 XIAOの端子名・配置が似ていても、**数値GPIOの直書きは互換ではありません**。
 
-| XIAO端子 | C3のGPIO | S3のGPIO |
-|---|---:|---:|
-| D0 | 2 | 1 |
-| D1 | 3 | 2 |
-| D2 | 4 | 3 |
-| D3 | 5 | 4 |
-| D4 / SDA | 6 | 5 |
-| D5 / SCL | 7 | 6 |
-| D6 / TX | 21 | 43 |
-| D7 / RX | 20 | 44 |
-| D8 / SCK | 8 | 7 |
-| D9 / MISO | 9 | 8 |
-| D10 / MOSI | 10 | 9 |
+| XIAO端子 | C3のGPIO | S3のGPIO | C6のGPIO |
+|---|---:|---:|---:|
+| D0 | 2 | 1 | 0 |
+| D1 | 3 | 2 | 1 |
+| D2 | 4 | 3 | 2 |
+| D3 | 5 | 4 | 21 |
+| D4 / SDA | 6 | 5 | 22 |
+| D5 / SCL | 7 | 6 | 23 |
+| D6 / TX | 21 | 43 | 16 |
+| D7 / RX | 20 | 44 | 17 |
+| D8 / SCK | 8 | 7 | 19 |
+| D9 / MISO | 9 | 8 | 20 |
+| D10 / MOSI | 10 | 9 | 18 |
 
 この表は通常のXIAO ESP32C3 / ESP32S3向けです。S3 Plus、拡張基板、別メーカーのDevKitへそのまま流用しないでください。Arduinoでは `D6` / `SDA` などのボード定義を優先し、周辺機能、ストラップピン、電源条件は個別に確認します。現在のメッシュ基本試験はUSB給電/シリアル中心で、外部GPIO接続を必要としません。
+
+### XIAO ESP32-C6のアンテナ切替
+
+C6はRF switchを内蔵しています。このrepoのC6環境は安全側で**オンボードアンテナを既定**にします。外部U.FLを使う場合は、対象アンテナ/構成の認証条件を確認した上でC6環境の `LPWA_XIAO_C6_EXTERNAL_ANTENNA=0` を `1` に変更してください。ファームはGPIO3をLowにしてRF switch制御を有効化し、GPIO14 Low=内蔵 / High=外部を選択します。
 
 ## 4. 長距離試験と日本国内の運用
 

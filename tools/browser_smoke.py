@@ -160,7 +160,7 @@ def main():
         try:
             with running_app(demo=True) as (_, url):
                 page.goto(url)
-                expect(page).to_have_title('Mesh Lab · C3 / S3')
+                expect(page).to_have_title('Mesh Lab · C3 / S3 / C6')
                 expect(page.locator('.map-node')).to_have_count(6)
                 expect(page.locator('#demo-banner')).to_be_visible()
                 expect(page.locator('#connect')).to_be_disabled()

@@ -87,6 +87,20 @@ bool EspNowMesh::begin() {
     return false;
   }
 
+#if defined(ARDUINO_XIAO_ESP32C6)
+  // XIAO C6 RF switch: GPIO3 enables software selection and GPIO14 selects
+  // onboard (LOW) versus external U.FL (HIGH). Default to onboard.
+  pinMode(3, OUTPUT);
+  digitalWrite(3, LOW);
+  delay(100);
+  pinMode(14, OUTPUT);
+#if LPWA_XIAO_C6_EXTERNAL_ANTENNA
+  digitalWrite(14, HIGH);
+#else
+  digitalWrite(14, LOW);
+#endif
+#endif
+
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false);
   if (!WiFi.mode(WIFI_STA)) return false;
@@ -364,11 +378,19 @@ bool EspNowMesh::parseRadioProfileText(const char* text, RadioProfile* outProfil
 
 
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void EspNowMesh::onSendStatic(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
+  if (instance_ != nullptr) {
+    instance_->onSend(tx_info != nullptr ? tx_info->des_addr : nullptr, status);
+  }
+}
+#else
 void EspNowMesh::onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
   if (instance_ != nullptr) {
     instance_->onSend(mac_addr, status);
   }
 }
+#endif
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 void EspNowMesh::onRecvStatic(const esp_now_recv_info_t* info, const uint8_t* data, int len) {

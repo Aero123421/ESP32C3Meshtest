@@ -16,7 +16,7 @@ from pathlib import Path
 from .model import Network, ProbeRun, integer, node_id
 from .transport import SerialLink, serial_ports
 
-ENVS = tuple('seeed_xiao_esp32' + chip + suffix for chip in ('c3', 's3')
+ENVS = tuple('seeed_xiao_esp32' + chip + suffix for chip in ('c3', 's3', 'c6')
              for suffix in ('', '_lr', '_coexist'))
 ROOT = Path(__file__).resolve().parents[2]
 

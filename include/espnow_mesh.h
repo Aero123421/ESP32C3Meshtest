@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <atomic>
 #include <esp_now.h>
+#include <esp_idf_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -94,7 +95,11 @@ class EspNowMesh {
   };
 
   static EspNowMesh* instance_;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+  static void onSendStatic(const esp_now_send_info_t* tx_info, esp_now_send_status_t status);
+#else
   static void onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status);
+#endif
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   static void onRecvStatic(const esp_now_recv_info_t* info, const uint8_t* data, int len);
 #else
