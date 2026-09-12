@@ -1,4 +1,5 @@
 #include "espnow_mesh.h"
+#include "mesh_validation.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -46,6 +47,8 @@ bool EspNowMesh::begin() {
     return false;
   }
   instance_ = this;
+  ready_ = false;
+  txAwaiting_ = false;
 
   const uint64_t efuseMac = ESP.getEfuseMac();
   nodeId_ = static_cast<uint32_t>((efuseMac >> 24) ^ (efuseMac & 0x00FFFFFFULL));
@@ -84,13 +87,30 @@ bool EspNowMesh::begin() {
     return false;
   }
 
-  WiFi.mode(WIFI_STA);
+#if defined(ARDUINO_XIAO_ESP32C6)
+  // XIAO C6 RF switch: GPIO3 enables software selection and GPIO14 selects
+  // onboard (LOW) versus external U.FL (HIGH). Default to onboard.
+  pinMode(3, OUTPUT);
+  digitalWrite(3, LOW);
+  delay(100);
+  pinMode(14, OUTPUT);
+#if LPWA_XIAO_C6_EXTERNAL_ANTENNA
+  digitalWrite(14, HIGH);
+#else
+  digitalWrite(14, LOW);
+#endif
+#endif
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  if (!WiFi.mode(WIFI_STA)) return false;
   WiFi.disconnect();
   delay(20);
 
   // Best-effort tuning: if a platform build does not support one of these knobs,
   // continue with defaults instead of failing mesh startup.
-  (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+  if (esp_wifi_set_country_code("JP", false) != ESP_OK) return false;
+  if (esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20) != ESP_OK) return false;
 
   hasStaMac_ = false;
   std::memset(staMac_, 0, sizeof(staMac_));
@@ -112,8 +132,8 @@ bool EspNowMesh::begin() {
     return false;
   }
 
-  esp_now_register_send_cb(EspNowMesh::onSendStatic);
-  esp_now_register_recv_cb(EspNowMesh::onRecvStatic);
+  if (esp_now_register_send_cb(EspNowMesh::onSendStatic) != ESP_OK ||
+      esp_now_register_recv_cb(EspNowMesh::onRecvStatic) != ESP_OK) return false;
 
   esp_now_peer_info_t peerInfo{};
   std::memcpy(peerInfo.peer_addr, kBroadcastMac, sizeof(kBroadcastMac));
@@ -148,11 +168,22 @@ bool EspNowMesh::begin() {
   const uint32_t nowMs = millis();
   const uint32_t firstDelay = randomDelayMs(kNodeInfoInitialJitterMinMs, kNodeInfoInitialJitterMaxMs);
   nextNodeInfoDueMs_ = nowMs + firstDelay;
+  ready_ = true;
   return true;
 }
 
 void EspNowMesh::loop() {
+  if (!ready_) return;
   processTxResultQueue();
+  // A missing callback must never be attributed to a later frame. Quarantine
+  // sends and restart the radio/MCU only after a prolonged driver stall.
+  if (txAwaiting_ && (millis() - txStartedMs_) > 10000U) {
+    Serial.println("{\"type\":\"error\",\"code\":\"tx_callback_stalled\",\"detail\":\"restarting radio\"}");
+    delay(20);
+    ESP.restart();
+    return;
+  }
+  pruneRoutingTables(millis());
   processRxQueue();
 
   uint32_t droppedByTimeout = 0;
@@ -216,6 +247,8 @@ void EspNowMesh::getStats(MeshStats* outStats) const {
     return;
   }
   *outStats = stats_;
+  outStats->rxQueueDropped += callbackRxDrops_.load();
+  outStats->txResultQueueDropped += callbackTxDrops_.load();
 }
 
 size_t EspNowMesh::copyNodeRecords(NodeRecord* outRecords, size_t maxRecords) const {
@@ -297,7 +330,9 @@ bool EspNowMesh::setRadioProfile(RadioProfile profile) {
   if (profile == RadioProfile::LongRange && !kLongRangeProfileAvailable) {
     return false;
   }
+  if (txAwaiting_ || !ready_) return false;
   if (!applyRadioProfile(profile)) {
+    (void)applyRadioProfile(radioProfile_);
     return false;
   }
   radioProfile_ = profile;
@@ -341,50 +376,21 @@ bool EspNowMesh::parseRadioProfileText(const char* text, RadioProfile* outProfil
   return false;
 }
 
-bool EspNowMesh::applyRadioProfile(RadioProfile profile) {
-  wifi_ps_type_t psMode = WIFI_PS_NONE;
-  uint8_t protocolMask = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
-  // ESP32-C3 requires Wi-Fi modem sleep when BLE and some Wi-Fi combinations
-  // (notably LR) are enabled together; otherwise IDF can abort at runtime.
-#if LPWA_ENABLE_BLE_RELAY
-  const bool bleRelayEnabled = true;
-#else
-  const bool bleRelayEnabled = false;
-#endif
-  // ESP32-C3 Wi-Fi+BLE coexistence requires modem sleep enabled.
-  const bool needsModemSleep = bleRelayEnabled || (profile == RadioProfile::Coexist);
-  if (needsModemSleep) {
-    psMode = WIFI_PS_MIN_MODEM;
-  }
-  if (profile == RadioProfile::LongRange) {
-    if (!kLongRangeProfileAvailable) {
-      return false;
-    }
-#ifdef WIFI_PROTOCOL_LR
-    protocolMask = static_cast<uint8_t>(protocolMask | WIFI_PROTOCOL_LR);
-#else
-    return false;
-#endif
-  }
-  if (esp_wifi_set_ps(psMode) != ESP_OK) {
-    return false;
-  }
-  esp_err_t protocolResult = esp_wifi_set_protocol(WIFI_IF_STA, protocolMask);
-  if (protocolResult != ESP_OK) {
-    return false;
-  }
-  // 84 == 21.0 dBm in 0.25 dBm steps (chip/regulatory limits still apply).
-  if (esp_wifi_set_max_tx_power(kMeshTxPowerQuarterDbm) != ESP_OK) {
-    return false;
-  }
-  return true;
-}
 
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void EspNowMesh::onSendStatic(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
+  if (instance_ != nullptr) {
+    instance_->onSend(tx_info != nullptr ? tx_info->des_addr : nullptr, status);
+  }
+}
+#else
 void EspNowMesh::onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status) {
   if (instance_ != nullptr) {
     instance_->onSend(mac_addr, status);
   }
 }
+#endif
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 void EspNowMesh::onRecvStatic(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
@@ -412,20 +418,14 @@ void EspNowMesh::onRecvStatic(const uint8_t* mac_addr, const uint8_t* data, int 
 #endif
 
 void EspNowMesh::onSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
-  const bool success = (status == ESP_NOW_SEND_SUCCESS);
-  if (!enqueueTxResult(mac_addr, success)) {
-    stats_.txResultQueueDropped++;
-    if (success) {
-      stats_.txSuccess++;
-    } else {
-      stats_.txFailed++;
-    }
+  if (!enqueueTxResult(mac_addr, status == ESP_NOW_SEND_SUCCESS)) {
+    callbackTxDrops_.fetch_add(1);
   }
 }
 
 void EspNowMesh::onRecv(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len) {
   if (!enqueueRx(mac_addr, rssi, data, len)) {
-    stats_.rxQueueDropped++;
+    callbackRxDrops_.fetch_add(1);
   }
 }
 
@@ -462,26 +462,39 @@ bool EspNowMesh::enqueueTxResult(const uint8_t* mac_addr, bool success) {
   return xQueueSend(txResultQueue_, &item, 0) == pdTRUE;
 }
 
-void EspNowMesh::processTxResultQueue() {
-  if (txResultQueue_ == nullptr) {
-    return;
-  }
-  TxResultItem item{};
-  uint8_t processed = 0;
-  while (processed < kRxProcessBudgetPerLoop && xQueueReceive(txResultQueue_, &item, 0) == pdTRUE) {
-    if (item.success) {
-      stats_.txSuccess++;
-    } else {
-      stats_.txFailed++;
+void EspNowMesh::recordTxResult(const TxResultItem& item) {
+  txAwaiting_ = false;
+  if (item.success) ++stats_.txSuccess; else ++stats_.txFailed;
+  if (!item.hasMac) return;  // broadcast TX completion is NOT receiver delivery
+  NeighborEntry* neighbor = findNeighbor(item.mac);
+  if (neighbor == nullptr) return;
+  updateNeighborTxEtx(neighbor, item.success);
+  neighbor->consecutiveTxFailures = item.success ? 0 :
+      static_cast<uint8_t>(neighbor->consecutiveTxFailures < 255 ? neighbor->consecutiveTxFailures + 1 : 255);
+  if (neighbor->consecutiveTxFailures < 2) return;
+  const uint32_t now = millis();
+  for (auto& route : routes_) {
+    if (!route.used) continue;
+    if (std::memcmp(route.backupNextHopMac, item.mac, 6) == 0) {
+      std::memset(route.backupNextHopMac, 0, 6);
+      route.backupLearnedMs = 0;
     }
-    if (item.hasMac) {
-      NeighborEntry* neighbor = findNeighbor(item.mac);
-      if (neighbor != nullptr) {
-        updateNeighborTxEtx(neighbor, item.success);
+    if (std::memcmp(route.nextHopMac, item.mac, 6) == 0) {
+      std::memset(route.nextHopMac, 0, 6);
+      if (isRouteLegValid(route.backupNextHopMac, route.backupLearnedMs, now)) {
+        promoteBackup(&route, now);
+      } else {
+        route = RouteEntry{};
+        ++stats_.routeExpired;
       }
     }
-    processed++;
   }
+}
+
+void EspNowMesh::processTxResultQueue() {
+  if (txResultQueue_ == nullptr) return;
+  TxResultItem item{};
+  while (xQueueReceive(txResultQueue_, &item, 0) == pdTRUE) recordTxResult(item);
 }
 
 void EspNowMesh::processRxQueue() {
@@ -508,6 +521,14 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
     return;
   }
 
+  if (header.originId == nodeId_) {
+    ++stats_.droppedDuplicates;
+    return;
+  }
+  if (!validMeshBody(header.type, body, bodyLen)) {
+    ++stats_.rxParseErrors;
+    return;
+  }
   const uint32_t nowMs = millis();
   pruneRoutingTables(nowMs);
 
@@ -612,9 +633,12 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   bool forwarded = false;
   if (routedFrame && routedMeta.dstNodeId != 0 && routedMeta.dstNodeId != nodeId_ && LPWA_ROUTING_MODE >= 2) {
     RouteEntry route{};
-    if (selectRoute(routedMeta.dstNodeId, &route)) {
+    if (selectRoute(routedMeta.dstNodeId, &route) &&
+        std::memcmp(route.nextHopMac, item.senderMac, 6) != 0) {
       stats_.routeLookupHit++;
       for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+        if (attempt > 0 && !selectRoute(routedMeta.dstNodeId, &route)) break;
+        if (std::memcmp(route.nextHopMac, item.senderMac, 6) == 0) break;
         stats_.routedUnicastAttempts++;
         if (sendRawUnicast(route.nextHopMac, forwardBuffer, item.len)) {
           stats_.routedUnicastSuccess++;
@@ -635,6 +659,7 @@ void EspNowMesh::processFrame(const RxQueueItem& item) {
   }
 
   if (!forwarded && !(routedFrame && routedMeta.dstNodeId == nodeId_)) {
+    delay(randomDelayMs(kForwardJitterMinMs, kForwardJitterMaxMs));
     for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
       if (sendRawBroadcast(forwardBuffer, item.len)) {
         forwarded = true;
@@ -670,6 +695,7 @@ bool EspNowMesh::parseHeader(const uint8_t* data, size_t len, MeshFrameHeader* o
     return false;
   }
 
+  if (!validMeshEnvelope(outHeader->originId, outHeader->ttl, outHeader->hops)) return false;
   *outBody = data + sizeof(MeshFrameHeader);
   *outBodyLen = len - sizeof(MeshFrameHeader);
   return true;
@@ -1083,31 +1109,35 @@ bool EspNowMesh::sendRawUnicast(const uint8_t* mac, const uint8_t* data, size_t 
 }
 
 bool EspNowMesh::sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len) {
-  if (mac == nullptr) {
-    return false;
-  }
-  if (data == nullptr || len == 0 || len > kEspNowMaxPayload) {
-    return false;
-  }
-
-  stats_.txFrames++;
+  if (!ready_ || mac == nullptr || data == nullptr || len == 0 || len > kEspNowMaxPayload) return false;
+  processTxResultQueue();  // drain a late callback before allowing another TX
+  if (txAwaiting_) return false;
   const uint8_t maxAttempts = static_cast<uint8_t>(kSendRawNoMemRetries + 1U);
-  esp_err_t result = ESP_FAIL;
   for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
-    result = esp_now_send(mac, data, len);
+    txAwaiting_ = true;
+    txStartedMs_ = millis();
+    const esp_err_t result = esp_now_send(mac, data, len);
     if (result == ESP_OK) {
-      return true;
+      ++stats_.txFrames;
+      TxResultItem item{};
+      // Do NOT pump RX here: forwarding could recursively submit a second TX.
+      // Only one frame is outstanding, so callback status identifies this frame.
+      if (xQueueReceive(txResultQueue_, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        recordTxResult(item);
+        return item.success;
+      }
+      ++txCallbackTimeouts_;
+      return false;  // remain quarantined until late callback or stall restart
     }
-    if (result != ESP_ERR_ESPNOW_NO_MEM || (attempt + 1) >= maxAttempts) {
-      break;
+    txAwaiting_ = false;
+    if (result != ESP_ERR_ESPNOW_NO_MEM || attempt + 1 >= maxAttempts) {
+      if (result == ESP_ERR_ESPNOW_NO_MEM) ++stats_.txNoMemDrops;
+      ++stats_.txFailed;
+      return false;
     }
-    stats_.txNoMemRetries++;
-    cooperativeDelay(kSendRawNoMemBackoffMinMs, kSendRawNoMemBackoffMaxMs);
+    ++stats_.txNoMemRetries;
+    delay(randomDelayMs(kSendRawNoMemBackoffMinMs, kSendRawNoMemBackoffMaxMs));
   }
-  if (result == ESP_ERR_ESPNOW_NO_MEM) {
-    stats_.txNoMemDrops++;
-  }
-  stats_.txFailed++;
   return false;
 }
 
@@ -1140,8 +1170,7 @@ uint8_t EspNowMesh::adaptiveAttemptBudget(uint8_t baseAttempts) const {
   }
   if (queued >= kAdaptiveQueueHighWater && attempts > 1) {
     attempts = static_cast<uint8_t>(attempts - 1);
-  } else if (queued <= kAdaptiveQueueLowWater && attempts < kAdaptiveAttemptMax) {
-    attempts = static_cast<uint8_t>(attempts + 1);
+
   }
   if (attempts == 0) {
     attempts = 1;
@@ -1269,6 +1298,7 @@ void EspNowMesh::pruneRoutingTables(uint32_t nowMs) {
       continue;
     }
     if ((nowMs - n.lastSeenMs) > kNeighborExpireMs) {
+      (void)esp_now_del_peer(n.mac);
       n = NeighborEntry{};
     }
   }
@@ -1308,7 +1338,9 @@ void EspNowMesh::learnRouteFromFrame(uint32_t originId, const uint8_t* senderMac
     return;
   }
   neighbor->lastSeenMs = nowMs;
-  const int16_t sampleQ8 = static_cast<int16_t>(static_cast<int16_t>(rssi) << 8);
+  // Arduino 2 / IDF 4 callbacks have no RSSI: zero is unknown, NOT 0 dBm.
+  if (rssi == 0) rssi = -85;
+  const int16_t sampleQ8 = static_cast<int16_t>(static_cast<int16_t>(rssi) * 256);
   if (neighbor->rssiEwmaQ8 == 0) {
     neighbor->rssiEwmaQ8 = sampleQ8;
   } else {

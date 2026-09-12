@@ -1,180 +1,43 @@
-# architecture.md
+# 現在の設計 — Mesh Lab
 
-## 1. 目的と前提
-- 目的: XIAO ESP32C3を3台使い、P2P通信からメッシュ通信へ段階的に拡張する
-- 重点:
-  - 障害物環境で50〜100m級の安定通信を目指す
-  - 見通し環境では長距離化の可能性を評価する
-- 前提:
-  - 2.4GHz帯のみ使用
-  - ノードは電池駆動またはUSB給電
-  - 将来的なノード増加を想定
-  - 現行実装は `ESP-NOW Hybrid Mesh`（`next-hop unicast + flood fallback + TTL + 重複排除 + 分割再構成`）を採用
-  - BLEは広告ベースの軽量テキスト中継（短文のみ）を採用
+本書はC3/S3/C6対応・Mesh Lab UIへの変更後の設計です。旧版の「LRが既定ON」「省電力OFFをBLEと無条件併用」「送信API受付=配達成功」という説明は使用しません。
 
-## 2. 設計方針
-- 方針1: まず単純構成で成功率を上げる
-  - `Wi-Fi UDP` で基本疎通を確認
-  - 次に `ESP-NOW` のP2Pへ移行
-- 方針2: メッシュ化は制御要素を明確化
-  - `TTL`（中継段数制御）
-  - `Packet ID`（重複排除）
-  - `ACK/再送`（信頼性）
-- 方針3: 距離拡張はリンク設計と運用設計の両方で行う
-  - 外部アンテナ、設置位置、送信間隔、チャンネル固定をセットで最適化
+## データ経路
 
-## 3. 通信レイヤーの使い分け
+`Browser → localhost Python → USB JSONL → ESP-NOW Hybrid Mesh → remote firmware → optional remote PC`
 
-| レイヤー | 主用途 | 利点 | 制約 |
-|---|---|---|---|
-| Wi-Fi STA/AP + UDP | 初期検証、ロギング | 実装容易、デバッグ容易 | AP依存またはSoftAP負荷 |
-| ESP-NOW | 低オーバーヘッドP2P | 接続処理なし、高速応答 | チャンネル管理が必要 |
-| ESP-WIFI-MESH | IPベース拡張 | 既存ネットワークとの連携が容易 | 実装と運用がやや重い |
-| ESP-BLE-MESH | 低電力・制御通知 | BLE資産を活用可能 | スループットが低い |
+Windows/macOS/LinuxのUIは同じPythonパッケージ `pc_app/mesh_lab` とローカルHTML/CSS/JSを使用します。127.0.0.1へのbind、ランダムな起動トークン、Host/Origin検証、CSP、HTTP body上限を持ちます。LAN公開・リモート管理サーバーではありません。ビルド・書き込みはallowlist内の環境を `subprocess` の引数リストで呼び、シェル文字列を実行しません。
 
-## 4. 推奨トポロジー（3台起点）
-- NodeA: ゲートウェイ候補（PC接続優先）
-- NodeB: リレー候補（中継専任）
-- NodeC: エッジ候補（遠端設置）
+## 無線
 
-通信例:
-- 近距離: `A <-> B`, `B <-> C`
-- 遠距離: `A -> B -> C` の2ホップ中継
+`platformio.ini` に通常/LR/BLE共存×C3/S3/C6の9環境を定義します。通常は1Mbps、LRは250kbpsをESP-NOW送信レートAPIへ明示設定します。通常/LRはBLE停止、20MHz、省電力OFF。LRは認証確認を必要とする実験用の別構成です。電力の要求値は72 quarter-dBmで、読み戻しと要求を別フィールドに出します。実測電力は取得していません。
 
-## 5. メッセージフレーム（最小）
+C3/S3/C6それぞれSoC別のbinが必要ですが、固定幅整数・packed構造体・最大250bytesの既存wire形式を共有します。同一チャンネル/プロファイルを揃えます。SDKを変更する場合は、受信/送信コールバック型・rate API・peer APIを含めて6環境すべてを再検証します。
 
-| フィールド | 型 | 説明 |
-|---|---|---|
-| `version` | uint8 | プロトコル版数 |
-| `msg_type` | uint8 | DATA/ACK/BEACON/CONTROL |
-| `src_id` | uint16 | 送信元ノードID |
-| `dst_id` | uint16 | 宛先ノードID（ブロードキャスト予約値あり） |
-| `seq` | uint16 | 送信シーケンス |
-| `ttl` | uint8 | 中継残り回数 |
-| `hop` | uint8 | 通過ホップ数 |
-| `payload_len` | uint8 | ペイロード長 |
-| `payload` | bytes | 本文 |
-| `crc` | uint16 | フレーム検証用 |
+## 中継と送信結果
 
-## 6. 中継制御の要点
-- 重複排除:
-  - キー: `src_id + seq`
-  - 期限付きキャッシュを保持
-- 中継条件:
-  - `ttl > 0` のときのみ転送
-  - 受信時に `ttl--`、`hop++`
-- ACK/再送:
-  - 宛先指定Wi-Fi (`dst` 指定) の `chat` / `long_text_*` / `reliable_1k_*` 制御パケットは `need_ack=true` + `e2e_id` を付与
-  - 受信ノードは `delivery_ack` を送信元へ返し、PC GUIは `e2e_id` で照合して完了判定する
-  - GUI再送ポリシー:
-    - timeout: 2200ms
-    - max retry: 4（合計5送信）
-  - Broadcast送信とBLE送信は `delivery_ack` 対象外
+経路は受信元から学習し、primary/backupを保持します。次ホップunicastに失敗した場合は再送とflood fallbackへ進みます。連続MAC失敗でその隣接ノードを使う経路を失効し、予備経路があれば昇格します。中継パケットを直前の送信元へ即座に返しません。TTL・期限付き重複排除・geometry検証・分割再構成で制限をかけます。これはループフリー経路や収束時間の数学的保証ではありません。
 
-## 6.1 長距離向け既定プロファイル（現行実装）
-- ノードごとの個別設定なしで同一ファームを配布して使用する前提
-- ESP-NOW初期化時に以下を自動適用:
-  - `esp_wifi_set_max_tx_power(72)`（18dBm相当、法規/実装制限に依存）
-  - `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)`（BLE共存時の安定運用）
-  - `esp_wifi_set_protocol(...11b/11g/11n)`（既定）
-  - `long_range` は build flag 条件を満たす場合のみ有効化可
-  - 送信フレームのオリジン側リピート送信（既定4回, robust mode）
-  - オリジン再送間隔と中継転送間隔のランダムジッタ（衝突確率低減）
-  - NodeInfo周期の延長（10s→15s）で常時オーバーヘッド抑制
-  - NodeInfo送信タイミングの個体ジッタ化（同時送信バースト緩和）
-  - フレーム種別ごとの中継再送回数（Fragment=4 / NodeInfo=1）
-  - `esp_now_send` の `NO_MEM` 時に短いバックオフ再試行
-  - `trace_obs` は `TTL=3` + 最短送信間隔（120ms）でテレメトリ過負荷を抑制
-  - `adaptiveAttemptBudget` によりRXキュー水位を見て再送回数を自動調整
-  - 送信待機は cooperative delay（待機中にRX処理を継続）で輻輳時の詰まりを緩和
-- 補足:
-  - 必要に応じて `platformio.ini` の build flag で切替可能
-    - `LPWA_ENABLE_WIFI_LR`（0/1）
-    - `LPWA_ALLOW_WIFI_LR_WITH_BLE`（0/1）
-    - `LPWA_MESH_CHANNEL`（1..14）
-    - `LPWA_MESH_TX_POWER_QDBM`（8..84）
-    - `LPWA_ROUTING_MODE`（0=floodのみ / 1=origin directed / 2=origin+relay directed）
-  - 実行中に `set_radio_profile`（balanced/long_range/coexist）で切替可能
-  - ただし `LPWA_ALLOW_WIFI_LR_WITH_BLE=0` かつ BLE relay有効ビルドでは `long_range` は `unsupported_profile` となる
-  - `set_nodeinfo_cfg` で NodeInfo の `ttl/period_ms` を調整可能
+`sendRawTo` は同時に1送信だけを許し、実際の送信コールバックを最大1秒待ちます。コールバック待ちでは再帰的なRX中継を実行しません。欠落時は送信を保留したままにし、遅着の結果を別フレームに割り当てません。10秒以上停止した場合は診断を出して再起動します。APIの即時NO_MEMは短いバックオフで上限付き再試行します。
 
-## 6.2 Phase2: 経路学習と次ホップ転送
-- Directed送信時は `RoutedFragment` を使用し、宛先ノードIDをフレームメタに付与する。
-- 各ノードは受信フレームから `origin -> next_hop` を学習し、経路表を保持する。
-- ルーティング指標は `hop + ETX + RSSI` の重み付き合成とし、ヒステリシスで経路フラップを抑制する。
-- 中継時の動作:
-  - ルート有り: 次ホップへ unicast 転送
-  - ルート無し/失敗: 同一attempt内で即座に flood fallback
-- 経路表は `primary + backup` の2経路を保持し、primary失効時はbackupへ昇格する。
-- 安全策:
-  - 期限切れ経路の自動削除
-  - ルート失効は `sendRawUnicast()` 戻り値では判定しない（MAC送信コールバック由来での誤失効を回避）
-  - フラグメント整合チェック（`frag_count/index/chunk_len/total_len`）
-  - hopカウントとメトリック計算の飽和処理（オーバーフロー回避）
+unicastのMAC成功は次ホップ到着の根拠ですが、最終宛先への到着ではありません。broadcastのMAC完了は受信ノードの存在すら保証しません。最終配達は `delivery_ack`、Pingは対応する遠端Pongで確認します。
 
-補足:
-- JSONプロトコルの `dst` は `0xXXXXXXXX` 形式のみを有効とする。
-- 不正な `dst` は bridge が `invalid_field` を返し、暗黙Broadcastへはフォールバックしない。
+NodeInfoは15秒+ジッタ、TTL3。既定データTTL6。通常の反復と中継反復を抑え、RXキューが空だからという理由で反復を増やしません。期限切れ隣接エントリとSDK peerを削除します。SDKの同時peer数上限と内部のノード記録数は同じではなく、大規模ネットワークの容量保証ではありません。
 
-## 6.3 Phase3: 1KB高信頼転送（`reliable_1k`）
-- `reliable_1k_start/chunk/end` をWi-Fi directedで送信し、`delivery_ack` でE2E配達を確認する。
-- 受信側は `data_shards + parity_shards` のFECシャードから復元し、欠損時は `reliable_1k_nack` で不足indexを返す。
-- 送信側は `reliable_1k_repair` で不足シャードのみ再送し、復元完了時に `reliable_1k_result` を返してセッションを閉じる。
-- 互換運用:
-  - wire上は短縮型 (`r1k_s/r1k_d/r1k_e/r1k_n/r1k_r/r1k_o`) を利用
-  - PC/JSONイベントは正規型 (`reliable_1k_*`) として統一表示
+## 観測の正確さ
 
-## 6.4 Phase4: 自動適応と観測
-- PC GUIは宛先ごとに `25+8` / `25+10` のprofileを自動調整する。
-  - 失敗/NACK増加/高再送率: 冗長を強化
-  - 連続安定時: 冗長を段階的に緩和
-- 統計は `ReliableStats` で一元集計する。
-  - 復元率
-  - 再送率
-  - 失敗理由トップ
-  - 使用profile
-- `mesh_trace` / `mesh_observed` で複数PCから同じ通信観測を共有し、トポロジと通信フローを同期表示する。
+Arduino 2 / IDF 4の受信コールバックはRSSIを渡しません。0を未知として表示し、経路メトリックでは中立値として扱います。RSSI実測を代替していません。将来のSDK更新には実機検証が必要です。
 
-## 6.5 Phase5: 回帰と失敗解析
-- `prepare_test_session.ps1` が `session.json` を生成し、再現条件を固定化する。
-- `flash_all.ps1` は `flash_result.json` に `firmware_sha256` を保存する。
-- `run_mesh_regression.ps1 -StartMonitor` 指定時に `monitor_all.ps1` が起動され、`monitor_manifest.json` を生成して Node/COM/log 対応を記録する。
-- `mesh_smoke_test.py` は `session-dir/run-id/scenario` と拡張thresholdをサポートする。
-- `mesh_smoke_test.py` は `--require-delivery-ack` 指定で delivery_ack欠落を失敗扱いにする。
-- `run_mesh_regression.ps1` は既定で `--require-delivery-ack` を付与し、回帰では逆方向ACK経路も検証する。
-- `run_mesh_regression.ps1` は smoke失敗時もフォールバックsummaryを生成し、`triage_mesh_failure.py` で失敗コードを自動分類する。
+GUIの実線は `via_node → observer` の観測された最後のリンクだけです。経路表の次ホップは破線。`dst` と `hops` が分かっても、未観測の中間ノードを勝手に結びません。経路45秒・観測リンク120秒で表示を失効し、ノードは最終観測60秒でstale表示します。Demoは固定の合成データで、通常接続へ自動混入しません。
 
-## 7. Wi-Fi/BLEメッシュの使い分け設計
-- Wi-Fiメッシュを優先する場面:
-  - センサーデータなど比較的大きいデータ転送
-  - IPネットワークと連携したい場合
-- BLEメッシュを優先する場面:
-  - 低頻度の制御コマンド
-  - 省電力運用を優先する場合
-- ハイブリッド案:
-  - 制御チャネル: BLE
-  - データチャネル: Wi-Fi/ESP-NOW
+## PC測定と文字列
 
-## 8. 障害時設計（運用）
-- 経路断:
-  - 近傍ノード探索を再実行し経路更新
-- ノード再起動:
-  - 起動後にBEACON送信し再参加
-- 干渉増加:
-  - チャンネル切替候補を事前定義し、試験中は固定、運用時に再選定
+JSONLは改行までバイトを保持し、UTF-8の分割受信を復元します。1行64KiB、送信キュー32、イベントキュー2048の上限を持ちます。部分書き込み後の再送は行頭から無条件に行わず、接続をエラーにして破損を混入させません。再接続時はgenerationを変え、旧ワーカーの遅着イベントを無視します。
 
-## 9. 今後の決定事項
-- 最終プロトコル:
-  - ESP-NOW自作メッシュを本命にするか
-  - 公式メッシュを併用するか
-- セキュリティ:
-  - 鍵更新周期
-  - ノード追加時のプロビジョニング手順
-- 品質指標:
-  - PDR（Packet Delivery Rate）目標
-  - 遅延上限
-  - 電池駆動時間目標
-## 9.1 Hop Telemetry Update
-- `pong` and `delivery_ack` now carry `request_hops` in their payload. This is the forward-path hop count observed at the responder.
-- PC/serial receive events keep `hops` for backward compatibility and also mirror the return-path hop count into `reply_hops`.
-- `trace_obs` / `mesh_trace` / `mesh_observed` forward these fields so forward/return hop asymmetry can be inspected from logs and topology tools.
+Pingは宛先ID+ping_idで照合し、PCの単調時計でRTTを測定します。local ACKは成功率に使いません。1件ずつ応答/期限を待つ方式で、未確定件数と損失を分けます。`probe_hash_ok=false` は失敗です。停止/切断は残った試行を取消とし、勝手に再開しません。
+
+メッセージは最大8192 UTF-8 bytes、長文は32bytesずつstop-and-wait。E2E IDを保った上限付き再送、受信側のSHA-256確認を使います。ACKは遠端ファームウェアが返すため、PCへの保存保証とは異なります。FEC/BLE専用画面は互換用 `legacy_app.py` に保持しています。
+
+## 未完の製品要件
+
+実RFでのC3/S3相互運用、長距離・遮蔽・混雑・中継断・電源断耐性、長時間の送受信負荷、macOS実機USB書き込みは受入試験が必要です。無線認証/暗号、鍵管理、OTA、端末追加手順は製品用途の完成要件として残ります。本PRを長距離保証・本番完成の代わりにしません。

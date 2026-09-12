@@ -1,7 +1,9 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
 #include <esp_now.h>
+#include <esp_idf_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -47,6 +49,7 @@ class EspNowMesh {
   bool resolveNodeIdByMac(const uint8_t* mac, uint32_t* outNodeId) const;
   uint32_t nodeId() const { return nodeId_; }
   bool setRadioProfile(RadioProfile profile);
+  void writeRadioStatus(Stream& output) const;
   RadioProfile radioProfile() const { return radioProfile_; }
   void setNodeInfoConfig(uint8_t ttl, uint32_t periodMs);
 
@@ -73,6 +76,7 @@ class EspNowMesh {
     uint16_t txOk = 0;
     uint16_t txFail = 0;
     uint16_t etxQ8 = 256;
+    uint8_t consecutiveTxFailures = 0;
   };
 
   struct RouteEntry {
@@ -91,7 +95,11 @@ class EspNowMesh {
   };
 
   static EspNowMesh* instance_;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+  static void onSendStatic(const esp_now_send_info_t* tx_info, esp_now_send_status_t status);
+#else
   static void onSendStatic(const uint8_t* mac_addr, esp_now_send_status_t status);
+#endif
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   static void onRecvStatic(const esp_now_recv_info_t* info, const uint8_t* data, int len);
 #else
@@ -104,6 +112,7 @@ class EspNowMesh {
   bool enqueueRx(const uint8_t* mac_addr, int8_t rssi, const uint8_t* data, size_t len);
   bool enqueueTxResult(const uint8_t* mac_addr, bool success);
   void processTxResultQueue();
+  void recordTxResult(const TxResultItem& item);
   void processRxQueue();
   void processFrame(const RxQueueItem& item);
 
@@ -154,6 +163,13 @@ class EspNowMesh {
   bool upsertNode(uint32_t nodeId, NodeRecord** outNode);
   NodeRecord* findNode(uint32_t nodeId);
 
+  bool ready_ = false;
+  bool txAwaiting_ = false;
+  uint32_t txStartedMs_ = 0;
+  uint32_t txCallbackTimeouts_ = 0;
+  uint16_t radioRateKbps_ = 1000;
+  std::atomic<uint32_t> callbackRxDrops_{0};
+  std::atomic<uint32_t> callbackTxDrops_{0};
   QueueHandle_t rxQueue_ = nullptr;
   QueueHandle_t txResultQueue_ = nullptr;
   DuplicateFilter duplicateFilter_;

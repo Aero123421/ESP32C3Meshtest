@@ -727,12 +727,7 @@ void SerialJsonBridge::handleLine(const char* line) {
       emitError("mesh_unavailable", "mesh not initialized");
       return;
     }
-    DynamicJsonDocument out(256);
-    out["event"] = "radio_profile";
-    out["type"] = "radio_profile";
-    out["profile"] = radioProfileName(mesh_->radioProfile());
-    serializeJson(out, *serial_);
-    serial_->println();
+    mesh_->writeRadioStatus(*serial_);
     return;
   }
 
@@ -920,7 +915,7 @@ void SerialJsonBridge::handleLine(const char* line) {
   }
 
   if (cmd == "get_nodes") {
-    DynamicJsonDocument out(2048);
+    DynamicJsonDocument out(12288);
     out["event"] = "nodes";
     out["type"] = "node_list";
 
@@ -940,7 +935,11 @@ void SerialJsonBridge::handleLine(const char* line) {
         }
         node["node_id"] = formatNodeId(records[i].nodeId);
         node["last_seen_ms"] = records[i].lastSeenMs;
-        node["rssi"] = records[i].lastRssi;
+        node["rssi_known"] = (records[i].lastRssi != 0);
+        if (records[i].lastRssi != 0) node["rssi"] = records[i].lastRssi;
+        else node["rssi"] = nullptr;
+        node["age_ms"] = millis() - records[i].lastSeenMs;
+        node["is_self"] = records[i].nodeId == mesh_->nodeId();
         node["uptime_sec"] = records[i].uptimeSec;
         node["free_heap"] = records[i].freeHeap;
         node["remote_rx_frames"] = records[i].remoteRxFrames;
@@ -961,7 +960,7 @@ void SerialJsonBridge::handleLine(const char* line) {
   }
 
   if (cmd == "get_routes") {
-    DynamicJsonDocument out(4096);
+    DynamicJsonDocument out(24576);
     out["event"] = "routes";
     out["type"] = "route_list";
 
@@ -992,6 +991,7 @@ void SerialJsonBridge::handleLine(const char* line) {
       }
       out["count"] = exported;
       out["total"] = count;
+      out["truncated"] = exported < count;
     } else {
       out["count"] = 0;
       out["total"] = 0;

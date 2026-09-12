@@ -1,207 +1,156 @@
-# LPWAtestESP32
+# Mesh Lab — XIAO ESP32-C3 / ESP32-S3 / ESP32-C6
 
-ESP32-C3（XIAO ESP32C3）を複数台使って、  
-Wi-Fi（ESP-NOW）メッシュ + BLE短文リレー + PC GUI試験を行うプロジェクトです。
+ESP-NOWの1ホップ・多段中継を比較するためのファームウェアと、Windows / macOS / Linux用ローカル試験アプリです。APへの接続を前提にする通常のWi-Fiアプリではなく、**ESP-NOW上の独自Hybrid Mesh**です。リポジトリの旧名・ログ内の `LPWAtestESP32` / `lpwa` は互換性のため一部残っています。
 
-## 1. このリポジトリでできること
+> **ビルド成功は、長距離通信成功や技適への適合を証明しません。** この変更でC3/S3/C6の無線設定と中継の不具合を修正し、実測用の道具を整備しています。実際の到達距離、C3⇄S3混在通信、障害時の復旧性能は [実機受入試験](docs/field_validation.md) で別途確認してください。既存レポートには距離・設置条件が記録されておらず、100m/数百mの実証として扱えません。
 
-- ESP-NOW Hybridメッシュ（次ホップunicast + flood fallback、TTL中継、重複排除、分割再構成）
-- 宛先指定Wi-Fiメッセージの `delivery_ack` + 自動再送（chat / long_text）
-- 1000文字級メッセージ向けの長文チャンク送信（`long_text_start/chunk/end`）
-- 1KB高信頼プロファイル（`reliable_1k_start/chunk/end + nack/repair/result`）
-- BLE広告ベースの短文リレー（テキスト数バイト向け）
-- Python GUIでのチャット、Ping試験、PDR/遅延統計
-- Python GUIでの中継系統図（tree）/通信フロー（flow）可視化
-- `mesh_trace` による観測共有（複数PCでトポロジ同期しやすい構成）
-- 堅牢寄り既定プロファイル（11b/11g/11n、送信電力・再送/ジッタ最適化）
-- PlatformIO（VSCode）からの書き込み・シリアル監視
-- 3台構成の基本試験スクリプト実行
+## 何が変わったか
 
-## 2. ディレクトリ構成
+通常ビルドは **BLE停止・ESP-NOW 1Mbps明示設定・20MHz・省電力OFF**。LRは別ビルドで **250kbpsを明示設定**します。単に `WIFI_PROTOCOL_LR` を追加しただけの構成ではありません。無線APIの戻り値を確認し、設定の読み戻しをシリアルと画面へ出力します。日本向けcountry設定は `JP`、チャンネルは1〜13に制限しています。
 
-- `src/`, `include/`: ESP32-C3ファームウェア
-- `pc_app/`: PC GUIアプリ（tkinter）
-- `tools/`: 書き込み・監視・試験補助スクリプト
-- `docs/`: 設計、調査、手順、試験記録
-- `AGENTS.md`: 開発/運用ルール
+中継は次ホップunicast、予備経路、flood fallback、TTL、重複排除、分割・再構成を使用します。`esp_now_send()` の受付成功とMAC送信完了を区別し、実際のMAC失敗で再送・経路失効・迂回へ進みます。送信は同時に1件のみ。コールバック欠落時は次の送信との混同を防ぎ、長時間停止時に再起動します。過剰な反復送信、送信元へ戻る中継、期限切れpeerの蓄積、破損フレームの早期処理、負数のシフトも修正しています。
 
-## 3. 前提環境
+新アプリはブラウザーUI＋Pythonのlocalhostサーバーです。クラウド不要、Tk/Qt不要、外部CDN不要。接続マップ、ノード詳細、経路表、Ping試験、配達ACK付き短文/長文、ビルド・書き込み、試験条件記録、JSONセッション保存を備えます。観測していないホップを推測で描きません。
 
-- Windows 10/11
-- Python 3.10+
-- VSCode + PlatformIO IDE
-- `pyserial`（`python -m pip install pyserial` または `python -m pip install -r pc_app\requirements.txt`）
-- XIAO ESP32C3 x 3（最低1台はPC直結、他はUSB給電でも可）
+## 1. セットアップ
 
-PowerShell 実行ポリシーで `.ps1` がブロックされる場合は、実行セッション内だけ一時的に次を実行してください。
+Python **3.10以上**を使用します。CIではPython 3.12をWindows/macOS/Linuxで検証します。初回のパッケージ導入、PlatformIOのツールチェーン導入にはインターネット接続が必要です。
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+macOS / Linux（リポジトリ直下）:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r pc_app/requirements.txt platformio==6.1.18
+python pc_app/app.py
 ```
 
-## 4. クイックスタート（ファーム）
-
-### 4.1 ビルド
+Windows PowerShell:
 
 ```powershell
-cd D:\codebase\LPWAtestESP32
-python -m platformio run
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r pc_app\requirements.txt platformio==6.1.18
+.\.venv\Scripts\python.exe pc_app\app.py
 ```
 
-### 4.2 3台へ一括書き込み
+ブラウザーが自動で開きます。起動時に表示するURLにはローカル操作用の一時トークンが含まれます。URLを共有せず、サーバーをLAN公開・ポート転送しないでください。終了はターミナルで `Ctrl+C`。同じPCのブラウザーだけから操作できます。
 
-```powershell
-cd D:\codebase\LPWAtestESP32
-.\tools\flash_all.ps1 -Ports COM6,COM7,COM8 -SessionDir .\test_logs\session_20260304
+```sh
+python pc_app/app.py --demo          # 明示的な読み取り専用サンプル。実測値ではない
+python pc_app/app.py --no-browser    # URLだけ表示
+python pc_app/app.py --help
 ```
 
-`-Ports` は1台以上の可変長指定に対応しています（例: 10台）。
-PowerShellからは `-Ports COM6,COM7,COM8` と `-Ports @("COM6","COM7","COM8")` の両方を利用できます。
+macOSは `/dev/cu.usbmodem...` / `/dev/cu.usbserial...` を選択します。Windowsは `COM...`、Linuxは `/dev/ttyACM...` / `/dev/ttyUSB...`。Linuxで権限エラーになる場合はディストリビューションのシリアルポート権限を設定してください。別のシリアルモニターと同じポートを同時に開かないでください。
 
-`pio` が PATH にある場合は自動で `pio` を使用し、無い場合は `python -m platformio` にフォールバックします。
+## 2. C3/S3/C6のビルドは別々
 
-### 4.3 3台同時モニタ
+**C3/S3/C6で同じ `.bin` は使えません。** C3/C6はRISC-V、S3はXtensaです。C6はESP-IDF 5.1+が必要なため、このrepoではSeeedのPlatformIO platformをcommit固定してArduino 3.xでビルドします。同じソースを、対象ボードに応じてビルドします。CPUの違いは無線互換性を妨げませんが、GPIO・USB・メモリ設定の違いは残ります。
 
-```powershell
-cd D:\codebase\LPWAtestESP32
-.\tools\monitor_all.ps1 -Ports COM6,COM7,COM8 -Baud 115200 -SessionDir .\test_logs\session_20260304
+| ビルド環境 `-e` | ボード | 無線プロファイル | BLE |
+|---|---|---|---|
+| `seeed_xiao_esp32c3` | XIAO C3 | 通常 / 1Mbps | OFF |
+| `seeed_xiao_esp32s3` | XIAO S3 | 通常 / 1Mbps | OFF |
+| `seeed_xiao_esp32c6` | XIAO C6 | 通常 / 1Mbps | OFF |
+| `seeed_xiao_esp32c3_lr` | XIAO C3 | LR / 250kbps（実験用） | OFF |
+| `seeed_xiao_esp32s3_lr` | XIAO S3 | LR / 250kbps（実験用） | OFF |
+| `seeed_xiao_esp32c6_lr` | XIAO C6 | LR / 250kbps（実験用） | OFF |
+| `seeed_xiao_esp32c3_coexist` | XIAO C3 | 通常 / BLE共存 | ON |
+| `seeed_xiao_esp32s3_coexist` | XIAO S3 | 通常 / BLE共存 | ON |
+| `seeed_xiao_esp32c6_coexist` | XIAO C6 | 通常 / BLE共存 | ON |
+
+```sh
+python -m platformio run -e seeed_xiao_esp32c3
+python -m platformio run -e seeed_xiao_esp32s3
+python -m platformio run -e seeed_xiao_esp32c6
+python -m platformio run -e seeed_xiao_esp32c3_lr
+python -m platformio run -e seeed_xiao_esp32s3_lr
+python -m platformio run -e seeed_xiao_esp32c6_lr
 ```
 
-ログを保存する場合:
+書き込み（ポートを現物に合わせて変更）:
 
-```powershell
-.\tools\monitor_all.ps1 -Ports COM6,COM7,COM8 -Baud 115200 -LogDir .\test_logs\session_20260303
+```sh
+# macOS: C3
+python -m platformio run -e seeed_xiao_esp32c3 -t upload --upload-port /dev/cu.usbmodemXXXX
+# macOS: S3
+python -m platformio run -e seeed_xiao_esp32s3 -t upload --upload-port /dev/cu.usbmodemYYYY
+# Windows: S3
+python -m platformio run -e seeed_xiao_esp32s3 -t upload --upload-port COM7
 ```
 
-## 5. PC GUIアプリ
+S3でポートが見えない/書き込めない場合は、データ対応USBケーブルを確認し、BOOTを押しながらRESETしてダウンロードモードへ入り、列挙し直したポートを選択します。USBポート名は書き込み・リセットの前後で変わる場合があります。`--force` で別チップ用binを書かないでください。
 
-```powershell
-cd D:\codebase\LPWAtestESP32\pc_app
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
+成果物は `.pio/build/<環境>/firmware.bin`。これはアプリ領域のbinで、単独では初回書き込みに必要なbootloader/partition tableを含みません。原則PlatformIOのuploadを使ってください。CIのファームウェアビルドはUbuntuで実施し、macOS実機でのUSB書き込み・ローカルコンパイルは別途検証対象です。
+
+## 3. C3/S3/C6はGPIO番号が違う
+
+XIAOの端子名・配置が似ていても、**数値GPIOの直書きは互換ではありません**。
+
+| XIAO端子 | C3のGPIO | S3のGPIO | C6のGPIO |
+|---|---:|---:|---:|
+| D0 | 2 | 1 | 0 |
+| D1 | 3 | 2 | 1 |
+| D2 | 4 | 3 | 2 |
+| D3 | 5 | 4 | 21 |
+| D4 / SDA | 6 | 5 | 22 |
+| D5 / SCL | 7 | 6 | 23 |
+| D6 / TX | 21 | 43 | 16 |
+| D7 / RX | 20 | 44 | 17 |
+| D8 / SCK | 8 | 7 | 19 |
+| D9 / MISO | 9 | 8 | 20 |
+| D10 / MOSI | 10 | 9 | 18 |
+
+この表は通常のXIAO ESP32C3 / ESP32S3向けです。S3 Plus、拡張基板、別メーカーのDevKitへそのまま流用しないでください。Arduinoでは `D6` / `SDA` などのボード定義を優先し、周辺機能、ストラップピン、電源条件は個別に確認します。現在のメッシュ基本試験はUSB給電/シリアル中心で、外部GPIO接続を必要としません。
+
+### XIAO ESP32-C6のアンテナ切替
+
+C6はRF switchを内蔵しています。このrepoのC6環境は安全側で**オンボードアンテナを既定**にします。外部U.FLを使う場合は、対象アンテナ/構成の認証条件を確認した上でC6環境の `LPWA_XIAO_C6_EXTERNAL_ANTENNA=0` を `1` に変更してください。ファームはGPIO3をLowにしてRF switch制御を有効化し、GPIO14 Low=内蔵 / High=外部を選択します。
+
+## 4. 長距離試験と日本国内の運用
+
+LRを利用する場合は、**ボード・アンテナ・無線方式を含む認証範囲を確認**してください。通常Wi-Fiの技適表示だけから、任意のアンテナやLRの適法性を断定しません。Seeedの指定アンテナ以外、任意の高利得アンテナ、外付け増幅器を前提にしません。
+
+全ノードを同じチャンネル・プロファイルに揃えます。C3通常＋S3 LRを無条件に混在させる手順は推奨しません。既存ファームとの無線互換性も、同一設定での実機確認が必要です。
+
+```sh
+python -m platformio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
 ```
 
-バッチで `venv` 作成から実行する場合:
+接続後に `{"cmd":"get_radio_profile"}` を送ると、`ready`、`chip`、`profile`、`channel`、`bandwidth_mhz`、`lr_enabled`、`power_save`、`tx_power_requested_qdbm`、`tx_power_readback_qdbm`、`readback_ok` が分かります。`espnow_rate_kbps` は送信APIが受理した設定値で、空中で測定したPHYレートではありません。
 
-```powershell
-cd D:\codebase\LPWAtestESP32\pc_app
-.\setup_and_run_gui.bat
+送信電力の既定要求は `72` quarter-dBm = 18dBm。これは最大値を要求するAPIの設定であり、実際の空中線電力・EIRPではありません。**84を指定すれば21dBmになる、という扱いはしません。** SDKの段階化、地域、PHY、認証条件の制約を受けます。距離保証に換算しないでください。
+
+固定ツールチェーンはPlatformIO Espressif32 6.10.0 / Arduino 2.0.17系です。このSDKの通常ESP-NOW受信コールバックにはRSSIがないため、現在は **RSSI不明** と表示します。経路評価では不明値を中立扱いし、0dBmの良好リンクとして評価しません。受信RSSIが必須の試験は、別途取得実装・実機検証を追加してから行ってください。
+
+## 5. 新アプリでの測定
+
+上部でポートを選び接続します。トポロジの実線は受信時の隣接リンク、破線は接続ゲートウェイの経路表にある次ホップです。遠端までの全経路が観測できたことを意味しません。マップ位置は模式図で、GPS座標や距離ではありません。観測テレメトリの無線配信は既定OFFで、通信負荷を抑えています。
+
+通信テストでは遠端ノードを指定し、64/256/1000bytes、回数、間隔、応答期限、TTLを設定します。測定はstop-and-wait方式。応答期限内に対応する遠端Pongが届いた試行のみ成功です。ローカルACK、別ノード、別ID、重複、期限後の応答は成功を増やしません。停止時の未確定試行は損失から除外します。RTTはPCの送信キュー投入からPong受信までの、USB等を含む往復です。
+
+短文・長文は `delivery_ack` を待って送ります。長文はUTF-8バイト単位の分割とSHA-256確認を使用します。**配達ACKは相手ファームウェアの受信であり、相手PCの保存完了ではありません。** 旧アプリのFEC/NACK/repair専用ワークフローとBLE画面は `python pc_app/legacy_app.py` に残しています。新UIは通常の宛先指定テキストとPing試験を中心に再構成しています。
+
+試験前に場所、距離、アンテナ、設置高さ、障害物、電源を記録し、終了後に「セッションを保存」を押します。設定の読み戻し、試験開始時の条件、確定した試行、ログ、直近ビルドのbinハッシュを含めて保存します。ビルドのハッシュはその場で作成したbinのハッシュで、接続中ボードに書かれているbinを読み出して照合した値ではありません。
+
+## 6. 回帰と検証範囲
+
+```sh
+python -m pip install pytest==8.3.5
+python -m pytest -q tests
 ```
 
-セットアップのみ:
+CIはC3/S3×通常/LR/BLE共存の6ビルド、Pythonテストの3OS、ブラウザーJavaScript構文検査を行います。ネイティブC++ハーネスは実際の送信関数とフレーム検証コードをfake driverで検査します。無線到達距離や干渉・アンテナ性能のテストではありません。
 
-```powershell
-.\setup_and_run_gui.bat --setup-only
-```
+既存の実機スモークツールも残しています:
 
-GUI機能:
-
-- COM接続/切断
-- GUIからBuild / ファーム書き込み（選択COM / 複数選択）
-- 宛先入力の厳格化（`0xXXXXXXXX` のみ許可）
-- 用途別タブUI（通信 / 試験 / トポロジ / ログ / FW書込）
-- ノード一覧表示
-- chat送信（`wifi` / `ble` 切替）
-- 宛先指定Wi-Fi送信のE2E配達確認（`delivery_ack`）と自動再送
-- フェーズ2経路観測（GUIの「経路要求」→ `route_list` 取得）
-- フェーズ3/4向け Reliable 1KB 送信（復元率/再送率/自動profile適応）
-- 長文テキスト送信（一定サイズ超過時に自動チャンク化）
-- ping単発/連続試験（1KB `ping_probe`）
-- Broadcast Ping時の複数ノード応答をラウンド集計（遅延Pongを誤警告しにくい）
-- 試験タブ下部に通信品質グラフ（PDR/遅延/Loss）のリアルタイム表示（時間軸つき）
-- 通信品質の宛先フィルタ（`all` / ノード別）
-- 連続Ping中の `route_lookup_hit/miss` / `routed_fallback_flood` 可視化
-- トポロジ表示モード切替（`tree` / `flow` / `both`）
-- 通信フロー表（observer / via_node / path / hops / msg）表示
-- `route_list` 表示タブ（primary/backup/rank）
-- ログ保存
-
-詳細は `pc_app/README.md` を参照してください。
-
-## 6. テスト実行例
-
-### 6.1 2台間メッシュ試験（chat + ping、任意でBLE）
-
-```powershell
-cd D:\codebase\LPWAtestESP32
-python tools/two_port_mesh_test.py --tx COM6 --rx COM7 --timeout 25
-```
-
-BLEを省略する場合:
-
-```powershell
-python tools/two_port_mesh_test.py --tx COM6 --rx COM7 --timeout 25 --skip-ble
-```
-
-### 6.2 3ノード認識確認
-
-```powershell
-cd D:\codebase\LPWAtestESP32
-python tools/get_nodes_wait.py COM6 --timeout 30 --min-count 3
-```
-
-### 6.3 複数ノード smoke 試験
-
-```powershell
-cd D:\codebase\LPWAtestESP32
-python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 COM9 --timeout 35 --ack-timeout 4 --ack-retries 6 --collect-stats
-```
-
-BLE短文試験をスキップしてWi-Fi系だけ確認する場合:
-
-```powershell
+```sh
 python tools/mesh_smoke_test.py --ports COM6 COM7 COM8 --timeout 35 --ack-timeout 4 --ack-retries 6 --skip-ble
 ```
 
-この smoke には、宛先指定 `chat`/`ping` に加えて `long_text`（約1KB）チャンク送受信と
-`delivery_ack` 検証、および `Directed reliable_1k (FEC)` が含まれます。
+このプロジェクトは試験用です。ブロードキャストを含む無線認証・鍵管理は完成しておらず、第三者による偽装や観測を防ぐ製品向けセキュリティを保証しません。認証・製品受入検証を終えるまでは、保安操作・機密情報・無人の本番設備に使用しないでください。
 
-### 6.4 回帰一括実行（Phase5）
-
-```powershell
-cd D:\codebase\LPWAtestESP32
-.\tools\run_mesh_regression.ps1 -Ports COM6,COM7,COM8 -Scenario indoor_s5
-```
-
-`run_mesh_regression.ps1` は既定で `delivery_ack` を必須化します。  
-逆方向経路が未収束の検証初期のみ緩和したい場合は `-AllowMissingDeliveryAck` を付与します。
-
-3台ベンチ検証向けに閾値を緩和する場合:
-
-```powershell
-.\tools\run_mesh_regression.ps1 -Ports COM6,COM7,COM8 -Scenario indoor_s3 -ThresholdFile .\docs\threshold_profiles\indoor_s3_baseline.json -AllowMissingDeliveryAck
-```
-
-実行後に `session.json` / `flash_result.json` / `smoke/*` / `triage/*` が生成されます。  
-`monitor_manifest.json` は `-StartMonitor` 指定時のみ生成されます。  
-`mesh_smoke_test.py` が失敗した場合でも `triage/*` は生成され、原因切り分けに必要な最低限のサマリを残します。
-
-## 7. VSCodeからの書き込み
-
-`docs/vscode_platformio_guide.md` に手順をまとめています。
-
-- `Build`（チェック）
-- `Upload`（右矢印）
-- `Monitor`（プラグ）
-
-## 8. 既知事項
-
-- Wi-Fiメッシュ（ESP-NOW）は3台で安定動作を確認済み
-- 1KB級長文（チャンク送信）はWi-Fi経路で検証対象に追加済み
-- BLE短文リレーは組み合わせ/環境依存で成功率にばらつきがある
-- `mesh_smoke_test.py` は `--skip-ble` を使うとWi-Fi系の回帰確認に特化できる
-- 長距離設定は build flag で調整可能（`LPWA_ENABLE_WIFI_LR`, `LPWA_ALLOW_WIFI_LR_WITH_BLE`, `LPWA_MESH_CHANNEL`, `LPWA_MESH_TX_POWER_QDBM`）
-- Directed宛先 `dst` は `0xXXXXXXXX` 形式を使用（不正形式はFWが `invalid_field` を返す）
-
-最新の試験結果は `docs/test_report_2026-03-03.md` を参照してください。
-
-## 9. 主要ドキュメント
-
-- `AGENTS.md`
-- `docs/architecture.md`
-- `docs/esp32c3_research.md`
-- `docs/vscode_platformio_guide.md`
-- `docs/test_plan.md`
-- `docs/test_report_2026-03-03.md`
+- [現在の設計](docs/architecture.md)
+- [RFと認証に関する注意](docs/esp32c3_research.md)
+- [実機受入試験 / 未検証項目](docs/field_validation.md)
+- [従来の実機試験記録](docs/test_report_2026-03-03.md)

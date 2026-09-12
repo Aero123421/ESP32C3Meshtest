@@ -9,11 +9,11 @@ namespace lpwa {
 #endif
 
 #ifndef LPWA_ENABLE_WIFI_LR
-#define LPWA_ENABLE_WIFI_LR 1
+#define LPWA_ENABLE_WIFI_LR 0
 #endif
 
 #ifndef LPWA_ENABLE_BLE_RELAY
-#define LPWA_ENABLE_BLE_RELAY 1
+#define LPWA_ENABLE_BLE_RELAY 0
 #endif
 
 #ifndef LPWA_ALLOW_WIFI_LR_WITH_BLE
@@ -38,9 +38,9 @@ namespace lpwa {
 constexpr uint16_t kMeshMagic = 0x4C50;
 constexpr uint8_t kMeshVersion = 1;
 #if LPWA_ROBUST_MODE
-constexpr uint8_t kDefaultTtl = 12;
+constexpr uint8_t kDefaultTtl = 6;
 #else
-constexpr uint8_t kDefaultTtl = 10;
+constexpr uint8_t kDefaultTtl = 6;
 #endif
 constexpr uint8_t kMaxTtl = 14;
 constexpr uint8_t kMeshChannel = LPWA_MESH_CHANNEL;
@@ -65,10 +65,10 @@ constexpr size_t kFragmentChunkSize = 180;
 constexpr size_t kMaxAppPayload = 1024;
 constexpr size_t kMaxFragments = (kMaxAppPayload + kFragmentChunkSize - 1) / kFragmentChunkSize;
 
-constexpr uint32_t kNodeInfoPeriodMs = 10000;
+constexpr uint32_t kNodeInfoPeriodMs = 15000;
 constexpr uint32_t kNodeInfoPeriodMinMs = 3000;
 constexpr uint32_t kNodeInfoPeriodMaxMs = 120000;
-constexpr uint8_t kDefaultNodeInfoTtl = 5;
+constexpr uint8_t kDefaultNodeInfoTtl = 3;
 constexpr uint16_t kNodeInfoInitialJitterMinMs = 800;
 constexpr uint16_t kNodeInfoInitialJitterMaxMs = 4200;
 constexpr uint16_t kNodeInfoJitterMaxMs = 1800;
@@ -83,9 +83,9 @@ constexpr uint32_t kReassemblyTimeoutMs = 22000;
 #if LPWA_ENABLE_BLE_RELAY
 constexpr uint8_t kOriginFrameRepeatCount = 5;
 #elif LPWA_ROBUST_MODE
-constexpr uint8_t kOriginFrameRepeatCount = 4;
+constexpr uint8_t kOriginFrameRepeatCount = 2;
 #else
-constexpr uint8_t kOriginFrameRepeatCount = 3;
+constexpr uint8_t kOriginFrameRepeatCount = 2;
 #endif
 constexpr uint8_t kDirectedOriginAttemptCount = 2;
 constexpr uint8_t kDirectedFallbackFloodAttempts = 1;
@@ -96,7 +96,7 @@ constexpr uint8_t kInterFragmentGapMaxMs = 16;
 constexpr uint8_t kForwardJitterMinMs = 10;
 constexpr uint8_t kForwardJitterMaxMs = 34;
 #if LPWA_ROBUST_MODE
-constexpr uint8_t kForwardSendAttemptsFragment = 4;
+constexpr uint8_t kForwardSendAttemptsFragment = 2;
 #else
 constexpr uint8_t kForwardSendAttemptsFragment = 3;
 #endif
@@ -165,7 +165,7 @@ static_assert(sizeof(MeshFrameHeader) == 14, "MeshFrameHeader size mismatch");
 static_assert(sizeof(FragmentMeta) == 8, "FragmentMeta size mismatch");
 static_assert(sizeof(RoutedFragmentMeta) == 4, "RoutedFragmentMeta size mismatch");
 static_assert(sizeof(NodeInfoPayload) == 28, "NodeInfoPayload size mismatch");
-static_assert(kMeshChannel >= 1 && kMeshChannel <= 14, "LPWA_MESH_CHANNEL must be 1..14");
+static_assert(kMeshChannel >= 1 && kMeshChannel <= 13, "LPWA_MESH_CHANNEL must be 1..13 (no ch14 in mixed PHY profiles)");
 static_assert(kMeshTxPowerQuarterDbm >= 8 && kMeshTxPowerQuarterDbm <= 84,
               "LPWA_MESH_TX_POWER_QDBM must be 8..84");
 static_assert(kAdaptiveQueueLowWater < kAdaptiveQueueHighWater,
