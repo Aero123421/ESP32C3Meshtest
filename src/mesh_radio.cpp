@@ -22,8 +22,12 @@ bool EspNowMesh::applyRadioProfile(RadioProfile profile) {
 #endif
   }
   // Protocol capability alone does not select the ESP-NOW transmit PHY.
-  // This repository pins IDF 4.4 / Arduino 2.0.17; migrate this call when
-  // deliberately upgrading the toolchain (IDF 6 removes the legacy API).
+  // C3/S3 use the pinned Espressif32 6.10.0 / Arduino 2.0.17 (IDF 4.4) toolchain;
+  // C6 uses the Seeed commit-pinned platform with Arduino 3.x / IDF 5.1+.
+  // The legacy esp_wifi_config_espnow_rate() API is deprecated in IDF 5.2+ and
+  // planned for removal in IDF 6; migrate to esp_now_set_peer_rate_config()
+  // when deliberately upgrading the toolchain. The 11B/11G/11N mask above keeps
+  // Wi-Fi 6 mode off, so Wi-Fi 6 mode does not cause startup failure here.
   if (esp_wifi_set_ps(ps) != ESP_OK ||
       esp_wifi_set_protocol(WIFI_IF_STA, mask) != ESP_OK ||
       esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20) != ESP_OK ||
@@ -62,6 +66,7 @@ void EspNowMesh::writeRadioStatus(Stream& output) const {
   out["ble_enabled"] = kBleRelayDefault;
   out["tx_power_requested_qdbm"] = kMeshTxPowerQuarterDbm;
   out["tx_callback_timeouts"] = txCallbackTimeouts_;
+  out["tx_stall_recoveries"] = txStallRecoveries_;
   out["tx_waiting"] = txAwaiting_;
   out["uptime_ms"] = millis();
   // Rate has no getter in the pinned SDK: report API-accepted configuration,

@@ -107,8 +107,8 @@ bool EspNowMesh::begin() {
   WiFi.disconnect();
   delay(20);
 
-  // Best-effort tuning: if a platform build does not support one of these knobs,
-  // continue with defaults instead of failing mesh startup.
+  // Country-code and bandwidth setup abort startup on failure (return false).
+  // JP channel operation is fixed; there is no overseas country-code contract.
   if (esp_wifi_set_country_code("JP", false) != ESP_OK) return false;
   if (esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20) != ESP_OK) return false;
 
@@ -176,8 +176,15 @@ void EspNowMesh::loop() {
   if (!ready_) return;
   processTxResultQueue();
   // A missing callback must never be attributed to a later frame. Quarantine
-  // sends and restart the radio/MCU only after a prolonged driver stall.
+  // sends after a 1s TX timeout and attempt lightweight recovery first;
+  // restart the MCU only when recovery fails, preserving queues/state otherwise.
   if (txAwaiting_ && (millis() - txStartedMs_) > 10000U) {
+    processTxResultQueue();  // a late callback may have arrived since loop entry
+    if (!txAwaiting_) return;
+    if (recoverStalledTx()) {
+      Serial.println("{\"type\":\"recovered\",\"code\":\"tx_callback_recovered\",\"detail\":\"send/recv callback re-registered; queues preserved\"}");
+      return;
+    }
     Serial.println("{\"type\":\"error\",\"code\":\"tx_callback_stalled\",\"detail\":\"restarting radio\"}");
     delay(20);
     ESP.restart();
@@ -495,6 +502,21 @@ void EspNowMesh::processTxResultQueue() {
   if (txResultQueue_ == nullptr) return;
   TxResultItem item{};
   while (xQueueReceive(txResultQueue_, &item, 0) == pdTRUE) recordTxResult(item);
+}
+
+bool EspNowMesh::recoverStalledTx() {
+  // Lightweight staged recovery: re-register callbacks without clearing
+  // RX/TX queues, reassembly state, routes, or stats. Returns true when the
+  // node can continue without a restart.
+  const bool sendOk = (esp_now_register_send_cb(EspNowMesh::onSendStatic) == ESP_OK);
+  const bool recvOk = (esp_now_register_recv_cb(EspNowMesh::onRecvStatic) == ESP_OK);
+  if (sendOk && recvOk) {
+    txAwaiting_ = false;
+    txStartedMs_ = millis();
+    ++txStallRecoveries_;
+    return true;
+  }
+  return false;
 }
 
 void EspNowMesh::processRxQueue() {
@@ -1122,6 +1144,8 @@ bool EspNowMesh::sendRawTo(const uint8_t* mac, const uint8_t* data, size_t len) 
       TxResultItem item{};
       // Do NOT pump RX here: forwarding could recursively submit a second TX.
       // Only one frame is outstanding, so callback status identifies this frame.
+      // The 1s blocking wait is bounded: on timeout the sender stays quarantined
+      // and loop() attempts callback re-registration before any restart.
       if (xQueueReceive(txResultQueue_, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
         recordTxResult(item);
         return item.success;

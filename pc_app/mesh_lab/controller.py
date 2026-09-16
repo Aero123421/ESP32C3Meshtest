@@ -82,12 +82,16 @@ class Controller:
 
     def close(self) -> None:
         self.stop_event.set()
-        if self.link:
-            self.link.close()
-        if self.job_process and self.job_process.poll() is None:
-            self.job_process.terminate()
-        if self.thread.is_alive():
-            self.thread.join(timeout=2)
+        try:
+            if self.link:
+                self.link.close()
+        finally:
+            try:
+                if self.job_process and self.job_process.poll() is None:
+                    self.job_process.terminate()
+            finally:
+                if self.thread.is_alive():
+                    self.thread.join(timeout=2)
 
     def disconnect(self) -> None:
         if self.run and self.run.status == 'running':

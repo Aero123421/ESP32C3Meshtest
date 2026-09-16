@@ -113,6 +113,7 @@ class EspNowMesh {
   bool enqueueTxResult(const uint8_t* mac_addr, bool success);
   void processTxResultQueue();
   void recordTxResult(const TxResultItem& item);
+  bool recoverStalledTx();
   void processRxQueue();
   void processFrame(const RxQueueItem& item);
 
@@ -167,6 +168,7 @@ class EspNowMesh {
   bool txAwaiting_ = false;
   uint32_t txStartedMs_ = 0;
   uint32_t txCallbackTimeouts_ = 0;
+  uint32_t txStallRecoveries_ = 0;
   uint16_t radioRateKbps_ = 1000;
   std::atomic<uint32_t> callbackRxDrops_{0};
   std::atomic<uint32_t> callbackTxDrops_{0};

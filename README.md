@@ -121,7 +121,7 @@ python -m platformio device monitor --port /dev/cu.usbmodemXXXX --baud 115200
 
 送信電力の既定要求は `72` quarter-dBm = 18dBm。これは最大値を要求するAPIの設定であり、実際の空中線電力・EIRPではありません。**84を指定すれば21dBmになる、という扱いはしません。** SDKの段階化、地域、PHY、認証条件の制約を受けます。距離保証に換算しないでください。
 
-固定ツールチェーンはPlatformIO Espressif32 6.10.0 / Arduino 2.0.17系です。このSDKの通常ESP-NOW受信コールバックにはRSSIがないため、現在は **RSSI不明** と表示します。経路評価では不明値を中立扱いし、0dBmの良好リンクとして評価しません。受信RSSIが必須の試験は、別途取得実装・実機検証を追加してから行ってください。
+固定ツールチェーンはC3/S3向けがPlatformIO Espressif32 6.10.0 / Arduino 2.0.17系、C6向けがSeeedのcommit固定platform / Arduino 3.x系です。C3/S3の通常ESP-NOW受信コールバックにはRSSIがないため、現在は **RSSI不明** と表示します。経路評価では不明値を中立扱いし、0dBmの良好リンクとして評価しません。受信RSSIが必須の試験は、別途取得実装・実機検証を追加してから行ってください。
 
 ## 5. 新アプリでの測定
 
@@ -140,7 +140,7 @@ python -m pip install pytest==8.3.5
 python -m pytest -q tests
 ```
 
-CIはC3/S3×通常/LR/BLE共存の6ビルド、Pythonテストの3OS、ブラウザーJavaScript構文検査を行います。ネイティブC++ハーネスは実際の送信関数とフレーム検証コードをfake driverで検査します。無線到達距離や干渉・アンテナ性能のテストではありません。
+CIはC3/S3/C6×通常/LR/BLE共存の9ビルド、Pythonテストの3OS、ブラウザーJavaScript構文検査を行います。ネイティブC++ハーネスは実際の送信関数とフレーム検証コードをfake driverで検査します。無線到達距離や干渉・アンテナ性能のテストではありません。
 
 既存の実機スモークツールも残しています:
 
